@@ -1,317 +1,301 @@
 \chapter{Cloud FinOps and Engineering Economics}
-\label{ch:finops}
+\label{chap:finops}
 
 \begin{chaptergoalsbox}
 \textbf{What You Will Learn:}
 \begin{itemize}[leftmargin=12pt]
-  \item Master the Cloud FinOps lifecycle phases: **Inform**, **Optimize**, and **Operate**, transforming cloud cost from a passive accounting expense into an active engineering metric.
-  \item Calculate Cloud Unit Economics (Cost per Transaction, Cost per Active Tenant, Cost per Million Tokens) to evaluate gross profit margins.
-  \item Identify and eliminate compute allocation waste: zombie instances, orphaned block storage volumes, unattached elastic IPs, and idle load balancers.
-  \item Analyze commitment-based discount instruments: Reserved Instances (RIs), Compute Savings Plans, and EC2 Instance Savings Plans, calculating exact break-even utilization curves.
-  \item Engineer fault-tolerant worker architectures using Spot Instances, handling 2-minute interruption warnings gracefully.
-  \item Optimize Kubernetes bin-packing economics: requests versus limits, vertical pod autoscaling, and Karpenter node provisioning.
+  \item Apply the three-phase **FinOps lifecycle** (**Inform**, **Optimize**, **Operate**) to connect cloud bills directly to engineering decisions.
+  \item Bridge Volume~III's **Azure** infrastructure vocabulary to **AWS** FinOps pricing instruments using a **Cloud Rosetta Stone**.
+  \item Measure **Cloud Unit Economics** (Cost per Order, Cost per Active Tenant, Cost per Million Tokens) and spot decimal (`TB`/`GB`) vs.\ binary (`TiB`/`GiB`) billing differences.
+  \item Calculate exact break-even utilization curves for **Savings Plans** and **Reserved Instances**, and build fault-tolerant **Spot** worker pools.
+  \item Tune Kubernetes \texttt{requests}/\texttt{limits} YAML and S3/Blob storage lifecycle policies to eliminate allocation waste.
 \end{itemize}
 
-\textbf{What You Should Already Understand:}
-\begin{itemize}[leftmargin=12pt]
-  \item Core cloud infrastructure components (Virtual Machines, Object Stores, VPCs, Managed Kubernetes).
-  \item Capital Expenditure (CapEx) vs Operating Expenditure (OpEx) financial concepts.
-  \item Basic container scheduling mechanics in Kubernetes.
-\end{itemize}
+\textbf{Prerequisites \& Calibration:}
+No accounting background or prior AWS/Kubernetes billing knowledge is assumed. We introduce **CapEx** (upfront capital purchases like buying physical servers) vs.\ **OpEx** (pay-as-you-go operating expenses like renting cloud VMs by the second), container resource limits, and storage tiers cleanly as we go.
 
-\textbf{Why This Topic Exists:}
-In physical on-premise data centers, compute procurement required capital expenditure (CapEx) with 6-month hardware procurement cycles approved by CFOs. In the public cloud, any software engineer can deploy a \$10,000/month GPU cluster with a single Terraform command or UI click. Without financial engineering discipline (FinOps), cloud elasticity quickly turns into runaway spend, eroding operating margins and threatening business viability.
-
-\textbf{Motivating Practical Problem:}
-A venture-backed SaaS platform scales its active user base by 30\% over twelve months. However, during the same period, their monthly AWS cloud bill skyrockets from \$35,000 to \$240,000—a 585\% increase. The engineering team deployed 64-core compute instances for simple worker jobs, left 180 unattached 1TB gp2 SSD volumes accumulating \$18,000/month in ghost charges, and transferred uncompressed video assets across AWS regions. The company's gross profit margin collapses from 78\% to 41\%, jeopardizing its Series B fundraising round.
+\textbf{Opening Problem:}
+A Series~B SaaS company grows its active user base by 30\% over twelve months, yet its monthly cloud invoice explodes from \$35,000 to \$240,000---a 585\% jump. Gross profit margin collapses from 78\% to 41\%, threatening the next funding round. An audit uncovers three silent leaks: 64-core VMs running light background queues, 180 unattached 1~TiB SSD disks left behind by deleted VMs (\$18,000/month), and uncompressed media assets stored permanently in hot object storage. Nobody broke production; the architecture simply lacked financial feedback loops.
 \end{chaptergoalsbox}
 
-\section{The FinOps Framework and Cultural Evolution}
+\section{The FinOps Framework and Azure $\leftrightarrow$ AWS Rosetta Stone}
 
-**FinOps** (Cloud Financial Operations) is the operational discipline of bringing financial accountability to the variable spend model of the cloud. It unites Engineering, Finance, Procurement, and Product Management to make data-driven architectural decisions.
-
-The FinOps Foundation defines an iterative, three-phase lifecycle:
+**FinOps (Cloud Financial Operations)** aligns Engineering, Finance, and Product around cloud unit efficiency through a continuous three-phase loop (Figure~\ref{fig:v5-ch08-finops-loop}):
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Inform}: Enforce 100\% resource tagging (\texttt{Team}, \texttt{Service}, \texttt{Environment}) so every dollar maps to an owner.
+  \item \textbf{Optimize}: Rightsize over-provisioned VMs, move steady compute onto Savings Plans, shift fault-tolerant jobs onto Spot capacity, and tier cold data to archive storage.
+  \item \textbf{Operate}: Add automated cost checks in CI (such as \texttt{infracost} diffs on Terraform pull requests) and daily anomaly alerts.
+\end{enumerate}
 
 \begin{figure}[htbp]
 \centering
 \begin{tikzpicture}[
   node distance=1.5cm and 2.0cm,
-  phase/.style={circle, draw=headingblue, fill=headingblue!10, text width=2.5cm, align=center, font=\sffamily\small\bfseries, inner sep=6pt},
+  phase/.style={circle, draw=headingblue, fill=headingblue!10, text width=2.55cm, align=center, font=\sffamily\small\bfseries, inner sep=6pt},
   arrow/.style={-{Stealth[scale=1.1]}, thick, color=exampleBlue}
 ]
 
-\node[phase] (inform) at (90:2.8) {1. Inform\\ \tiny Allocation, Visibility, Tagging, Unit Metrics};
-\node[phase] (optimize) at (210:2.8) {2. Optimize\\ \tiny Rightsizing, Spot, RIs, Storage Lifecycles};
-\node[phase] (operate) at (330:2.8) {3. Operate\\ \tiny Continuous Governance, CI/CD Budgets, Automation};
+\node[phase] (inform) at (90:2.6) {1. Inform\\ \tiny Tagging, Attribution, Unit Metrics};
+\node[phase] (optimize) at (210:2.6) {2. Optimize\\ \tiny Rightsizing, Spot, Plans, Lifecycles};
+\node[phase] (operate) at (330:2.6) {3. Operate\\ \tiny CI Cost Gates, Budgets, Alerts};
 
-\draw[arrow] (inform) to [bend right=30] (optimize);
-\draw[arrow] (optimize) to [bend right=30] (operate);
-\draw[arrow] (operate) to [bend right=30] (inform);
+\draw[arrow] (inform) to [bend right=28] (optimize);
+\draw[arrow] (optimize) to [bend right=28] (operate);
+\draw[arrow] (operate) to [bend right=28] (inform);
 
 \end{tikzpicture}
-\caption{The Iterative FinOps Lifecycle: Inform, Optimize, Operate}
-\label{fig:finops-lifecycle}
+\caption{The Iterative Cloud FinOps Lifecycle}
+\label{fig:v5-ch08-finops-loop}
 \end{figure}
 
-\begin{enumerate}[leftmargin=18pt]
-  \item \textbf{Inform}: Establish total cost visibility through 100\% resource tagging (\texttt{CostCenter}, \texttt{Environment}, \texttt{Owner}, \texttt{Service}). Provide engineers with daily cost dashboards and attribute spend directly to teams.
-  \item \textbf{Optimize}: Eliminate waste by rightsizing over-provisioned instances, transitioning workloads to Spot or Graviton processors, committing to Savings Plans, and enabling S3 lifecycle storage rules.
-  \item \textbf{Operate}: Embed financial guardrails into continuous delivery pipelines (e.g., Infracost CLI checks on pull requests), establishing automated anomaly alerts and executive KPIs.
-\end{enumerate}
-
-\begin{intuitionbox}[Turning Off Lights in Empty Hotel Rooms]
-Traditional on-premise IT was like buying a hotel building: once you paid the construction mortgage (CapEx), running the lights didn't alter your monthly mortgage payment. Cloud computing is like renting hotel rooms by the second (OpEx). If an engineer spins up 50 instances for a benchmark on Friday afternoon and leaves them running over the weekend, the company pays for 50 fully booked luxury suites that sat completely empty for 72 hours.
+\begin{intuitionbox}[Paying for Empty Hotel Suites]
+Buying on-premise servers is **CapEx**---like buying a hotel building: turning hallway lights off barely changes your monthly mortgage. Public cloud is **OpEx**---like renting hotel suites by the second. Spinning up 50 oversized VMs for a Friday benchmark and forgetting them until Monday pays for 50 luxury suites sitting completely empty for 72 hours.
 \end{intuitionbox}
 
-\section{Cloud Unit Economics: Linking Cost to Business Value}
-
-Tracking total cloud spend in isolation is misleading. If total cloud costs rise by 50\%, is that an operational failure or a cause for celebration because active revenue-generating users grew by 400\%?
-
-**Cloud Unit Economics** links cloud infrastructure expenditure directly to a core business unit metric:
-\begin{equation}
-\text{Unit Cost} = \frac{\text{Total Cloud Infrastructure Cost for Service}}{\text{Total Volume of Business Activity Metric}}
-\end{equation}
-
-Common industry unit economic metrics include:
-\begin{itemize}[leftmargin=18pt]
-  \item **E-Commerce Platform**: Cloud Cost per Completed Order ($\frac{\text{Monthly AWS Cost}}{\text{Orders Completed}}$).
-  \item **Fintech Neobank**: Cloud Cost per Settled Payment ($\frac{\text{Processing Cluster Spend}}{\text{Transactions Processed}}$).
-  \item **Multi-Tenant B2B SaaS**: Cost per Daily Active Tenant ($\frac{\text{Tenant Infrastructure Cost}}{\text{Active Enterprise Accounts}}$).
-  \item **GenAI Copilot**: Cost per 1,000 Generated Tokens ($\frac{\text{GPU Cluster Cost}}{\text{Total Inference Tokens}}$).
-\end{itemize}
-
-A healthy engineering organization aims for **declining unit cost over time** through economies of scale, software optimization, and architectural efficiency.
-
-\section{Compute Rightsizing and Waste Elimination}
-
-In unmonitored cloud environments, between 20\% and 35\% of total compute spending represents pure waste—resources running idle or provisioned at capacities far beyond actual requirements.
+Because Volume~III introduced cloud infrastructure primarily through Microsoft Azure while many FinOps benchmarks quote AWS terminology, Table~\ref{tab:v5-ch08-rosetta} bridges the exact equivalent services across both clouds.
 
 \begin{table}[htbp]
 \centering\small
-\begin{tabular}{lp{6.0cm}p{5.5cm}}
+\begin{tabular}{llp{5.6cm}}
 \toprule
-\textbf{Waste Category} & \textbf{Root Cause} & \textbf{Remediation Strategy} \\
+\textbf{Azure Term (Volume III)} & \textbf{AWS FinOps Equivalent} & \textbf{Primary Cost Driver} \\
 \midrule
-\textbf{Zombie Instances} & QA/Staging environments left running 24/7 over weekends and holidays. & Automated cron shutdown scripts (e.g., AWS Instance Scheduler) stopping non-prod at 7 PM. \\
-\textbf{Orphaned EBS Disks} & EC2 instance terminated without \texttt{DeleteOnTermination} flag checked. & Automated AWS Config rule identifying unattached EBS volumes; snapshot and delete after 7 days. \\
-\textbf{Unattached Elastic IPs} & Static IP reserved but not bound to any running VM (charged \$0.005/hr). & Nightly cleanup script releasing unused Elastic IPs. \\
-\textbf{Idle Load Balancers} & ALBs deployed for decommissioned microservices still routing zero bytes. & Monitor CloudWatch \texttt{ActiveConnectionCount}; delete ALBs with 0 requests over 14 days. \\
-\textbf{Architecture Mismatch} & Running x86 (Intel/AMD) VMs when code natively compiles to ARM64. & Migrate workloads to AWS Graviton (ARM64) for 20\% lower hourly cost and 40\% better price-performance. \\
+Azure Managed Disks (\texttt{Premium SSD v2}) & Amazon EBS (\texttt{gp3} / \texttt{io2}) & Provisioned GiB-months + provisioned IOPS; persists after VM deletion unless flagged. \\
+Azure Application Gateway & AWS Application Load Balancer (ALB) & Hourly fixed fee + processed capacity units (LCUs); idle gateways still bill hourly. \\
+Azure Kubernetes Service (AKS) & Amazon EKS & Control plane hourly fee + underlying worker VM sizes and packing efficiency. \\
+Azure Savings Plan for Compute & AWS Compute Savings Plans & 1-yr or 3-yr hourly spend commitment yielding 25\%--65\% discount across instance families. \\
+Azure Spot VMs & AWS EC2 Spot Instances & Spare capacity up to 90\% off, reclaimable on short eviction notice (30s Azure / 2m AWS). \\
+Azure Blob (Hot / Cool / Archive) & AWS S3 (Standard / IA / Glacier) & GB-month storage rate vs.\ retrieval and minimum-duration early-deletion fees. \\
 \bottomrule
 \end{tabular}
-\caption{Common Cloud Compute Waste Vectors and Remediations}
-\label{tab:compute-waste}
+\caption{Azure $\leftrightarrow$ AWS Cloud FinOps Rosetta Stone}
+\label{tab:v5-ch08-rosetta}
 \end{table}
 
-\section{Commitment-Based Discounts: RIs and Savings Plans}
+\section{Unit Economics and Storage Unit Clarity (\texttt{GB} vs.\ \texttt{GiB})}
 
-Cloud hyper-scalers price compute on a sliding scale based on operational flexibility:
-
-\begin{figure}[htbp]
-\centering
-\begin{tikzpicture}[
-  scale=0.9, every node/.style={transform shape},
-  tier/.style={rectangle, draw=headingblue, fill=headingblue!10, rounded corners=3pt, minimum width=11.5cm, minimum height=1.0cm, inner sep=6pt, font=\sffamily\small}
-]
-
-\node[tier, fill=warningRed!10, draw=warningRed] (ondemand) {
-  \textbf{On-Demand Compute}: Maximum flexibility, zero commitment. Highest hourly rate. Baseline = 100\% cost.
-};
-
-\node[tier, fill=exampleBlue!10, draw=exampleBlue, below=0.5cm of ondemand] (sp) {
-  \textbf{Compute Savings Plans}: Commit to \$/hour spend (1 or 3 years). Flexible across families, OS, and regions. $\approx 25\% - 45\%$ discount.
-};
-
-\node[tier, fill=headingblue!15, draw=headingblue, below=0.5cm of sp] (ec2sp) {
-  \textbf{EC2 Instance Savings Plans / Standard RIs}: Commit to specific instance family in one region. $\approx 40\% - 65\%$ discount.
-};
-
-\node[tier, fill=intuitionBg, draw=intuitionTeal, below=0.5cm of ec2sp] (spot) {
-  \textbf{Spot Instances}: Spare cloud capacity bid dynamically. Up to 90\% discount. Subject to 2-minute eviction warning.
-};
-
-\end{tikzpicture}
-\caption{Cloud Compute Purchasing Model Spectrum}
-\label{fig:purchasing-spectrum}
-\end{figure}
-
-\subsection{Mathematical Break-Even Analysis}
-
-To decide whether committing to a 1-year or 3-year Savings Plan is economically sound, architects calculate the **Break-Even Utilization Point** ($U_{\text{break}}$).
-
-Let:
-\begin{itemize}[leftmargin=18pt]
-  \item $R_{\text{od}}$: On-Demand hourly rate (e.g., \$1.00/hour).
-  \item $R_{\text{sp}}$: Savings Plan discounted hourly rate (e.g., \$0.60/hour, representing a 40\% discount).
-\end{itemize}
-Because you pay $R_{\text{sp}}$ for all 24 hours of every day regardless of whether the instance is powered on:
+Total monthly cloud spend in isolation hides whether growth is healthy. **Cloud Unit Economics** divides infrastructure spend by business volume:
 \begin{equation}
-U_{\text{break}} = \frac{R_{\text{sp}}}{R_{\text{od}}} = \frac{\$0.60}{\$1.00} = 0.60 \quad (60\%)
+\text{Unit Cost} = \frac{\text{Monthly Service Cloud Spend (\$)}}{\text{Monthly Business Activity (Orders, Tenants, or Tokens)}}
 \end{equation}
-If your service runs for more than $60\% \times 24\text{ hours} = 14.4\text{ hours/day}$ (or $>18\text{ days/month}$), committing to the Savings Plan is cheaper than paying On-Demand, even if the instance sits completely idle for the remainder of the time!
+If AWS spend rises $40\%$ while completed orders double ($+100\%$), your cost per order actually \emph{fell} by $30\%$---healthy scaling!
 
-\begin{underthehoodbox}[AWS Savings Plan Priority Matching Engine]
-How does AWS bill your account when you own Savings Plans? Every hour, the AWS billing engine aggregates all compute usage across EC2, Fargate, and Lambda. It evaluates instances in descending order of their percentage discount. The plan is automatically applied first to the instance family delivering the highest percentage savings relative to On-Demand. Any leftover commitment cascades down to lesser-discounted workloads.
-\end{underthehoodbox}
+\subsection{Decimal (\texttt{GB}/\texttt{TB}) vs.\ Binary (\texttt{GiB}/\texttt{TiB}) Billing}
 
-\section{Spot Instances and Fault-Tolerant Architectures}
+Always verify which unit a cloud billing table uses:
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Decimal SI Units (\texttt{GB}, \texttt{TB})}: $1\text{ GB} = 1,000^3\text{ bytes}$ and $1\text{ TB} = 1,000\text{ GB}$. Object stores like **AWS S3** and **Azure Blob** bill per decimal **GB-month** (so $50\text{ TB} = 50,000\text{ GB}$).
+  \item \textbf{Binary IEC Units (\texttt{GiB}, \texttt{TiB})}: $1\text{ GiB} = 1,024^3\text{ bytes}$ and $1\text{ TiB} = 1,024\text{ GiB}$. Block volumes like **Amazon EBS** and Kubernetes memory specs (\texttt{memory: "2Gi"}) use binary **GiB** (so $2\text{ TiB} = 2,048\text{ GiB}$).
+\end{itemize}
 
-**Spot Instances** offer excess, unreserved cloud compute capacity at discounts up to 90\% off On-Demand rates. However, if cloud demand surges, the hyper-scaler can reclaim the instance with only a **two-minute notification**.
+\section{Compute Waste, Commitment Break-Even, and Spot}
 
-\subsection{The Anatomy of a Production Spot Architecture}
+In unaudited accounts, 20\%--35\% of spend is pure waste: non-production VMs left running nights/weekends, orphaned EBS disks lacking \texttt{DeleteOnTermination}, idle load balancers, and x86 VMs that could run 20\% cheaper (and often faster) on ARM64 processors (AWS Graviton / Azure Cobalt).
 
-To leverage Spot without suffering production outages:
+\subsection{Commitment Break-Even Math}
+
+Cloud compute spans four purchasing models: **On-Demand** (100\% baseline, stop anytime), **Compute Savings Plans** (1--3 yr hourly spend commitment across instance families, ~25\%--45\% off), **Instance Savings Plans / Standard RIs** (locked to one family/region, ~40\%--65\% off), and **Spot** (up to 90\% off, evictable).
+
+Because a Savings Plan bills $R_{\text{sp}}$ for all 24 hours/day even if the VM shuts down, the **Break-Even Utilization** ($U_{\text{break}}$) is:
+\begin{equation}
+U_{\text{break}} = \frac{R_{\text{sp}}}{R_{\text{od}}}
+\end{equation}
+For example, if an instance costs $R_{\text{od}} = \$1.00/\text{h}$ and a 1-year plan costs $R_{\text{sp}} = \$0.60/\text{h}$, then $U_{\text{break}} = 0.60 / 1.00 = 60\%$. Any workload running more than $0.60 \times 24 = 14.4\text{ hours/day}$ is cheaper under the Savings Plan. Listing~\ref{lst:v5-ch08-rightsize} automates that comparison in Python.
+
+\begin{lstlisting}[language=Python, caption={Runnable Compute Purchasing Break-Even Analyzer}, label={lst:v5-ch08-rightsize}]
+def recommend_purchasing(hourly_ondemand: float, hourly_sp: float, active_hours_per_day: float):
+    utilization = active_hours_per_day / 24.0
+    breakeven = hourly_sp / hourly_ondemand
+    od_monthly = hourly_ondemand * active_hours_per_day * 30
+    sp_monthly = hourly_sp * 24 * 30
+    choice = "Savings Plan" if utilization >= breakeven else "On-Demand"
+    return {
+        "utilization_pct": round(utilization * 100, 1),
+        "breakeven_pct": round(breakeven * 100, 1),
+        "od_monthly": round(od_monthly, 2),
+        "sp_monthly": round(sp_monthly, 2),
+        "recommendation": choice,
+    }
+
+print("24h Prod API:", recommend_purchasing(0.384, 0.218, 24))
+print("10h Dev/QA:  ", recommend_purchasing(0.384, 0.218, 10))
+\end{lstlisting}
+
+\textbf{Step-by-Step Trace on Concrete Inputs:}
 \begin{enumerate}[leftmargin=18pt]
-  \item \textbf{Strict Workload Separation}: Never run stateful singletons (e.g., Redis primary, single-node PostgreSQL) or latency-critical ingress gateways on Spot. Scope Spot strictly to stateless horizontal workers, batch data processing, machine learning training, and CI/CD runners.
-  \item \textbf{Instance-Type Diversification}: Never configure an Auto Scaling Group (ASG) to request a single instance type (e.g., only \texttt{m5.xlarge}). Diversify across at least 8--12 instance types (e.g., \texttt{m5.xlarge}, \texttt{m5a.xlarge}, \texttt{c5.xlarge}, \texttt{r5.xlarge}) across multiple Availability Zones. Spot market capacity pools are independent; when one family runs out of capacity, other pools remain available.
-  \item \textbf{Interruption Handling}: Run the open-source AWS Node Termination Handler daemon. When AWS publishes an Amazon EC2 Spot Interruption Notice via IMDS (\url{http://169.254.169.254/latest/meta-data/spot/instance-action}), the daemon immediately drains the Kubernetes node, uncordons new pods elsewhere, and completes in-flight HTTP requests before the physical shutdown occurs.
+  \item Lines 2--3 compute actual daily utilization and the break-even threshold ($0.218 / 0.384 = 56.8\%$).
+  \item Line 14 tests a 24h production \texttt{m5.2xlarge} API: $100.0\% \ge 56.8\%$, On-Demand would cost $\$276.48/\text{mo}$ vs.\ Savings Plan $\$156.96/\text{mo}$ $\rightarrow$ recommends \texttt{Savings Plan}.
+  \item Line 15 tests a dev/QA server auto-stopped at night (10h/day): utilization is $41.7\% < 56.8\%$, so On-Demand costs only $\$115.20/\text{mo}$ vs.\ $\$156.96/\text{mo}$ $\rightarrow$ recommends \texttt{On-Demand}.
 \end{enumerate}
 
-\begin{productionwarningbox}[Running Stateful Singletons on Spot Instances]
-A catastrophic anti-pattern is attempting to save money by running an un-replicated Elasticsearch or Cassandra cluster on Spot instances. During a regional cloud capacity crunch (e.g., during Cyber Monday), cloud providers can evict 100\% of your Spot instances in a single zone simultaneously. If stateful nodes are evicted before data is flushed and replicated, total data corruption and unrecoverable downtime ensue.
-\end{productionwarningbox}
+\subsection{Spot Resilience Rules}
 
-\section{Kubernetes FinOps: Requests, Limits, and Bin-Packing}
+Use Spot capacity strictly for **stateless, restartable workers** (image resizing, CI runners, batch ETL), never for un-replicated databases. Diversify across **8--12 instance types** and multiple Availability Zones so one capacity crunch cannot wipe out your pool, and run a node-draining daemon (e.g., AWS Node Termination Handler) that catches the 2-minute IMDS eviction notice and gracefully finishes in-flight jobs.
 
-In Kubernetes clusters, poor resource configuration generates massive hidden financial waste.
+\section{Kubernetes Bin-Packing and Storage Lifecycle Policies}
 
-\subsection{Requests vs Limits Mechanics}
-
+In Kubernetes, over-sized Pod requests force the cluster autoscaler to rent twice as many VMs as workloads actually use (Figure~\ref{fig:v5-ch08-k8s-waste}):
 \begin{itemize}[leftmargin=18pt]
-  \item \textbf{Resource Requests}: Used by the Kubernetes \texttt{kube-scheduler} to place pods onto worker nodes. A node with 8 CPUs cannot accept a pod requesting 4 CPUs if other scheduled pods have already requested 5 CPUs, even if those pods are currently using 0.05 CPUs! \textbf{Requests dictate cloud cluster sizing and your monthly VM bill.}
-  \item \textbf{Resource Limits}: Enforced by the Linux kernel cgroups runtime. If a pod exceeds its memory limit, the Linux kernel terminates it immediately with an \textbf{OOMKilled} (Exit Code 137) error. If a pod exceeds its CPU limit, the CFS scheduler throttles its execution cycles, increasing latency.
+  \item \textbf{\texttt{requests}}: Reserves capacity on a physical node for the \texttt{kube-scheduler}. **Requests drive your monthly VM bill.**
+  \item \textbf{\texttt{limits}}: Enforced by Linux \texttt{cgroups} (Volume~III, Chapter~3). Exceeding \texttt{limits.memory} triggers an immediate **OOMKilled (Exit Code 137)** crash; setting tight \texttt{limits.cpu} throttles CPU cycles even when the physical node is idle!
 \end{itemize}
 
 \begin{figure}[htbp]
 \centering
 \begin{tikzpicture}[
   scale=0.9, every node/.style={transform shape},
-  nodebox/.style={rectangle, draw=headingblue, fill=headingblue!5, rounded corners=3pt, minimum width=11.5cm, minimum height=3.5cm, inner sep=6pt},
-  podbox/.style={rectangle, draw=exampleBlue, fill=exampleBg, rounded corners=2pt, minimum width=3.2cm, minimum height=1.8cm, font=\sffamily\scriptsize, align=left, inner sep=5pt},
-  wastebox/.style={rectangle, draw=warningRed, fill=warningBg, dashed, rounded corners=2pt, minimum width=3.6cm, minimum height=2.8cm, font=\sffamily\scriptsize\bfseries\color{warningRed}, align=center}
+  nodebox/.style={rectangle, draw=headingblue, fill=headingblue!5, rounded corners=3pt, minimum width=11.5cm, minimum height=3.2cm, inner sep=6pt},
+  podbox/.style={rectangle, draw=exampleBlue, fill=exampleBg, rounded corners=2pt, minimum width=3.2cm, minimum height=1.7cm, font=\sffamily\scriptsize, align=left, inner sep=5pt},
+  wastebox/.style={rectangle, draw=warningRed, fill=warningBg, dashed, rounded corners=2pt, minimum width=3.6cm, minimum height=2.3cm, font=\sffamily\scriptsize\bfseries\color{warningRed}, align=center}
 ]
 
 \node[nodebox] (node) at (0, 0) {};
-\node[font=\sffamily\small\bfseries\color{headingblue}, anchor=north west] at (-5.5, 1.6) {Physical Kubernetes Worker Node (16 vCPU, 32 GB RAM)};
+\node[font=\sffamily\small\bfseries\color{headingblue}, anchor=north west] at (-5.5, 1.45) {Kubernetes Worker Node (16 vCPU, 32 GiB RAM)};
 
-\node[podbox] (p1) at (-3.4, -0.4) {
+\node[podbox] (p1) at (-3.4, -0.35) {
   \textbf{Pod A}\\
-  Req: 4 CPU, 8 GB\\
-  \textit{Actual: 0.2 CPU, 1.2 GB}
+  Req: 4 CPU, 8 GiB\\
+  \textit{Actual: 0.2 CPU, 1.2 GiB}
 };
 
-\node[podbox] (p2) at (0.2, -0.4) {
+\node[podbox] (p2) at (0.2, -0.35) {
   \textbf{Pod B}\\
-  Req: 8 CPU, 16 GB\\
-  \textit{Actual: 0.5 CPU, 2.5 GB}
+  Req: 8 CPU, 16 GiB\\
+  \textit{Actual: 0.5 CPU, 2.5 GiB}
 };
 
-\node[wastebox] (w) at (3.8, -0.2) {
-  \textbf{Allocation Waste}\\
+\node[wastebox] (w) at (3.8, -0.25) {
+  \textbf{Stranded Capacity}\\
   Only 4 CPU Unallocated\\
-  \textit{Actual Node Idle: 85\%}\\
-  Cluster Autoscaler forces\\
-  buying another VM!
+  \textit{Actual Idle: 85\%}\\
+  Forces spinning up a 2nd VM!
 };
 
 \end{tikzpicture}
-\caption{Kubernetes Allocation Waste Caused by Over-Provisioned Resource Requests}
-\label{fig:k8s-waste}
+\caption{Kubernetes Allocation Waste from Inflated Resource Requests}
+\label{fig:v5-ch08-k8s-waste}
 \end{figure}
 
-\begin{commonmistakebox}[Setting Memory Requests Equal to Memory Limits]
-Developers often set CPU and memory requests equal to limits out of caution. This eliminates the scheduler's ability to overcommit resources. While memory limits should be set with a modest buffer to prevent OOMKills, setting CPU requests equal to peak limits prevents bin-packing, forcing the cluster autoscaler to spin up twice as many physical VM nodes as necessary, doubling cloud infrastructure costs.
-\end{commonmistakebox}
+Listing~\ref{lst:v5-ch08-k8s-yaml} shows a FinOps-tuned Pod spec, and Listing~\ref{lst:v5-ch08-s3-json} shows an automated S3 Lifecycle JSON policy (whose exact Azure Blob equivalent is a Lifecycle Management rule transitioning \texttt{tierToCool} after 30 days and \texttt{tierToArchive} after 90 days).
 
-\begin{realworldbox}[Airbnb and DoorDash FinOps Transformations]
-As DoorDash scaled to millions of restaurant orders, their Kubernetes clusters experienced severe fragmentation and low node packing efficiency ($\approx 18\%$ average CPU utilization). By adopting **Karpenter** (an open-source, intelligent Kubernetes node provisioner created by AWS) and replacing standard Cluster Autoscaler, their platform dynamically provisioned exact instance sizes (bin-packing mixed compute families and Graviton ARM64 processors on the fly). This automated right-sizing initiative reduced DoorDash's monthly cloud compute footprint by over 30\%, saving millions of dollars annually.
+\begin{lstlisting}[language=yaml, caption={FinOps-Tuned Kubernetes Pod Resource Configuration}, label={lst:v5-ch08-k8s-yaml}]
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: image-resizer-worker
+spec:
+  replicas: 4
+  template:
+    spec:
+      containers:
+        - name: resizer
+          image: ghcr.io/acme/resizer:2.4.1
+          resources:
+            requests:
+              cpu: "250m"      # p95 steady usage for tight bin-packing
+              memory: "1Gi"    # Steady heap footprint
+            limits:
+              memory: "4Gi"    # Burst headroom preventing OOMKilled (Exit 137)
+              # cpu limit intentionally omitted to avoid CFS micro-throttling
+\end{lstlisting}
+
+\textbf{Walkthrough:} Lines 13--15 reserve only \texttt{250m} CPU ($0.25$ vCPU) and \texttt{1Gi} RAM for scheduling so 4--8 workers pack onto one node instead of sitting idle. Line 17 caps memory at \texttt{4Gi} for rare large-image spikes without locking away 4~GiB per pod permanently, and omitting a hard \texttt{cpu} limit prevents Linux CFS quota throttling when spare CPU is available on the node.
+
+\begin{lstlisting}[language=bash, caption={AWS S3 Lifecycle Policy JSON (Azure Blob Cool/Archive Equivalent)}, label={lst:v5-ch08-s3-json}]
+{
+  "Rules": [
+    {
+      "ID": "ArchiveRawAnalyticalLogs",
+      "Filter": { "Prefix": "logs/" },
+      "Status": "Enabled",
+      "Transitions": [
+        { "Days": 30, "StorageClass": "STANDARD_IA" },
+        { "Days": 90, "StorageClass": "DEEP_ARCHIVE" }
+      ],
+      "Expiration": { "Days": 365 }
+    }
+  ]
+}
+\end{lstlisting}
+
+\textbf{Walkthrough:} Every object written under \texttt{logs/} lives in \texttt{S3 Standard} (\$0.023/GB) for days 1--30 (Line 8), shifts automatically to \texttt{STANDARD\_IA} (\$0.0125/GB) on day 30, moves to \texttt{DEEP\_ARCHIVE} (\$0.00099/GB) on day 90 (Line 9), and deletes permanently after 365 days (Line 11).
+
+\begin{realworldbox}[Diagnostic Walkthrough: Fixing 18\% Cluster Utilization with Karpenter]
+\textbf{Symptoms:} Monthly EKS infrastructure spend grows 45\% in a quarter while average cluster CPU utilization sits at just $18\%$, yet new deploys stick in \texttt{Pending} state.\\
+\textbf{Metrics & Logs:} \texttt{kube-state-metrics} reveals \texttt{sum(kube\_pod\_container\_resource\_requests\{resource="cpu"\}) / sum(kube\_node\_status\_allocatable\{resource="cpu"\}) = 0.89} ($89\%$ requested, $18\%$ used), and \texttt{kubectl describe pod} prints \texttt{0/12 nodes available: 12 Insufficient memory} due to rigid homogeneous \texttt{m5.2xlarge} node groups.\\
+\textbf{Remediation:} Engineers rightsized pod \texttt{requests} to actual \texttt{p95} metrics and replaced fixed Auto Scaling Groups with **Karpenter** (dynamic node provisioner choosing exact mixed x86/Graviton instance sizes per pending pod batch). Karpenter consolidated 12 half-empty nodes into 5 tightly packed Graviton nodes, cutting monthly compute spend by over $30\%$.
 \end{realworldbox}
 
-\begin{tryityourselfbox}[Exercise: S3 Storage Lifecycle Cost Reduction]
-An application generates 50 Terabytes of raw analytical log data every month in AWS S3 Standard:
-\begin{itemize}
-  \item S3 Standard: \$0.023 per GB/month.
-  \item S3 Standard-Infrequent Access (IA): \$0.0125 per GB/month (accessed $<1$ time/month).
-  \item S3 Glacier Flexible Archive: \$0.0036 per GB/month (retrieval takes 3 hours).
-  \item S3 Glacier Deep Archive: \$0.00099 per GB/month (retrieval takes 12 hours).
-\end{itemize}
-Calculate the monthly cost of storing 50 TB in S3 Standard. Then, design an S3 Lifecycle Configuration rule that transitions data to IA after 30 days and Glacier Deep Archive after 90 days, calculating the annual cost savings.
+\begin{tryityourselfbox}[S3 Storage Lifecycle Cost Reduction]
+An application writes $50\text{ TB}$ ($50,000\text{ GB}$) of raw logs every month into AWS S3 Standard (\$0.023/GB-mo), retaining logs for 12 months. Using Standard-IA (\$0.0125/GB-mo) after 30 days and Glacier Deep Archive (\$0.00099/GB-mo) after 90 days:
+\begin{enumerate}
+  \item Compute the monthly cost of keeping one 50~TB cohort in S3 Standard.
+  \item Compute the steady-state monthly cost (once 12 monthly cohorts accumulate, totaling 600~TB) with vs.\ without the lifecycle rule, and state the annual savings.
+\end{enumerate}
 \end{tryityourselfbox}
 
-\section{Summary \& Key Takeaways}
+\section{Summary \protect\& Key Takeaways}
 
 \begin{itemize}[leftmargin=18pt]
-  \item \textbf{FinOps Lifecycle}: Cost engineering operates across Inform (visibility/tagging), Optimize (rightsizing/discounts), and Operate (continuous CI/CD governance).
-  \item \textbf{Unit Economics}: Evaluate cloud expenditure as a ratio of business value (e.g., Cost per Order, Cost per Token).
-  \item \textbf{Eliminate Ghost Waste}: Continuously identify and terminate zombie non-prod VMs, orphaned EBS volumes, unattached static IPs, and idle load balancers.
-  \item \textbf{Commitment Optimization}: Utilize Compute Savings Plans for baseline steady-state compute once utilization exceeds the break-even threshold ($\approx 60\%$).
-  \item \textbf{Spot Resilience}: Run stateless, asynchronous, and batch workloads on Spot instances diversified across 8+ instance families with automated 2-minute draining handlers.
-  \item \textbf{K8s Bin-Packing}: Tune resource requests to match actual p95 usage to maximize cluster packing density and avoid over-provisioning node fleets.
+  \item \textbf{Inform, Optimize, Operate}: Tag 100\% of resources, eliminate ghost disks/idle VMs, and gate Terraform PRs with cost checks.
+  \item \textbf{Azure $\leftrightarrow$ AWS Mapping}: Managed Disks/EBS, App Gateway/ALB, AKS/EKS, Savings Plans, Spot VMs, and Blob/S3 tiers follow identical FinOps economics.
+  \item \textbf{Units Matter}: Object stores bill decimal \texttt{GB}/\texttt{TB} ($10^3$), whereas block disks and Kubernetes memory use binary \texttt{GiB}/\texttt{TiB} ($2^{10}$).
+  \item \textbf{Break-Even Discipline}: Commit to Savings Plans only when daily utilization exceeds $R_{\text{sp}}/R_{\text{od}}$; keep bursty and stateless queues on On-Demand and diversified Spot pools.
 \end{itemize}
 
 \section{Exercises}
 
 \subsection*{Mechanics}
-\begin{enumerate}[leftmargin=18pt]
-  \item A cloud service runs on an \texttt{m5.2xlarge} instance costing \$0.384/hour On-Demand. A 3-year No-Upfront Compute Savings Plan discounts the price to \$0.218/hour. Calculate the break-even utilization percentage $U_{\text{break}}$.
-  \item An engineer provisions an unattached 2TB AWS EBS gp3 SSD volume at \$0.08 per GB-month and forgets it for six months. Compute the total wasted expenditure.
+\begin{enumerate}[label=\textbf{Exercise~\thechapter.\arabic*}, leftmargin=*]
+  \item An \texttt{m5.2xlarge} costs \$0.384/hour On-Demand and \$0.218/hour under a 3-year Compute Savings Plan. Compute the break-even utilization $U_{\text{break}}$ and minimum active hours/day.
+  \item An engineer leaves an unattached $2\text{ TiB}$ ($2,048\text{ GiB}$) EBS \texttt{gp3} disk running for 6 months at \$0.08 per GiB-month. Compute the wasted spend.
 \end{enumerate}
 
 \subsection*{Debugging}
-\begin{enumerate}[leftmargin=18pt]
-  \item A team deploys a stateless Python background image processing worker on a Kubernetes cluster. The pod is configured with \texttt{limits: \{memory: "2Gi"\}} and \texttt{requests: \{memory: "2Gi"\}}. During load spikes, the pod randomly crashes with Exit Code 137. Explain what is happening and propose the corrected configuration.
+\begin{enumerate}[label=\textbf{Exercise~\thechapter.\arabic*}, leftmargin=*, start=3]
+  \item A Python image-resizer pod runs with \texttt{requests: \{memory: "2Gi"\}} and \texttt{limits: \{memory: "2Gi"\}}. During traffic spikes, pods crash with Exit Code 137. Explain the crash and write the corrected \texttt{requests}/\texttt{limits}.
 \end{enumerate}
 
 \subsection*{Architecture Design}
-\begin{enumerate}[leftmargin=18pt]
-  \item Design an enterprise multi-tier compute purchasing architecture for an e-commerce platform that experiences a baseline load of 2,000 requests/sec with predictable daily peaks of 6,000 requests/sec and Black Friday surges of 20,000 requests/sec. Specify how On-Demand, Savings Plans, and Spot instances should be allocated across API gateways, core transaction processing, and asynchronous image resizing workers.
+\begin{enumerate}[label=\textbf{Exercise~\thechapter.\arabic*}, leftmargin=*, start=4]
+  \item Architect a compute-purchasing mix for an e-commerce site with a 24/7 baseline of 2,000 RPS, daily daytime peaks of 6,000 RPS, and 4-day holiday spikes of 20,000 RPS across core APIs, ingress, and asynchronous thumbnail workers.
 \end{enumerate}
 
 \section{Detailed Solutions}
 
-\subsection*{Mechanics Solution}
+\subsection*{Try It Yourself Solution}
 \begin{enumerate}[leftmargin=18pt]
-  \item Break-even utilization point:
-  $$U_{\text{break}} = \frac{R_{\text{sp}}}{R_{\text{od}}} = \frac{\$0.218}{\$0.384} \approx 0.5677 \quad (56.77\%)$$
-  If the workload runs more than $56.77\% \times 24\text{ hours} \approx 13.62\text{ hours/day}$, the Savings Plan is cheaper than On-Demand.
-  
-  \item Total gigabytes = $2\text{ TB} = 2,048\text{ GB}$.
-  $$\text{Monthly Cost} = 2,048 \times \$0.08 = \$163.84 \text{ per month}$$
-  $$\text{Total 6-Month Waste} = \$163.84 \times 6 = \$983.04$$
-  Nearly \$1,000 was wasted on a single forgotten disk.
+  \item One $50\text{ TB} = 50,000\text{ GB}$ cohort in S3 Standard costs:
+  $$50,000 \times \$0.023 = \$1,150.00\text{/month}$$
+  \item At steady state with 12 monthly cohorts retained ($600,000\text{ GB}$ total):
+  \begin{itemize}[leftmargin=14pt]
+    \item \textbf{Without Lifecycle} (all 12 months in S3 Standard): $12 \times \$1,150 = \$13,800.00/\text{month}$ ($\$165,600/\text{year}$).
+    \item \textbf{With Lifecycle}:
+      \begin{itemize}
+        \item Month 1 cohort (days 1--30, 50,000 GB in Standard): $\$1,150.00/\text{mo}$.
+        \item Months 2--3 cohorts (days 31--90, 100,000 GB in IA): $100,000 \times \$0.0125 = \$1,250.00/\text{mo}$.
+        \item Months 4--12 cohorts (days 91--365, 450,000 GB in Deep Archive): $450,000 \times \$0.00099 = \$445.50/\text{mo}$.
+        \item Total with Lifecycle = $\$1,150 + \$1,250 + \$445.50 = \mathbf{\$2,845.50/\text{month}}$ ($\$34,146/\text{year}$).
+      \end{itemize}
+    \item \textbf{Steady-State Annual Savings}: $\$165,600 - \$34,146 = \mathbf{\$131,454/\text{year}}$ ($79.4\%$ reduction; equivalently $\$10,954.50$ saved over 12 months per 50~TB cohort).
+  \end{itemize}
 \end{enumerate}
 
-\subsection*{Debugging Solution}
-\begin{enumerate}[leftmargin=18pt]
-  \item \textbf{Root Cause}: Exit Code 137 is the standard Linux SIGKILL triggered by the kernel Out-Of-Memory (OOM) Killer. Because the memory limit was hard-capped at 2Gi, processing an oversized user image caused heap allocations to exceed 2Gi, prompting the kernel to terminate the process immediately.
-  
-  \textbf{Correction}:
-  \begin{enumerate}
-    \item Increase memory limit to accommodate p99 image sizes (e.g., \texttt{limits: \{memory: "4Gi"\}}).
-    \item Right-size the request to reflect average steady-state usage (e.g., \texttt{requests: \{memory: "1Gi"\}}). This allows Kubernetes to bin-pack pods efficiently while allowing headroom for temporary processing bursts without triggering OOMKills.
-  \end{enumerate}
+\subsection*{Mechanics, Debugging & Architecture Solutions}
+\begin{enumerate}[label=\textbf{Solution~\thechapter.\arabic*}, leftmargin=*]
+  \item $U_{\text{break}} = \$0.218 / \$0.384 \approx 0.5677$ ($56.77\%$), or $0.5677 \times 24 \approx 13.62\text{ hours/day}$.
+  \item $2,048\text{ GiB} \times \$0.08/\text{GiB-mo} = \$163.84/\text{mo}$; over 6 months, waste is $\$163.84 \times 6 = \mathbf{\$983.04}$.
+  \item Exit Code 137 is \texttt{SIGKILL} from the Linux kernel OOM Killer when heap memory exceeds \texttt{limits.memory: 2Gi}. Fix: raise \texttt{limits.memory: "4Gi"} to cover \texttt{p99} large images while lowering \texttt{requests.memory: "1Gi"} (matching typical steady usage) so Kubernetes packs pods tightly without OOMKills.
+  \item \textbf{Tiered Purchasing Plan}: (1) **Core 2,000 RPS baseline (24/7)**: 3-year Compute Savings Plan (~55\%--60\% discount); (2) **Daytime 2k--6k RPS swing**: 1-year Compute Savings Plan for the predictable daytime floor + On-Demand autoscaling above 13.6h/day break-even; (3) **4-day 20k RPS holiday spike**: pure On-Demand autoscaling (never over-commit a 1-year plan for 4 days of traffic); (4) **Async thumbnail workers**: 100\% Spot across 8+ instance families with queue-backed retries.
 \end{enumerate}
 
-\subsection*{Architecture Design Solution}
-\begin{table}[htbp]
-\centering\footnotesize
-\begin{tabular}{p{2.6cm}p{3.8cm}p{3.2cm}p{4.6cm}}
-\toprule
-\textbf{Workload Tier} & \textbf{Characteristics} & \textbf{Purchasing Model} & \textbf{Architectural Justification} \\
-\midrule
-\textbf{Core Transaction Engine} & Stateful / Critical; 2,000 RPS steady baseline 24/7/365 & 3-Year Compute Savings Plan & 55\% discount; baseline load never drops below 2,000 RPS. \\
-\textbf{Daily Peak Ingress} & Variable diurnal traffic (2k to 6k RPS during daylight hours) & 1-Year Compute Savings Plan (50\%) + On-Demand (50\%) & Balances discount commitment with flexibility to scale down at night. \\
-\textbf{Black Friday Surges} & Unpredictable extreme surge (6k to 20k RPS for 4 days) & On-Demand with Auto Scaling & Zero long-term commitment risk for temporary 4-day spike. \\
-\textbf{Image Resizing Workers} & Asynchronous, queue-backed, stateless & Spot Instances (100\%) across 8+ instance families & 70--90\% discount; queue absorbs 2-minute evictions without data loss. \\
-\bottomrule
-\end{tabular}
-\caption{Tiered Purchasing Architecture for E-Commerce Platform}
-\end{table}
+\begin{labbridgebox}
+Run \texttt{python3 exercises/volume5/ex04\_cloud\_finops\_optimizer.py} to experiment with utilization break-even curves, and inspect container resource footprints in \texttt{projects/p12-end-to-end-platform/docker-compose.yml}.
+\end{labbridgebox}
 
-\section{Further Reading \& Citations}
+\section{Further Reading \protect\& Citations}
 \begin{itemize}[leftmargin=18pt]
-  \item Storment, J. R., \& Fuller, M. (2023). \textit{Cloud FinOps: Collaborative, Real-Time Cloud Financial Management} (2nd ed.). O'Reilly Media.
-  \item FinOps Foundation. (2024). \textit{The FinOps Framework and Principles}. \url{https://www.finops.org/framework/}.
-  \item Burns, B., Villalba, E., Strebel, D., \& Evenson, L. (2019). \textit{Managing Kubernetes Resources}. O'Reilly Media.
-  \item Amazon Web Services. (2023). \textit{AWS Cost Management and Savings Plans Guide}.
+  \item Storment, J. R., \& Fuller, M. (2023). \textit{Cloud FinOps} (2nd ed.). O'Reilly Media.
+  \item FinOps Foundation. (2024). \textit{The FinOps Framework}: \url{https://www.finops.org/framework/}.
+  \item Burns, B., et al. (2019). \textit{Managing Kubernetes Resources}. O'Reilly Media.
 \end{itemize}

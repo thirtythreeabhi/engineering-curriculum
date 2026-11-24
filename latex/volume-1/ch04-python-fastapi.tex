@@ -1,0 +1,487 @@
+\chapter{Python and FastAPI: Async Event Loops, ASGI, Pydantic v2, and CPython}
+\label{chap:python-fastapi}
+
+In Chapter~\ref{chap:modern-php}, we traced PHP from the C runtime up because every PHP-FPM request starts in a fresh isolated process. FastAPI works completely differently: one Python worker holds an in-memory HTTP server serving hundreds of concurrent users at once. That design enables sub-millisecond overhead---until one innocent-looking import breaks everything.
+
+Consider this 12-line FastAPI route:
+
+\begin{lstlisting}[language=Python,caption={The Classic 	exttt{async def} Event-Loop Freeze Bug}]
+import requests
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get("/profile/{user_id}")
+async def fetch_profile(user_id: int):
+    # BUG: requests.get() is synchronous blocking I/O!
+    resp = requests.get(f"https://upstream.internal/users/{user_id}", timeout=5.0)
+    return resp.json()
+\end{lstlisting}
+
+Suppose the upstream user service takes $3.0\text{\,s}$ to reply, and 10 users hit 	exttt{/profile/1} through 	exttt{/profile/10} at the exact same instant. How long does User 10 wait? Not $3.0\text{\,s}$---User 10 waits \textbf{30.0 seconds} while CPU sits near $0\%$! Why a single 	exttt{requests.get()} freezes nine other users, how ASGI and FastAPI wire requests cleanly, and what CPython actually executes underneath form the arc of this chapter.
+
+% ==========================================
+\section{Why One Blocking Call Freezes Ten Users}
+
+Building on Chapter~\ref{chap:concurrency}, FastAPI's 	exttt{asyncio} runtime runs all 	exttt{async def} route handlers on a \textbf{single OS thread} driven by an event loop (backed by 	exttt{epoll} on Linux or 	exttt{kqueue} on macOS).
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.88, transform shape,
+  node distance=0.9cm and 1.1cm,
+  node/.style={rectangle, draw=headingblue, fill=codebg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily},
+  accent/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily\bfseries},
+  line/.style={draw=headingblue, -{Stealth[length=2.5mm]}, thick}
+]
+  \node[accent] (poll) {\textbf{OS Selector (	exttt{epoll\_wait})}\\\small Wait for ready sockets or next timer};
+  \node[node, right=of poll] (timers) {\textbf{Drain Timers}\\\small Move expired 	exttt{\_scheduled} items to 	exttt{\_ready}};
+  \node[node, below=0.95cm of timers] (drain) {\textbf{Run 	exttt{\_ready} Callbacks}\\\small Step each coroutine until next 	exttt{await}};
+  \node[node, left=of drain] (yieldstep) {\textbf{Coroutine Awaits I/O}\\\small Register socket FD, yield back to loop};
+
+  \draw[line] (poll) -- (timers);
+  \draw[line] (timers) -- (drain);
+  \draw[line] (drain) -- (yieldstep);
+  \draw[line] (yieldstep) -- (poll);
+\end{tikzpicture}
+\caption{Single-thread 	exttt{asyncio} event loop cycle (	exttt{\_ready} deque and 	exttt{\_scheduled} min-heap).}
+\label{fig:v1-ch04-asyncio-loop}
+\end{figure}
+
+When User 1 calls 	exttt{fetch\_profile(1)}:
+\begin{itemize}[leftmargin=15pt]
+  \item With 	exttt{requests.get(...)}, Python executes a blocking C socket 	exttt{recv()} with \emph{no 	exttt{await} yield point}. The single event-loop thread goes to sleep inside the kernel for $3.0\text{\,s}$. Users 2--10 sit untouched in the TCP accept queue, each waiting $3.0\text{\,s}$ behind the previous user ($10 \times 3.0\text{\,s} = 30.0\text{\,s}$).
+  \item With 	exttt{async with httpx.AsyncClient()} and 	exttt{await client.get(...)}, User 1's coroutine registers its socket with 	exttt{epoll} and immediately yields back to the event loop in microseconds. Users 2--10 all fire their upstream HTTP requests immediately, and all 10 finish in $\approx 3.0\text{\,s}$ total.
+\end{itemize}
+
+\begin{intuitionbox}[One Barista vs.\ Ten Coffee Machines]
+Think of the event loop as one fast barista taking orders. Calling 	exttt{await httpx.get()} is starting an espresso machine and turning to the next customer while it brews. Calling 	exttt{requests.get()} is staring motionless at machine \#1 for three minutes while the line out the door stops completely.
+\end{intuitionbox}
+
+\subsection{How Coroutines Pause and Resume: 	exttt{Task.\_step()}}
+
+Calling an 	exttt{async def} function does \emph{not} run its body---it returns a paused coroutine object. An 	exttt{asyncio.Task} drives that coroutine forward via 	exttt{coro.send(None)} inside a minimal scheduler loop:
+
+\begin{lstlisting}[language=Python,caption={How 	exttt{asyncio.Task} Drives a Coroutine (	exttt{SimpleTask})}]
+class SimpleTask:
+    def __init__(self, coro, loop):
+        self._coro = coro
+        self._loop = loop
+        self._loop.call_soon(self._step)
+
+    def _step(self, exc=None):
+        try:
+            if exc is None:
+                result = self._coro.send(None)  # Run until next yield/await
+            else:
+                result = self._coro.throw(exc)
+        except StopIteration as done:
+            self.set_result(done.value)        # Coroutine returned!
+            return
+
+        if result is None:
+            # Bare yield (yielded None): reschedule on next loop turn
+            self._loop.call_soon(self._step)
+        else:
+            # Yielded a Future: wake up when that Future completes
+            result.add_done_callback(self._wakeup)
+
+    def _wakeup(self, future):
+        self._loop.call_soon(self._step)
+\end{lstlisting}
+
+\textbf{Step-by-step walkthrough:}
+\begin{enumerate}[leftmargin=15pt]
+  \item Line 5 puts 	exttt{self.\_step} onto the loop's 	exttt{\_ready} FIFO queue.
+  \item When popped, line 10 calls 	exttt{self.\_coro.send(None)}, executing the coroutine up to its next 	exttt{await}.
+  \item If the coroutine awaits an unresolved 	exttt{Future} (such as a socket read), 	exttt{result} is that 	exttt{Future}; line 22 attaches 	exttt{self.\_wakeup} so when 	exttt{epoll} marks the socket ready, 	exttt{\_wakeup} re-queues 	exttt{\_step}.
+  \item If a low-level generator yielded 	exttt{None} directly (cooperative yield without waiting on an external Future), line 18 guards 	exttt{result is None} and re-schedules 	exttt{\_step} immediately instead of crashing with 	exttt{AttributeError: 'NoneType' object has no attribute 'add\_done\_callback'}.
+  \item When the coroutine executes 	exttt{return value}, Python raises 	exttt{StopIteration(value)}, caught at line 13 to resolve the Task.
+\end{enumerate}
+
+\begin{realworldbox}[Hunting Down Event-Loop Starvation in Production]
+\textbf{Symptom:} A 32-core FastAPI service reports p99 latency climbing from 15\,ms to 1,900\,ms under modest traffic while CPU hovers below 10\% and health-check probes intermittently time out.
+
+\textbf{Diagnostic Steps:}
+\begin{enumerate}[leftmargin=15pt,itemsep=2pt]
+  \item Enable 	exttt{PYTHONASYNCIODEBUG=1} in staging (or set 	exttt{loop.slow\_callback\_duration = 0.1}) to capture warnings such as 	exttt{Executing <Task ...> took 1.420 seconds}.
+  \item Attach 	exttt{py-spy top --pid <uvicorn\_worker\_pid>} under load: if the hot stack trace sits inside 	exttt{urllib3}, 	exttt{requests}, 	exttt{psycopg2}, or CPU-heavy PDF/image rendering inside an 	exttt{async def} route, the event loop is blocked.
+  \item Replace blocking I/O with native async clients (	exttt{httpx}, 	exttt{asyncpg}), or offload unavoidable synchronous/CPU helpers to a worker threadpool via 	exttt{await asyncio.to\_thread(fn, *args)} (or 	exttt{ProcessPoolExecutor} for heavy CPU work).
+\end{enumerate}
+\end{realworldbox}
+
+% ==========================================
+\section{ASGI, Starlette Middleware, and Lifespan}
+
+Older Python frameworks (Django WSGI, Flask) used 	extbf{WSGI (PEP 3333)}, a synchronous function 	exttt{app(environ, start\_response)} that returns a response list on one thread per request---making WebSockets and concurrent streaming awkward.
+
+\textbf{ASGI (Asynchronous Server Gateway Interface)} replaces WSGI with a single async coroutine signature:
+$$	exttt{async def app(scope, receive, send) -> None}$$
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{	exttt{scope}:} Connection metadata dict (	exttt{scope["type"]} is 	exttt{"http"}, 	exttt{"websocket"}, or 	exttt{"lifespan"}; includes 	exttt{path}, 	exttt{method}, 	exttt{headers}).
+  \item \textbf{	exttt{receive}:} Async callable returning inbound event dicts (such as 	exttt{\{"type": "http.request", "body": b"...", "more\_body": True\}}).
+  \item \textbf{	exttt{send}:} Async callable accepting outbound events (	exttt{http.response.start}, 	exttt{http.response.body}).
+\end{itemize}
+
+Crucially, HTTP request bodies can arrive in multiple streamed chunks. Calling 	exttt{await receive()} only once silently drops later chunks when 	exttt{more\_body} is 	exttt{True}! A compliant raw ASGI app loops until 	exttt{more\_body} becomes 	exttt{False}:
+
+\begin{lstlisting}[language=Python,caption={Compliant Pure ASGI 3.0 HTTP Handler Reading Full Chunked Bodies}]
+async def minimal_asgi_app(scope, receive, send):
+    assert scope["type"] == "http"
+
+    chunks = []
+    while True:
+        event = await receive()
+        chunks.append(event.get("body", b""))
+        if not event.get("more_body", False):
+            break
+    full_body = b"".join(chunks)
+
+    await send({
+        "type": "http.response.start",
+        "status": 200,
+        "headers": [(b"content-type", b"application/json")],
+    })
+    await send({
+        "type": "http.response.body",
+        "body": f'{{"received_bytes": {len(full_body)}}}'.encode("utf-8"),
+    })
+\end{lstlisting}
+
+\textbf{Walkthrough:} For a 10\,KB chunked POST split into two events (	exttt{more\_body=True}, then 	exttt{more\_body=False}), lines 5--9 accumulate both byte slices into 	exttt{chunks} and assemble 	exttt{full\_body}. Lines 12--20 emit the status/headers event followed by the JSON body event.
+
+\subsection{Starlette Lifespan Handlers}
+
+Starlette (FastAPI's core ASGI toolkit) uses ASGI 	exttt{lifespan} events so connection pools initialize once before traffic starts and close cleanly on shutdown:
+
+\begin{lstlisting}[language=Python,caption={FastAPI Lifespan Pool Management}]
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+import asyncpg
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.pool = await asyncpg.create_pool(
+        dsn="postgresql://user:pass@localhost:5432/prod", min_size=10, max_size=50
+    )
+    yield
+    await app.state.pool.close()
+
+app = FastAPI(lifespan=lifespan)
+\end{lstlisting}
+
+% ==========================================
+\section{FastAPI Dependency Injection and Pydantic v2}
+
+\subsection{Dependency Graphs, 	exttt{yield} Cleanup, and Test Overrides}
+
+When a route declares 	exttt{db: AsyncSession = Depends(get\_db)} and 	exttt{user: User = Depends(get\_current\_user)}, FastAPI inspects parameter signatures, builds a Directed Acyclic Graph (DAG) of sub-dependencies, and resolves each dependency \textbf{once per request} (	exttt{use\_cache=True} by default) so multiple sub-dependencies sharing 	exttt{Depends(get\_db)} reuse the same session.
+
+Using 	exttt{yield} inside a dependency turns it into a request-scoped context manager for transaction boundaries:
+
+\begin{lstlisting}[language=Python,caption={Clean 	exttt{yield} Database Transaction Dependency}]
+from collections.abc import AsyncGenerator
+from sqlalchemy.ext.asyncio import AsyncSession
+
+async def get_db_transaction() -> AsyncGenerator[AsyncSession, None]:
+    async with async_session_factory() as session:
+        async with session.begin():
+            yield session
+            # session.begin() commits on normal exit and rolls back automatically on exception
+\end{lstlisting}
+
+Notice we do \emph{not} manually add 	exttt{except Exception: await session.rollback()} inside 	exttt{async with session.begin():}---SQLAlchemy's 	exttt{begin()} context manager already handles commit on clean return and rollback on any exception! In tests, 	exttt{app.dependency\_overrides[get\_current\_user] = mock\_user} swaps dependencies cleanly without monkey-patching, and 	exttt{app.dependency\_overrides.clear()} resets state afterward.
+
+\subsection{Pydantic v2: Rust 	exttt{pydantic-core} Validation}
+
+Pydantic v1 ran recursive Python loops to validate JSON, often consuming over half of request CPU time. \textbf{Pydantic v2} moves the validation engine into Rust (	exttt{pydantic-core}):
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.88, transform shape,
+  node distance=0.9cm and 1.2cm,
+  box/.style={rectangle, draw=headingblue, fill=codebg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily},
+  rustbox/.style={rectangle, draw=warningRed, fill=warningBg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily\bfseries},
+  line/.style={draw=headingblue, -{Stealth[length=2.5mm]}, thick}
+]
+  \node[box] (py) {\textbf{Python 	exttt{BaseModel}}\\\small Type Annotations};
+  \node[box, right=of py] (schema) {\textbf{Core Schema}\\\small Compiled once at import};
+  \node[rustbox, right=of schema] (core) {\textbf{pydantic-core (Rust)}\\\small 	exttt{SchemaValidator} DAG};
+  \node[rustbox, below=0.95cm of core] (json) {\textbf{Direct JSON Parser}\\\small Validates raw UTF-8 bytes in Rust};
+  \node[box, left=of json] (obj) {\textbf{Model Instance}\\\small Typed Python attributes ready};
+
+  \draw[line] (py) -- (schema);
+  \draw[line] (schema) -- (core);
+  \draw[line] (core) -- (json);
+  \draw[line] (json) -- (obj);
+\end{tikzpicture}
+\caption{Pydantic v2 validation pipeline compiling Python type hints into a Rust validator DAG.}
+\label{fig:v1-ch04-pydantic-v2}
+\end{figure}
+
+At model import time, Pydantic compiles field types into a validator DAG in Rust. At runtime, 	exttt{OrderRequest.model\_validate\_json(raw\_bytes)} parses and validates raw JSON bytes inside Rust before constructing Python objects, and 	exttt{order.model\_dump()} (replacing deprecated v1 	exttt{.dict()}) serializes back out cleanly:
+
+\begin{lstlisting}[language=Python,caption={Strict Pydantic v2 Model and 	exttt{model\_dump()}}]
+from pydantic import BaseModel, Field, ConfigDict
+from uuid import UUID
+
+class OrderRequest(BaseModel):
+    model_config = ConfigDict(strict=True, str_strip_whitespace=True, frozen=True)
+    order_id: UUID
+    customer_id: int = Field(gt=0)
+    amount_in_cents: int = Field(gt=0, le=100_000_000)
+\end{lstlisting}
+
+% ==========================================
+\section{Opening the Hood: CPython Compilation, 	exttt{ceval.c}, and the GIL}
+
+Now that we know how FastAPI behaves at the ASGI level, let's look inside the Python interpreter to see \emph{why} Python bytecode behaves this way and why the Global Interpreter Lock exists.
+
+First, what does it mean that \textbf{CPython is the reference implementation of Python}? Python itself is a language specification (syntax rules, data model, standard library behavior). \textbf{CPython} is the official C implementation maintained by the Python core team; alternative implementations like PyPy (JIT), MicroPython (microcontrollers), and RustPython treat CPython's observable behavior as the authoritative standard to match.
+
+\subsection{Tracing 	exttt{def add(a, b): return a + b} Through CPython's Pipeline}
+
+Let's trace an actual 2-line Python function through CPython's four compilation stages:
+
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Tokenizing:} CPython's tokenizer breaks characters into typed tokens:
+  	exttt{NAME 'def'}, 	exttt{NAME 'add'}, 	exttt{OP '('}, 	exttt{NAME 'a'}, 	exttt{OP ','}, 	exttt{NAME 'b'}, 	exttt{OP ')'}, 	exttt{OP ':'}, 	exttt{NEWLINE}, 	exttt{INDENT}, 	exttt{NAME 'return'}, 	exttt{NAME 'a'}, 	exttt{OP '+'}, 	exttt{NAME 'b'}, 	exttt{DEDENT}.
+  \item \textbf{PEG Parsing Directly to AST (PEP 617):} Older CPython ($<3.9$) used an LL(1) parser that first built a Concrete Syntax Tree (CST) holding every parenthesis and token, and then converted that CST into an AST. Since Python 3.9, CPython's 	extbf{PEG (Parsing Expression Grammar) parser} (	exttt{Grammar/python.gram}) \textbf{constructs the AST directly}, skipping the intermediate CST allocation completely \cite{pep617}. (Formatters and refactoring tools such as 	exttt{LibCST} still build CSTs separately when they must preserve exact comments and formatting.) Running 	exttt{ast.dump(ast.parse("def add(a, b): return a + b"), indent=2)} outputs:
+\begin{lstlisting}[language=sh]
+Module(body=[
+  FunctionDef(
+    name='add',
+    args=arguments(args=[arg(arg='a'), arg(arg='b')]),
+    body=[
+      Return(value=BinOp(left=Name(id='a', ctx=Load()),
+                         op=Add(),
+                         right=Name(id='b', ctx=Load())))])])
+\end{lstlisting}
+  \item \textbf{Symbol Table \& Lowering to CFG / Bytecode:} CPython builds a symbol table marking 	exttt{a} and 	exttt{b} as fast local slots (	exttt{0} and 	exttt{1}), 	extbf{lowers} high-level AST control structures (loops, 	exttt{with}, 	exttt{try}) into a Control Flow Graph (CFG) of basic blocks, and emits 16-bit bytecode instructions stored in a 	exttt{PyCodeObject}. Running 	exttt{dis.dis(add)} prints:
+\begin{lstlisting}[language=sh]
+  1           RESUME                   0
+  2           LOAD_FAST                0 (a)
+              LOAD_FAST                1 (b)
+              BINARY_OP                0 (+)
+              RETURN_VALUE
+\end{lstlisting}
+  (In Python 3.13+, consecutive local loads often fuse into a single superinstruction such as 	exttt{LOAD\_FAST\_LOAD\_FAST} or 	exttt{LOAD\_FAST\_BORROW\_LOAD\_FAST\_BORROW}.)
+\end{enumerate}
+
+\subsection{Inside 	exttt{PyCodeObject}, Frames, and 	exttt{Python/ceval.c}}
+
+In Python 3.11+, compiled code lives in 	exttt{PyCodeObject} (whose adaptive instruction array 	exttt{co\_code\_adaptive} holds 16-bit 	exttt{\_Py\_CODEUNIT} slots for PEP 659 runtime specialization, while 	exttt{code.co\_code} exposes a read-only 	exttt{bytes} view in Python). When 	exttt{add(3, 4)} runs, CPython pushes a lightweight 	exttt{\_PyInterpreterFrame} onto the thread's frame stack with a fast-locals array (	exttt{a}, 	exttt{b}) and an operand value stack.
+
+\begin{lstlisting}[language=C,caption={Simplified CPython 3.11+ Dispatch Loop Concept (	exttt{Python/ceval.c})}]
+for (;;) {
+    _Py_CODEUNIT instruction = *next_instr++;
+    int opcode = _Py_OPCODE(instruction);
+    int oparg = _Py_OPARG(instruction);
+
+    switch (opcode) {
+        case LOAD_FAST: {
+            PyObject *val = localsplus[oparg];
+            Py_INCREF(val);
+            *stack_pointer++ = val;
+            DISPATCH();
+        }
+        case BINARY_OP_ADD_INT: {
+            /* C99 block required to declare variables inside switch case */
+            PyObject *right = *--stack_pointer;
+            PyObject *left = *--stack_pointer;
+            PyObject *res = PyLong_FromLong(
+                PyLong_AS_LONG(left) + PyLong_AS_LONG(right)
+            );
+            Py_DECREF(left);
+            Py_DECREF(right);
+            if (res == NULL) goto error;
+            *stack_pointer++ = res;
+            DISPATCH();
+        }
+        case RETURN_VALUE:
+            return *--stack_pointer;
+    }
+}
+\end{lstlisting}
+
+\begin{underthehoodbox}[Specializing Adaptive Interpreter (PEP 659)]
+If 	exttt{add(a, b)} is called repeatedly with two 	exttt{int}s, CPython's adaptive interpreter rewrites the generic 	exttt{BINARY\_OP} slot inside 	exttt{co\_code\_adaptive} in place into 	exttt{BINARY\_OP\_ADD\_INT} (guarded by quick type checks), skipping generic operator lookup!
+\end{underthehoodbox}
+
+\subsection{The GIL and Free-Threaded Python (3.12--3.13+)}
+
+Every Python value inherits from 	exttt{PyObject}. In Python 3.10 and earlier, 	exttt{PyObject} held a simple signed 	exttt{Py\_ssize\_t ob\_refcnt} plus 	exttt{PyTypeObject *ob\_type}; in Python 3.12+, 	exttt{ob\_refcnt} uses a 32-bit/64-bit split representation supporting \textbf{immortal objects} (singletons like 	exttt{None}, 	exttt{True}, and small ints whose refcounts are never mutated).
+
+Standard CPython protects non-atomic 	exttt{Py\_INCREF}/	exttt{Py\_DECREF} updates with the 	extbf{Global Interpreter Lock (GIL)}: only one OS thread runs Python bytecode at a time (switching roughly every $5\text{\,ms}$ via 	exttt{sys.getswitchinterval()}), though blocking C calls like socket 	exttt{recv()} or 	exttt{epoll\_wait()} release the GIL. Experimental 	extbf{free-threaded Python} (PEP 703, Python 3.13+ 	exttt{--disable-gil} \cite{pep703}) replaces the GIL by adding per-object thread IDs and mutexes (	exttt{ob\_tid}, 	exttt{ob\_mutex}) with 	extbf{Biased Reference Counting} (local non-atomic updates by the owning thread, atomic updates by others) and thread-local heaps via Microsoft's 	exttt{mimalloc}.
+
+\begin{tryityourselfbox}[Predict 	exttt{ast.dump} and 	exttt{dis.dis}]
+Given 	exttt{def calc(x, y): return (x + 1) * y}, write down the AST root inside 	exttt{Return(value=...)} and predict the exact order of stack pushes and 	exttt{BINARY\_OP} instructions emitted by 	exttt{dis.dis(calc)}.
+\end{tryityourselfbox}
+
+% ==========================================
+\section{Chapter Summary \protect\& Key Takeaways}
+
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{Event Loop Discipline:} Blocking I/O (	exttt{requests}, 	exttt{time.sleep}, 	exttt{psycopg2}) inside 	exttt{async def} freezes the entire single-threaded loop; use async clients or 	exttt{asyncio.to\_thread()}.
+  \item \textbf{ASGI \& Starlette:} ASGI's 	exttt{(scope, receive, send)} protocol must loop 	exttt{await receive()} until 	exttt{more\_body} is 	exttt{False} to handle chunked bodies; 	exttt{lifespan} manages shared DB pools cleanly.
+  \item \textbf{FastAPI \& Pydantic v2:} 	exttt{Depends()} caches per-request DAG resolutions; 	exttt{yield} dependencies with 	exttt{async with session.begin():} handle commit/rollback automatically; Pydantic v2 validates JSON in Rust (	exttt{pydantic-core}) and serializes via 	exttt{.model\_dump()}.
+  \item \textbf{CPython Internals:} CPython's PEP 617 PEG parser builds the AST directly (no CST), lowers AST to CFG/bytecode (	exttt{PyCodeObject} with adaptive specialization in 3.11+), and protects refcounts with the GIL (or Biased Reference Counting + 	exttt{mimalloc} in PEP 703 free-threaded builds).
+\end{itemize}
+
+% ==========================================
+\section{Exercises and Real-World Scenarios}
+
+\subsection{Mechanics Exercises}
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Exercise~\thechapter.1:} Write a pure ASGI 3.0 middleware class 	exttt{TimingMiddleware} (without Starlette base classes) that measures request duration in milliseconds and injects 	exttt{X-Process-Time-Ms} into every HTTP response while passing WebSocket/lifespan scopes untouched.
+  \item \textbf{Exercise~\thechapter.2:} Reconstruct the exact Python function that compiles to:
+\begin{lstlisting}[language=sh]
+  1           RESUME                   0
+  2           LOAD_FAST                0 (x)
+              LOAD_FAST                1 (y)
+              BINARY_OP                0 (+)
+              RETURN_VALUE
+\end{lstlisting}
+\end{enumerate}
+
+\subsection{Debugging Exercise}
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Exercise~\thechapter.3:} Under 500 concurrent requests, this FastAPI route stalls completely. Identify every bug (concurrency and Pydantic v2) and write the corrected code:
+\begin{lstlisting}[language=Python]
+@app.post("/generate-report")
+async def generate_report(data: ReportInput):
+    pdf_bytes = render_heavy_pdf_canvas(data.dict())
+    send_email_via_smtp(data.email, pdf_bytes)  # uses smtplib.SMTP
+    return {"status": "dispatched"}
+\end{lstlisting}
+\end{enumerate}
+
+\subsection{Architecture Design Problem}
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Exercise~\thechapter.4:} Design an asynchronous rate-limited webhook dispatcher in FastAPI and 	exttt{httpx.AsyncClient} that limits concurrent outbound HTTP calls to 50 using 	exttt{asyncio.Semaphore}, retries failed requests up to 3 times with exponential backoff, avoids holding semaphore slots while sleeping on backoff, and closes the client cleanly during ASGI lifespan shutdown.
+\end{enumerate}
+
+% ==========================================
+\section{Detailed Solutions}
+
+\subsection{Solution to Try It Yourself: 	exttt{calc(x, y)} AST and Bytecode}
+The 	exttt{Return} value AST is:
+\begin{verbatim}
+BinOp(
+  left=BinOp(left=Name(id='x', ctx=Load()), op=Add(), right=Constant(value=1)),
+  op=Mult(),
+  right=Name(id='y', ctx=Load()))
+\end{verbatim}
+Bytecode order evaluates the left subtree first, then multiplies by 	exttt{y}:
+\begin{verbatim}
+RESUME      0
+LOAD_FAST   0 (x)
+LOAD_CONST  1 (1)
+BINARY_OP   0 (+)     # Pops x, 1; pushes (x + 1)
+LOAD_FAST   1 (y)
+BINARY_OP   5 (*)     # Pops (x + 1), y; pushes (x + 1) * y
+RETURN_VALUE
+\end{verbatim}
+
+\subsection{Solution~\thechapter.1: Pure ASGI 	exttt{TimingMiddleware}}
+\begin{lstlisting}[language=Python]
+import time
+
+class TimingMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        start = time.perf_counter()
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                elapsed_ms = (time.perf_counter() - start) * 1000
+                headers = list(message.get("headers", []))
+                headers.append((b"x-process-time-ms", f"{elapsed_ms:.2f}".encode("latin1")))
+                message["headers"] = headers
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+\end{lstlisting}
+
+\subsection{Solution~\thechapter.2: Disassembled Bytecode Reconstruction}
+\begin{lstlisting}[language=Python]
+def add(x, y):
+    return x + y
+\end{lstlisting}
+	exttt{LOAD\_FAST} pushes local slots 	exttt{0} (	exttt{x}) and 	exttt{1} (	exttt{y}) onto the frame stack, 	exttt{BINARY\_OP 0 (+)} pops both and pushes 	exttt{x + y}, and 	exttt{RETURN\_VALUE} returns the top of stack.
+
+\subsection{Solution~\thechapter.3: Fixing Event-Loop Starvation and Pydantic v2 API}
+\textbf{Diagnosis:} 	exttt{render\_heavy\_pdf\_canvas} is CPU-bound and 	exttt{smtplib.SMTP} performs synchronous blocking network I/O directly inside an 	exttt{async def} handler, starving all 499 sibling requests on the event loop. Also, 	exttt{data.dict()} is deprecated in Pydantic v2 and should be 	exttt{data.model\_dump()}.
+\begin{lstlisting}[language=Python]
+from fastapi import BackgroundTasks
+
+def sync_pdf_and_email(payload: dict, email: str) -> None:
+    pdf_bytes = render_heavy_pdf_canvas(payload)
+    send_email_via_smtp(email, pdf_bytes)
+
+@app.post("/generate-report")
+async def generate_report(data: ReportInput, background_tasks: BackgroundTasks):
+    # FastAPI runs synchronous background functions in AnyIO's worker threadpool
+    background_tasks.add_task(sync_pdf_and_email, data.model_dump(), data.email)
+    return {"status": "dispatched"}
+\end{lstlisting}
+
+\subsection{Solution~\thechapter.4: Deadlock-Free Rate-Limited Webhook Dispatcher}
+Notice the critical concurrency rule: \textbf{never put the retry/sleep recursion inside 	exttt{async with self.semaphore:}}! If 50 requests fail simultaneously and sleep/recurse while still holding their semaphore permits, any retry trying to re-acquire 	exttt{self.semaphore} (or 50 tasks sleeping while holding all permits) stalls throughput or deadlocks! Acquire the semaphore \emph{only} around the actual HTTP call:
+
+\begin{lstlisting}[language=Python]
+import asyncio
+from contextlib import asynccontextmanager
+import httpx
+from fastapi import FastAPI
+
+class WebhookDispatcher:
+    def __init__(self, max_concurrency: int = 50, max_attempts: int = 3):
+        self.semaphore = asyncio.Semaphore(max_concurrency)
+        self.max_attempts = max_attempts
+        self.client = httpx.AsyncClient(timeout=10.0)
+
+    async def dispatch(self, url: str, payload: dict) -> int:
+        last_exc: Exception | None = None
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                async with self.semaphore:
+                    response = await self.client.post(url, json=payload)
+                response.raise_for_status()
+                return response.status_code
+            except (httpx.HTTPError, httpx.TimeoutException) as exc:
+                last_exc = exc
+                if attempt == self.max_attempts:
+                    raise
+                await asyncio.sleep(0.2 * (2 ** (attempt - 1)))
+        raise RuntimeError("Unreachable") from last_exc
+
+    async def aclose(self) -> None:
+        await self.client.aclose()
+
+dispatcher = WebhookDispatcher(max_concurrency=50)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    await dispatcher.aclose()
+
+app = FastAPI(lifespan=lifespan)
+\end{lstlisting}
+
+\begin{labbridgebox}[Build \& Trace Async Python Services]
+\begin{itemize}[leftmargin=15pt,itemsep=2pt]
+  \item 	exttt{exercises/volume1/ex03\_python\_asyncio\_event\_loop.py}: Observe 	exttt{asyncio.Semaphore} concurrency caps and task timeouts locally.
+  \item 	exttt{projects/p03-python-fastapi-api/}: Inspect 	exttt{app/main.py}, 	exttt{app/middleware.py}, 	exttt{app/schemas.py} (Pydantic v2), and run 	exttt{pytest} inside 	exttt{tests/test\_api.py}.
+\end{itemize}
+\end{labbridgebox}
+
+\section*{Further Reading}
+See PEP 617 on CPython's PEG parser \cite{pep617}, PEP 703 on free-threaded Python \cite{pep703}, and the ASGI 3.0 \& Pydantic v2 specifications.

@@ -1,0 +1,343 @@
+\chapter{SLOs, SLIs, and SLAs}
+\label{chap:slos}
+
+\begin{chaptergoalsbox}
+\textbf{What You Will Learn:}
+\begin{itemize}[leftmargin=12pt]
+  \item Distinguish the three reliability tiers: **SLI** (measured reality), **SLO** (internal engineering target), and **SLA** (legally binding contract).
+  \item Formulate mathematically valid event-ratio SLIs bounded strictly between $0\%$ and $100\%$, avoiding client-error denominator bugs.
+  \item Understand **Prometheus Counters**, \texttt{rate()}, and **counter resets** from scratch so PromQL rules hold during pod restarts.
+  \item Derive **Error Budgets** and **Multi-Window Multi-Burn-Rate** formulas algebraically, replacing noisy static thresholds with precision alerting.
+  \item Enforce **Error Budget Policies** that balance release velocity with mandatory stability sprints.
+\end{itemize}
+
+\textbf{Prerequisites \& Calibration:}
+No prior Prometheus, PromQL, or integral calculus experience is assumed. We build Prometheus counter math from a 4-sample pod-restart example and derive burn-rate fractions using plain division.
+
+\textbf{Opening Problem:}
+An analytics team faces two opposite failures in the same week. First, on-call engineers receive 25 PagerDuty pages every night from a static rule (\textit{``Page if error rate $> 1\%$ for 5 minutes''}), nearly all from brief spikes that resolve on their own, causing severe burnout. Second, a Tuesday deploy introduces a leak causing HTTP \texttt{500} errors on $1.8\%$ of checkout requests. Because a colleague raised the static threshold to $5\%$ to stop the noise, that $1.8\%$ bleed runs silently for five days---burning $100\%$ of the monthly reliability budget and triggering customer SLA credits.
+\end{chaptergoalsbox}
+
+\section{The Reliability Hierarchy: SLI, SLO, SLA}
+
+Site Reliability Engineering (SRE) replaces political tug-of-war between ``ship faster'' and ``freeze changes'' with three clear definitions~\cite{beyer2016site}:
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Service Level Indicator (SLI)}: The actual, empirically measured metric right now (e.g., percentage of valid HTTP requests that succeeded over the last 30 days).
+  \item \textbf{Service Level Objective (SLO)}: The internal target range owned jointly by Product and Engineering (e.g., $\text{SLI} \ge 99.9\%$ over any rolling 30-day window).
+  \item \textbf{Service Level Agreement (SLA)}: The external legal contract promising refunds or credits if reliability drops below a lower floor (e.g., $99.0\%$ uptime).
+\end{enumerate}
+
+\begin{intuitionbox}[Speedometer, Target Speed, and Legal Speed Limit]
+Think of the **SLI** as your car's speedometer (measured speed), the **SLO** as your cruise-control target (65 mph to arrive safely on time), and the **SLA** as the legal speed limit where police issue tickets (75 mph). Always set your internal SLO stricter than your external SLA ($\text{SLO} > \text{SLA}$) so engineering notices trouble long before lawyers get involved.
+\end{intuitionbox}
+
+\section{Mathematical Formulation of Valid SLIs}
+
+Google SRE expresses every modern SLI as a ratio of counts:
+\begin{equation}
+\text{SLI} = \frac{\sum \text{Good Events}}{\sum \text{Valid Events}} \times 100\%
+\end{equation}
+Because every Good Event must also be a Valid Event ($\text{Good} \subseteq \text{Valid}$), a valid SLI is **mathematically guaranteed to stay inside $[0\%, 100\%]$**.
+
+\subsection{Fixing the Classic Availability SLI Trap}
+
+A widespread bug happens when teams write: \textit{``Good = status $< 500$, Valid = status $\neq 4xx$.''} Test that on 80 \texttt{200 OK} requests and 20 \texttt{404 Not Found} requests: the numerator would be $80 + 20 = 100$, while the denominator is $80$, yielding **$125\%$ availability**!
+
+To keep $\text{Good} \subseteq \text{Valid}$, treat \texttt{4xx} client errors consistently in \emph{both} numerator and denominator:
+\begin{equation}
+\text{SLI}_{\text{avail}} = \frac{\text{Count of HTTP requests with } 200 \le \text{status} < 400}{\text{Count of valid HTTP requests with status} \notin [400, 499]} \times 100\%
+\end{equation}
+Check our numbers again: with 80 \texttt{200 OK}, 20 \texttt{404}, and 0 \texttt{500}, $\text{SLI}_{\text{avail}} = 80 / 80 = 100\%$. With 80 \texttt{200 OK}, 10 \texttt{404}, and 10 \texttt{500}, $\text{SLI}_{\text{avail}} = 80 / 90 = 88.89\%$. Excluding \texttt{4xx} from both sides prevents a flood of bad client requests (like a broken scraper hitting \texttt{404}) from masking real server health or inflating availability above $100\%$. (An alternative valid convention counts \texttt{4xx} as Good in the numerator \emph{and} includes them in the denominator: $\text{Count(status < 500)} / \text{Count(all requests)}$, though excluding \texttt{4xx} from both gives a cleaner signal of server behavior.)
+
+\subsection{Latency SLI}
+
+A latency SLI measures the fraction of valid requests finishing within a threshold $T$ (e.g., $T = 200\text{ ms}$):
+\begin{equation}
+\text{SLI}_{\text{latency}} = \frac{\text{Count of valid requests with duration} \le T}{\text{Total count of valid requests}} \times 100\%
+\end{equation}
+In Chapter~\ref{chap:requirements}, we read this directly from the cumulative request histogram (or continuous curve $\int_0^T f(t)\,dt$).
+
+\begin{commonmistakebox}[Targeting 100\% Availability]
+Promising $100\%$ availability is both physically impossible and economically wasteful: users' own Wi-Fi and mobile carriers drop connections well below $99.9\%$, and chasing five nines leaves zero room to deploy new code. The complement $(1 - \text{SLO})$ is your **Error Budget**---reliability headroom intentionally spent on feature releases and experiments.
+\end{commonmistakebox}
+
+\section{Error Budgets and Burn-Rate Derivation}
+
+For a rolling window $T_{\text{SLO}}$ (typically 30 days = 720 hours = 43,200 minutes), the **Error Budget** is:
+\begin{equation}
+\text{Error Budget} = 1 - \text{SLO}
+\end{equation}
+If $\text{SLO} = 99.95\%$ ($0.9995$) and an API serves $50,000,000$ valid requests per month, permissible failures are:
+\begin{equation}
+N_{\text{fail}} = 50,000,000 \times (1 - 0.9995) = 25,000 \text{ failed requests}
+\end{equation}
+
+\subsection{Deriving Burn Rate and \% Budget Burned}
+
+The **Burn Rate** ($B$) measures how fast we are spending that budget relative to a steady 30-day pace:
+\begin{equation}
+B = \frac{\text{Observed Error Rate}}{1 - \text{SLO}}
+\end{equation}
+At $B = 1$, an error rate equal to $(1 - \text{SLO})$ consumes exactly $100\%$ of the budget in $T_{\text{SLO}} = 720\text{ hours}$. At $B$ times that error rate, the budget empties $B$ times faster:
+\begin{equation}
+T_{\text{exhaust}} = \frac{T_{\text{SLO}}}{B}
+\end{equation}
+Over any observation window of length $W$ hours, the **fraction of the total monthly budget burned** is simply the ratio of $W$ to the exhaustion time $T_{\text{exhaust}}$:
+\begin{equation}
+\text{Budget Fraction Burned} = \frac{W}{T_{\text{exhaust}}} = B \times \frac{W}{T_{\text{SLO}}}
+\end{equation}
+Verify this algebraic identity on Google SRE's standard thresholds (for $T_{\text{SLO}} = 720\text{ h}$):
+\begin{itemize}[leftmargin=18pt]
+  \item $B = 14.4$ over $W = 1\text{ h}$: $14.4 \times \frac{1}{720} = 0.02 = \mathbf{2.0\%}$ burned (exhausts $100\%$ in $720/14.4 = 50\text{ h}$).
+  \item $B = 6.0$ over $W = 6\text{ h}$: $6.0 \times \frac{6}{720} = 0.05 = \mathbf{5.0\%}$ burned (exhausts $100\%$ in $720/6 = 120\text{ h} = 5\text{ days}$).
+  \item $B = 3.0$ over $W = 24\text{ h}$: $3.0 \times \frac{24}{720} = 0.10 = \mathbf{10.0\%}$ burned (exhausts $100\%$ in $10\text{ days}$).
+\end{itemize}
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lrrrrrl}
+\toprule
+\textbf{Severity} & \textbf{Burn Rate ($B$)} & \textbf{Budget Burned} & \textbf{Long Window ($W$)} & \textbf{Short Window} & \textbf{Time to 100\%} & \textbf{Action} \\
+\midrule
+\textbf{Page (Critical)} & 14.4 & 2.0\% & 1 hour & 5 minutes & 50 hours & Page on-call \\
+\textbf{Page (High)} & 6.0 & 5.0\% & 6 hours & 30 minutes & 5 days & Page during shift \\
+\textbf{Ticket (Medium)} & 3.0 & 10.0\% & 1 day & 2 hours & 10 days & File ticket \\
+\textbf{Ticket (Low)} & 1.0 & 10.0\% & 3 days & 6 hours & 30 days & Review next day \\
+\bottomrule
+\end{tabular}
+\caption{Google SRE Multi-Window Multi-Burn-Rate Alerting Standard (30-Day Window)}
+\label{tab:v5-ch05-burn-rate}
+\end{table}
+
+\subsection{Why Two Windows? Fast Spike vs.\ Slow Bleed}
+
+An alert fires only when \emph{both} the long window (e.g., 1h) and the short window (e.g., 5m) exceed the burn-rate threshold simultaneously. Figure~\ref{fig:v5-ch05-timeseries-burn} illustrates why this defeats both failure modes from our opening problem:
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Scenario A (Transient 3-Minute Spike)}: The 5-minute window jumps past $14.4\times$, then drops right back below the threshold when the glitch heals. The 1-hour average either never crosses $14.4\times$ or the alert resets within minutes---no 3 AM page!
+  \item \textbf{Scenario B (Sustained Bleed / Major Incident)}: Both the long window and short window climb past the threshold and stay above it, keeping the alert active cleanly until engineers mitigate the deploy. (Even a slow $1.8\%$ bleed on a $99.9\%$ SLO is $B = 0.018 / 0.001 = 18\times$, triggering the $14.4\times$ page within minutes instead of hiding for five days!)
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.92, every node/.style={transform shape},
+  axis/.style={thick, -{Stealth[scale=1.0]}}
+]
+
+% Axes
+\draw[axis] (0, 0) -- (12.2, 0) node[right, font=\sffamily\small]{Time (minutes)};
+\draw[axis] (0, 0) -- (0, 5.2) node[above, font=\sffamily\small]{Burn Rate ($B$)};
+
+% Threshold line 14.4x at y=2.6
+\draw[dashed, thick, color=warningRed] (0, 2.6) -- (11.8, 2.6);
+\node[font=\sffamily\scriptsize\bfseries\color{warningRed}, anchor=west] at (0.1, 2.82) {Critical Threshold ($B = 14.4\times$)};
+
+% Shaded alert region (x=7.4 to 11.6)
+\fill[warningRed!12] (7.4, 0) rectangle (11.6, 4.9);
+\node[font=\sffamily\tiny\bfseries\color{warningRed}, align=center] at (9.5, 4.55) {Alert Fires:\\Long AND Short $\ge 14.4\times$};
+
+% Scenario A: Transient 3-min spike (x=1.5 to 3.2)
+\draw[thick, color=exampleBlue] plot [smooth, tension=0.6] coordinates {
+  (0.2, 0.3) (1.2, 0.35) (1.8, 4.1) (2.3, 4.2) (2.8, 0.5) (5.0, 0.35)
+};
+\draw[thick, dotted, color=exampleBlue] plot [smooth, tension=0.6] coordinates {
+  (0.2, 0.3) (1.5, 0.35) (2.3, 1.45) (3.3, 1.1) (5.0, 0.45)
+};
+\node[font=\sffamily\tiny\bfseries\color{exampleBlue}, align=left] at (2.5, 4.65) {Transient Spike:\\5m spikes, 1h stays low $\rightarrow$ NO PAGE};
+
+% Scenario B: Sustained outage (x=6.0 onwards)
+\draw[thick, color=tryViolet] plot [smooth, tension=0.5] coordinates {
+  (5.0, 0.35) (6.2, 1.2) (6.6, 3.8) (8.0, 4.0) (11.5, 3.9)
+};
+\draw[thick, dotted, color=tryViolet] plot [smooth, tension=0.5] coordinates {
+  (5.0, 0.45) (6.4, 0.9) (7.4, 2.6) (8.8, 3.5) (11.5, 3.7)
+};
+
+% Legend
+\draw[thick, color=exampleBlue] (0.4, -0.8) -- (1.1, -0.8) node[right, font=\sffamily\tiny\color{textdark}]{5m Short Window (Spike)};
+\draw[thick, dotted, color=exampleBlue] (4.3, -0.8) -- (5.0, -0.8) node[right, font=\sffamily\tiny\color{textdark}]{1h Long Window (Spike)};
+\draw[thick, color=tryViolet] (8.1, -0.8) -- (8.8, -0.8) node[right, font=\sffamily\tiny\color{textdark}]{5m / 1h Sustained Burn};
+
+\end{tikzpicture}
+\caption{Time-Series Burn-Rate Plot: Filtering Transient Spikes While Catching Sustained Burns}
+\label{fig:v5-ch05-timeseries-burn}
+\end{figure}
+
+\section{Prometheus Counters, \texttt{rate()}, and Counter Resets}
+
+Before writing PromQL alert rules, we must understand what a Prometheus **Counter** actually stores. A Counter is a cumulative number that starts at `0` when an application pod boots and only ever goes up (e.g., `http_requests_total`).
+
+Suppose one pod records these cumulative counts every 15 seconds, and crashes/restarts at $t = 20\text{ s}$:
+$$t=0\text{ s}: 100 \quad\longrightarrow\quad t=15\text{ s}: 160 \quad\longrightarrow\quad \text{[pod restarts at 20s!]} \quad\longrightarrow\quad t=30\text{ s}: 20 \quad\longrightarrow\quad t=45\text{ s}: 80$$
+If you naively subtracted end minus start ($80 - 100 = -20$), you would report negative traffic! Prometheus's **`rate(metric[window])`** function solves this automatically:
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Counter Reset Detection}: Whenever a sample is smaller than the previous sample ($20 < 160$), \texttt{rate()} assumes the process restarted and adds back the pre-crash counter value ($160$):
+  $$\Delta = (160 - 100) + 20 + (80 - 20) = 60 + 20 + 60 = 140\text{ requests}$$
+  \item \textbf{Per-Second Rate & Extrapolation}: \texttt{rate()} divides $\Delta$ by the time span between samples (45 s $\rightarrow$ $140 / 45 \approx 3.11\text{ req/s}$, and extrapolates slightly to the window edges if needed).
+  \item \textbf{Aggregation Across Pods}: Wrapping \texttt{sum(rate(...))} adds the per-second rates across all running replicas without mixing individual pod restarts.
+\end{enumerate}
+
+\section{Production PromQL Rules (Line-by-Line Walkthrough)}
+
+Listing~\ref{lst:v5-ch05-promql} implements a $99.9\%$ availability SLO ($1 - \text{SLO} = 0.001$) using our corrected \texttt{status!~"4.."} denominator so \texttt{4xx} client errors never skew the ratio.
+
+\begin{lstlisting}[language=bash, caption={Prometheus Recording Rules and Multi-Burn-Rate Alert}, label={lst:v5-ch05-promql}]
+groups:
+  - name: service_slo_rules
+    rules:
+      - record: job:http_requests:error_ratio_1h
+        expr: >
+          sum(rate(http_requests_total{job="checkout-api", status=~"5.."}[1h]))
+          /
+          sum(rate(http_requests_total{job="checkout-api", status!~"4.."}[1h]))
+
+      - record: job:http_requests:error_ratio_5m
+        expr: >
+          sum(rate(http_requests_total{job="checkout-api", status=~"5.."}[5m]))
+          /
+          sum(rate(http_requests_total{job="checkout-api", status!~"4.."}[5m]))
+
+  - name: service_slo_alerts
+    rules:
+      - alert: CheckoutApiHighErrorBudgetBurn
+        expr: >
+          (job:http_requests:error_ratio_1h{job="checkout-api"} > (14.4 * 0.001))
+          and
+          (job:http_requests:error_ratio_5m{job="checkout-api"} > (14.4 * 0.001))
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "14.4x Error Budget Burn on Checkout API"
+\end{lstlisting}
+
+\textbf{Line-by-Line Walkthrough:}
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Lines 4--8}: Pre-computes the 1-hour server error ratio into a recording rule \texttt{job:http\_requests:error\_ratio\_1h}. \texttt{status=~"5.."} matches \texttt{500}--\texttt{599} errors; \texttt{status!~"4.."} excludes client errors from the denominator so the ratio stays strictly in $[0, 1]$. (If traffic drops to zero, division yields \texttt{NaN} so the alert safely does not fire.)
+  \item \textbf{Lines 10--14}: Computes the exact same ratio over a sensitive 5-minute window.
+  \item \textbf{Lines 18--22}: Multiplies the critical burn rate ($14.4$) by the error budget ($0.001$) to get an error-ratio threshold of $0.0144$ ($1.44\%$). The \texttt{and} requires \emph{both} 1h and 5m ratios to exceed $1.44\%$ continuously for \texttt{for: 2m} before paging.
+\end{itemize}
+
+\section{Error Budget Policies}
+
+An error budget without consequences is trivia. Table~\ref{tab:v5-ch05-budget-policy} defines the engineering contract tied to remaining budget.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lp{10.5cm}}
+\toprule
+\textbf{Remaining Budget} & \textbf{Mandatory Organizational Action} \\
+\midrule
+\textbf{$> 50\%$} & Normal release velocity: ship features, run experiments, refactor normally. \\
+\textbf{$10\% - 50\%$} & Double canary soak durations; postpone risky schema changes. \\
+\textbf{$< 10\%$} & Halt non-essential launches; shift sprint capacity to reliability fixes. \\
+\textbf{$0\%$ (Exhausted)} & \textbf{Feature Freeze}: Block feature deploys (security hotfixes only) until rolling reliability recovers above $0\%$. \\
+\bottomrule
+\end{tabular}
+\caption{Sample Organizational Error Budget Policy}
+\label{tab:v5-ch05-budget-policy}
+\end{table}
+
+\begin{realworldbox}[Diagnostic Walkthrough: Catching a Silent 1.8\% Error Bleed]
+\textbf{Symptoms:} Customers report intermittent checkout failures on Tuesday afternoon, while the legacy static CPU and $5\%$ error-rate alerts remain silent.\\
+\textbf{Metrics & Logs:} Running the new PromQL burn-rate expression returns \texttt{error\_ratio\_1h = 0.018} ($1.8\%$) and \texttt{error\_ratio\_5m = 0.019} against a $99.9\%$ SLO ($0.001$ budget). The burn rate is $B = 0.018 / 0.001 = 18.0\times$, exceeding the $14.4\times$ page threshold. Pod logs show \texttt{OOMError / ConnectionReset} in build \texttt{v2.14.0} deployed at 13:10 UTC.\\
+\textbf{Remediation:} Multi-window alerting pages within 8 minutes of deployment instead of 5 days later. The team rolls back to \texttt{v2.13.9}, spending only $3\%$ of the monthly error budget instead of $100\%$, and invokes the Error Budget Policy to add automated canary rollback checks before re-enabling feature deploys.
+\end{realworldbox}
+
+\begin{tryityourselfbox}[Calculate Burn Rate and Budget Exhaustion Time]
+An online banking API maintains a $99.95\%$ monthly availability SLO ($1 - \text{SLO} = 0.0005$) over 30 days ($720\text{ hours}$).
+\begin{enumerate}
+  \item Compute the error rate corresponding to a $14.4\times$ burn rate.
+  \item If the API suffers a sustained $1.0\%$ ($0.01$) server error rate, compute the actual burn rate $B$.
+  \item How many hours will this $1.0\%$ error rate take to consume $100\%$ of the 30-day error budget?
+\end{enumerate}
+\end{tryityourselfbox}
+
+\section{Summary \protect\& Key Takeaways}
+
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{SLI $\ge$ SLO $>$ SLA}: Measure reality (SLI), target internal safety (SLO), and leave a buffer above legal penalties (SLA).
+  \item \textbf{Consistent Denominators}: Exclude \texttt{4xx} client errors from both numerator and denominator so availability never exceeds $100\%$.
+  \item \textbf{Prometheus Counter Resets}: Always query counters via \texttt{rate(...[window])} so pod restarts do not create negative deltas.
+  \item \textbf{Multi-Window Burn Rates}: Requiring both long and short windows to exceed $B \times (1 - \text{SLO})$ cuts false-positive pages while catching slow bleeds rapidly.
+\end{itemize}
+
+\section{Exercises}
+
+\subsection*{Mechanics}
+\begin{enumerate}[label=\textbf{Exercise~\thechapter.\arabic*}, leftmargin=*]
+  \item A notification service processes $120,000,000$ valid requests over 30 days under a $99.9\%$ SLO. How many failed requests exhaust the budget?
+  \item Using $\text{Fraction Burned} = B \times (W / T_{\text{SLO}})$, calculate what percentage of a 30-day budget is consumed by a $6.0\times$ burn rate over a 6-hour window, and compute $T_{\text{exhaust}}$.
+\end{enumerate}
+
+\subsection*{Debugging}
+\begin{enumerate}[label=\textbf{Exercise~\thechapter.\arabic*}, leftmargin=*, start=3]
+  \item An engineer writes this alert rule:
+  \begin{lstlisting}[language=bash]
+  - alert: HighErrorRate
+    expr: rate(http_requests_500_total[1m]) > 5
+    for: 30s
+  \end{lstlisting}
+  Identify two major flaws explaining why it fails both at high traffic and low traffic.
+\end{enumerate}
+
+\subsection*{Architecture Design}
+\begin{enumerate}[label=\textbf{Exercise~\thechapter.\arabic*}, leftmargin=*, start=4]
+  \item Author a Prometheus rule group implementing both the $14.4\times$ (\texttt{1h} / \texttt{5m}) Critical Page alert and the $6.0\times$ (\texttt{6h} / \texttt{30m}) High Page alert for a $99.9\%$ availability SLO using valid \texttt{status!~"4.."} denominators.
+\end{enumerate}
+
+\section{Detailed Solutions}
+
+\subsection*{Try It Yourself Solution}
+\begin{enumerate}[leftmargin=18pt]
+  \item Error rate at $14.4\times$ burn rate:
+  $$\text{Error Rate} = 14.4 \times 0.0005 = 0.0072 \quad (0.72\%)$$
+  \item Actual burn rate during a $1.0\%$ ($0.01$) error rate:
+  $$B = \frac{0.01}{0.0005} = 20.0\times$$
+  \item Time to consume $100\%$ of the 30-day ($720\text{ hour}$) budget:
+  $$T_{\text{exhaust}} = \frac{720\text{ hours}}{20.0} = 36\text{ hours} \quad (1.5\text{ days})$$
+\end{enumerate}
+
+\subsection*{Mechanics, Debugging & Architecture Solutions}
+\begin{enumerate}[label=\textbf{Solution~\thechapter.\arabic*}, leftmargin=*]
+  \item Permissible failures: $120,000,000 \times (1 - 0.999) = 120,000,000 \times 0.001 = 120,000\text{ failed requests}$.
+  \item For $B = 6.0$, $W = 6\text{ h}$, $T_{\text{SLO}} = 720\text{ h}$:
+  $$\text{Budget Burned} = 6.0 \times \frac{6}{720} = 0.05 = 5.0\%, \qquad T_{\text{exhaust}} = \frac{30\text{ days}}{6.0} = 5\text{ days (120 hours)}$$
+  \item Two flaws: (1) **Absolute Rate Instead of Ratio**: At $100,000\text{ RPS}$, $5\text{ errors/s}$ is $99.995\%$ availability (false positive); at $10\text{ RPS}$, $4\text{ errors/s}$ is a $40\%$ outage that never triggers! (2) **Tiny \texttt{1m} Window + \texttt{30s} Hold**: Transient network blips page engineers constantly.
+  \item Listing~\ref{lst:v5-ch05-sol-alerts} shows the complete multi-window alert group.
+\end{enumerate}
+
+\begin{lstlisting}[language=bash, caption={Multi-Window Multi-Burn-Rate Prometheus Alert Rules ($99.9\%$ SLO)}, label={lst:v5-ch05-sol-alerts}]
+groups:
+  - name: api_slo_burn_alerts
+    rules:
+      - alert: ApiAvailabilityCriticalBurnRate
+        expr: >
+          (sum(rate(http_requests_total{status=~"5.."}[1h]))
+           / sum(rate(http_requests_total{status!~"4.."}[1h])) > (14.4 * 0.001))
+          and
+          (sum(rate(http_requests_total{status=~"5.."}[5m]))
+           / sum(rate(http_requests_total{status!~"4.."}[5m])) > (14.4 * 0.001))
+        for: 2m
+        labels: { severity: page, tier: critical }
+
+      - alert: ApiAvailabilityHighBurnRate
+        expr: >
+          (sum(rate(http_requests_total{status=~"5.."}[6h]))
+           / sum(rate(http_requests_total{status!~"4.."}[6h])) > (6.0 * 0.001))
+          and
+          (sum(rate(http_requests_total{status=~"5.."}[30m]))
+           / sum(rate(http_requests_total{status!~"4.."}[30m])) > (6.0 * 0.001))
+        for: 15m
+        labels: { severity: page, tier: high }
+\end{lstlisting}
+
+\begin{labbridgebox}
+Run \texttt{python3 exercises/volume5/ex01\_slo\_error\_budget\_burn.py} to verify burn-rate formulas in Python, and inspect the live Prometheus scrape configuration and dashboard metrics in \texttt{projects/p12-end-to-end-platform/observability/prometheus.yml} and \texttt{grafana-dashboard.json}.
+\end{labbridgebox}
+
+\section{Further Reading \protect\& Citations}
+\begin{itemize}[leftmargin=18pt]
+  \item Beyer, B., Murphy, N. R., Rensin, D. K., Kawahara, K. M., \& Thorne, S. (2018). \textit{The Site Reliability Workbook}. O'Reilly Media.
+  \item Beyer, B., Jones, C., Petoff, J., \& Murphy, N. R. (2016). \textit{Site Reliability Engineering}~\cite{beyer2016site}. O'Reilly Media.
+\end{itemize}

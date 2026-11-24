@@ -1,34 +1,6 @@
 \documentclass[11pt,oneside]{book}
 \input{../common/preamble.tex}
 
-% Custom listing language additions for YAML and HCL
-\lstdefinelanguage{yaml}{
-  keywords={true,false,null,y,n},
-  keywordstyle=\color{blue!80!black}\bfseries,
-  basicstyle=\ttfamily\footnotesize\color{textdark},
-  sensitive=false,
-  comment=[l]{\#},
-  morecomment=[s]{/*}{*/},
-  commentstyle=\color{gray!80!black}\itshape,
-  stringstyle=\color{green!50!black},
-  moredelim=[l][\color{headingblue}\bfseries]{:},
-  morestring=[b]',
-  morestring=[b]"
-}
-
-\lstdefinelanguage{hcl}{
-  keywords={terraform,provider,resource,data,variable,output,locals,module,dynamic,content,lifecycle,precondition,postcondition},
-  keywordstyle=\color{blue!80!black}\bfseries,
-  basicstyle=\ttfamily\footnotesize\color{textdark},
-  sensitive=true,
-  comment=[l]{\#},
-  morecomment=[l]{//},
-  morecomment=[s]{/*}{*/},
-  commentstyle=\color{gray!80!black}\itshape,
-  stringstyle=\color{green!50!black},
-  morestring=[b]"
-}
-
 \begin{document}
 \frontmatter
 
@@ -37,16 +9,16 @@
 \begin{center}
   \vspace*{2.0cm}
   {\Huge\sffamily\bfseries\color{headingblue} Cloud Engineering\\and DevSecOps}\\[14pt]
-  {\Large\sffamily\color{gray} Architecture, Container Runtimes, Supply Chain Security, and Infrastructure as Code}\\[24pt]
+  {\Large\sffamily\color{gray} Cloud Networking, Container Runtimes, Infrastructure as Code,\\Zero Trust Security, and Enterprise AI Infrastructure}\\[24pt]
   {\normalsize\sffamily\scshape Volume III of the Modern Engineering Curriculum}\\[30pt]
   \hrule height 1.2pt
   \vspace*{30pt}
-  
+
   {\large\sffamily\bfseries Modern Engineering Curriculum Initiative}\\[10pt]
-  {\small\sffamily Production-Grade Engineering for Enterprise Systems}
-  
+  {\small\sffamily First-Principles Infrastructure, Security, and Platform Engineering}
+
   \vfill
-  
+
   \begin{tcolorbox}[
     enhanced,
     colback=white,
@@ -57,11 +29,12 @@
   ]
   \sffamily\footnotesize\centering
   \textbf{Curriculum Track B: Cloud Infrastructure and DevSecOps}\\
-  Covering Microsoft Azure SDN, Enterprise AI Infrastructure, Linux Namespaces \& cgroups v2,\\
-  Kubernetes Control Plane Internals, Secure CI/CD Pipelines, Sigstore Software Supply Chains,\\
-  Terraform DAG Execution, and SPIFFE/SPIRE Zero Trust Security.
+  Covering IPv4/CIDR \& Azure SDN, Linux Namespaces \& \texttt{cgroups v2},\\
+  Kubernetes Control Plane, CNI \& CSI Storage, Terraform DAG Execution,\\
+  PKI/mTLS, SPIFFE/SPIRE \& OIDC Federation, Progressive CI/CD, Sigstore Supply Chains,\\
+  and Isolated Azure OpenAI \& AI Search Systems.
   \end{tcolorbox}
-  
+
   \vspace*{1.5cm}
 \end{center}
 \end{titlepage}
@@ -99,50 +72,52 @@ No part of this publication may be reproduced, stored in a retrieval system, or 
 \chapter*{Preface}
 \addcontentsline{toc}{chapter}{Preface}
 
-Welcome to \textbf{Volume III: Cloud Engineering and DevSecOps}, a foundational cornerstone of the \emph{Modern Engineering Curriculum}. 
+Welcome to \textbf{Volume III: Cloud Engineering and DevSecOps}, part of the \emph{Modern Engineering Curriculum}.
 
-While Volume I explored backend application runtimes (PHP-FPM, Python/FastAPI, HTTP/3, and database engines) and Volume II investigated artificial intelligence architectures (LangGraph, vector spaces, HNSW, and hybrid RAG), Volume III addresses the foundational substratum upon which all modern applications execute: the cloud infrastructure, the containerized runtime layer, the continuous delivery pipeline, and the cryptographic security fabric.
+If you have coordinated software deployments, reviewed AI-generated Dockerfiles or Terraform manifests, or debugged failing cloud pipelines without ever sitting down to unpack how the underlying kernel, network, and identity layers actually work, this volume is written specifically for you. You do \emph{not} need prior coursework in operating systems, computer networking, or cryptography: every chapter builds those foundations from first principles before taking you all the way to production diagnostics and architecture.
 
-\section*{The Philosophy of Volume III: No Magic, No Hand-Waving}
-In commercial software engineering, cloud computing and DevOps are too often taught through superficial tutorials: clicking buttons in a cloud web console, copying YAML snippets without understanding their semantics, or relying on magical abstractions.
+\section*{The Philosophy of Volume III: From First Principles to Production Rigor}
+Cloud engineering and DevSecOps are too often taught as copy-paste recipes: click a wizard in a web console, paste a YAML manifest, or trust that a managed service handles security automatically. When production breaks---a pod is OOM-killed despite plenty of host RAM, a Private Link DNS query leaks onto the public internet, or an unsigned container slips into a cluster---those recipes offer no help.
 
-This textbook is designed with a very different pedagogy:
+This volume teaches by building mental models from the ground up:
 \begin{enumerate}[leftmargin=15pt]
-  \item \textbf{Kernel-First Understanding:} We do not treat containers as ``lightweight virtual machines.'' We examine the precise Linux kernel system calls (\texttt{clone}, \texttt{unshare}, \texttt{setns}), the unified \texttt{cgroups v2} hierarchy, and the Copy-on-Write storage mechanics of \texttt{overlay2}.
-  \item \textbf{Mathematical \& Algorithmic Rigor:} We do not merely state that systems scale or search; we derive the token bucket leaky equations for Azure OpenAI rate limits, the graph traversal algorithms ($M, efConstruction, efSearch$) of HNSW vector indexes, the Reciprocal Rank Fusion (RRF) formula, the Completely Fair Scheduler CPU quota math, the Kahn topological sort of Terraform's DAG engine, and the Shannon entropy equation for secret detection.
-  \item \textbf{Production Hardening \& Failure Analysis:} Every chapter includes real-world case studies detailing multi-million-dollar outages caused by subtle misconfigurations---from DNS split-brain loops in Private Link to PLEG deadlocks on worker nodes and plaintext secrets in Terraform state files.
+  \item \textbf{Foundations Before Abstractions:} Before designing an Azure Virtual Network, we derive IPv4 CIDR subnetting, NAT, and DNS. Before running Docker or Kubernetes, we unpack Linux virtual memory, file descriptors, system calls (\texttt{clone}, \texttt{unshare}, \texttt{setns}), \texttt{cgroups v2}, and \texttt{overlay2}. Before reading a Sigstore policy or Argo Rollout gate, we establish X.509 certificates, Merkle transparency logs, and Prometheus \texttt{rate()} queries.
+  \item \textbf{Dependency-Ordered Mastery:} Each chapter unlocks the next. Cloud networking (Chapter~\ref{chap:azure-fundamentals}) and containers/Kubernetes (Chapters~\ref{chap:containers}--\ref{chap:kubernetes}) establish the runtime substrate. Terraform (Chapter~\ref{chap:terraform}) codifies that substrate declaratively. Zero Trust identity and PKI (Chapter~\ref{chap:infra-security}) establish keyless OIDC authentication before CI/CD pipelines (Chapter~\ref{chap:cicd}), software supply chain security (Chapter~\ref{chap:devsecops}), and private enterprise AI deployments (Chapter~\ref{chap:azure-ai}) put them into action.
+  \item \textbf{Diagnostic Practice:} Every chapter pairs concrete step-by-step code walkthroughs with real-world symptom-and-log troubleshooting scenarios, active \emph{Try It Yourself} experiments, worked exercises, and bridges to the standalone Python labs (\texttt{exercises/volume3/}) and reference projects (\texttt{projects/p08}--\texttt{p10}).
 \end{enumerate}
 
-\section*{Structure of Track B}
-Volume III spans seven interconnected chapters:
+\section*{Structure of Volume III}
+Volume III spans eight sequenced chapters:
 \begin{itemize}[leftmargin=15pt]
-  \item \textbf{Chapter 1: Azure Fundamentals and Architecture} -- Covers ARM management hierarchies, VNet software-defined networking, CIDR math, Route Tables, NSGs, Azure Firewall, and Private Endpoints.
-  \item \textbf{Chapter 2: Azure OpenAI and Azure AI Search} -- Deep-dives into enterprise LLM provisioning, PTU vs. Pay-As-You-Go economics, content safety filters, private vector indexing with HNSW, hybrid search, and semantic rankers.
-  \item \textbf{Chapter 3: Docker and Kubernetes Internals} -- Unpacks Linux namespaces, \texttt{cgroups v2}, \texttt{overlay2}, OCI runtimes (\texttt{runc}, \texttt{containerd}, shims), the Kubernetes control plane, \texttt{etcd} Raft, kubelet PLEG, and KEDA autoscaling.
-  \item \textbf{Chapter 4: CI/CD Pipelines} -- Explores GitHub Actions event models, runner security boundaries, caching mechanics, Blue-Green deployments, Canary rollouts, and automated Prometheus-gated rollbacks.
-  \item \textbf{Chapter 5: DevSecOps} -- Details the shift-left security paradigm, AST taint analysis with Semgrep, Trivy SCA scanning with EPSS scoring, TruffleHog secret scanning, Cosign keyless signing with Sigstore, SBOMs via Syft, and the SLSA framework.
-  \item \textbf{Chapter 6: Terraform and Infrastructure as Code} -- Analyzes declarative HCL2 AST parsing, DAG graph resolution, remote state security, distributed locking with Azure Blob leases, 3-way drift reconciliation, and reusable module design.
-  \item \textbf{Chapter 7: Infrastructure Security} -- Codifies Zero Trust Architecture (NIST SP 800-207), Azure RBAC with PIM JIT access, cryptographic workload identity using SPIFFE/SPIRE, OIDC Workload Identity Federation, and Azure Key Vault envelope encryption with Secrets Store CSI drivers.
+  \item \textbf{Chapter 1: Azure Fundamentals and Cloud Networking} -- Begins with an IPv4/CIDR, OSI L3/L4/L7, NAT, and DNS primer, then builds through ARM governance hierarchies, Azure-reserved subnet IPs, VNet peering, UDR routing, two-tier NSG evaluation, Azure Firewall, Private Link split-brain DNS, and managed compute options.
+  \item \textbf{Chapter 2: Linux Kernel Primitives and Container Runtimes} -- Opens with an OS kernel primer (processes, RSS vs.\ page cache, file descriptors, syscalls), then examines all 8 Linux namespaces (including \texttt{time}), \texttt{cgroups v2} resource ceilings and OOM scoring, \texttt{overlay2} copy-on-write and whiteouts, and the OCI stack (\texttt{containerd}, \texttt{containerd-shim}, \texttt{runc}).
+  \item \textbf{Chapter 3: Kubernetes Internals: Control Plane, Networking, Storage, and Autoscaling} -- Traces \texttt{kubectl apply} through \texttt{kube-apiserver}, \texttt{etcd} Raft/MVCC, \texttt{kube-scheduler}, and \texttt{kubelet} PLEG; unpacks CNI pod networking (\texttt{veth} pairs, Services/\texttt{kube-proxy}, Ingress) and CSI persistent storage; and derives HPA and KEDA autoscaling.
+  \item \textbf{Chapter 4: Terraform and Infrastructure as Code} -- Introduces HCL2 syntax, dynamic blocks, Kahn's topological sort traced step-by-step on a 4-resource graph, remote state security, Azure Blob lease locking, three-way drift reconciliation, and lifecycle safety guards.
+  \item \textbf{Chapter 5: Infrastructure Security, Identity Federation, and Zero Trust} -- Starts with a PKI, X.509 certificate chain, and TLS vs.\ mTLS primer, then covers NIST SP 800-207 Zero Trust, Azure RBAC (\texttt{Actions - NotActions}) and PIM, SPIFFE/SPIRE attestation over Unix domain sockets, OIDC Workload Identity Federation, KMS envelope encryption (KEK/DEK), and Secrets Store CSI \texttt{tmpfs} mounts.
+  \item \textbf{Chapter 6: CI/CD Pipelines and Progressive Delivery} -- Covers GitHub Actions triggers, \texttt{pull\_request} vs.\ \texttt{pull\_request\_target} boundaries, ephemeral ARC runners, deterministic dependency caching, a complete PR-to-Production workflow walkthrough, Blue-Green cutovers, and a Prometheus \texttt{rate()}/SLI/error-budget primer powering Argo Rollouts canary gates.
+  \item \textbf{Chapter 7: DevSecOps and Software Supply Chain Security} -- Explores shift-left economics, Semgrep AST taint analysis, Trivy SCA with EPSS prioritization, Shannon entropy (with bit-guessing intuition) and TruffleHog active verification, Cosign/Fulcio/Rekor Merkle log signing enforced by Kyverno, Syft SBOMs, and the four SLSA v1.0 build levels.
+  \item \textbf{Chapter 8: Enterprise Azure OpenAI and Azure AI Search} -- Applies Volume III's networking, container, and identity foundations to enterprise AI: Token Bucket rate limiting, worked PTU capacity sizing, Content Safety policies, Private Endpoint + IMDS Managed Identity authentication, and Azure AI Search hybrid/semantic query integration (building on the mathematical foundations in Volume~II).
 \end{itemize}
 
-Alongside these chapters, students are encouraged to implement the accompanying reference projects: \textbf{Project 8} (Azure Secure App with Managed Identity and Key Vault), \textbf{Project 9} (Modular Terraform Infrastructure), and \textbf{Project 10} (DevSecOps Pipeline with SAST, SCA, and SBOMs).
+Alongside these chapters, work through the standalone Python exercises in \texttt{exercises/volume3/} and the three reference projects: \textbf{Project 8} (\texttt{p08-azure-secure-app}), \textbf{Project 9} (\texttt{p09-terraform-infrastructure}), and \textbf{Project 10} (\texttt{p10-cicd-security-pipeline}).
 
 \mainmatter
 
 \input{ch01-azure-fundamentals.tex}
-\input{ch02-azure-openai-search.tex}
-\input{ch03-docker-kubernetes.tex}
-\input{ch04-cicd-pipelines.tex}
-\input{ch05-devsecops.tex}
-\input{ch06-terraform-iac.tex}
-\input{ch07-infrastructure-security.tex}
+\input{ch02-containers.tex}
+\input{ch03-kubernetes.tex}
+\input{ch04-terraform-iac.tex}
+\input{ch05-infrastructure-security.tex}
+\input{ch06-cicd-pipelines.tex}
+\input{ch07-devsecops.tex}
+\input{ch08-azure-openai-search.tex}
 
 \backmatter
 
-\chapter{Appendix: Cloud Engineering \& DevSecOps Taxonomy}
+\chapter{Appendix: Cloud Engineering \protect\& DevSecOps Taxonomy}
 \label{app:taxonomy}
 
-\section*{Cloud Infrastructure and Compute Foundations}
+\section*{Cloud Infrastructure, Networking, and Compute Foundations}
 
 \begin{table}[htbp]
 \centering\small
@@ -154,22 +129,23 @@ Alongside these chapters, students are encouraged to implement the accompanying 
 \textbf{ARM} & \textbf{Azure Resource Manager:} Unified control plane API gateway for all Azure resource lifecycle management. \\
 \textbf{ASG} & \textbf{Application Security Group:} Tag-based grouping of NICs for dynamic NSG rule definitions. \\
 \textbf{CFS} & \textbf{Completely Fair Scheduler:} Linux kernel default CPU scheduling algorithm governing cgroup bandwidth quotas. \\
-\textbf{CNI} & \textbf{Container Network Interface:} CNCF specification for configuring network interfaces in Linux containers. \\
-\textbf{CRI} & \textbf{Container Runtime Interface:} gRPC API enabling kubelet to communicate with container runtimes (containerd). \\
-\textbf{CSI} & \textbf{Container Storage Interface:} Standard specification for exposing storage volume plugins to container orchestrators. \\
+\textbf{CIDR} & \textbf{Classless Inter-Domain Routing:} Bitmask notation (e.g., \texttt{10.0.1.0/24}) partitioning IPv4 network prefixes and host addresses. \\
+\textbf{CNI} & \textbf{Container Network Interface:} CNCF specification for configuring network interfaces and Pod IPs in Linux containers. \\
+\textbf{CRI} & \textbf{Container Runtime Interface:} gRPC API enabling \texttt{kubelet} to communicate with container runtimes (\texttt{containerd}). \\
+\textbf{CSI} & \textbf{Container Storage Interface:} Standard specification for exposing block and file storage volume plugins to Kubernetes. \\
 \textbf{DAG} & \textbf{Directed Acyclic Graph:} Mathematical graph with directed edges and no closed cycles, utilized by Terraform. \\
-\textbf{HNSW} & \textbf{Hierarchical Navigable Small World:} Multi-layer skip-graph algorithm for approximate nearest neighbor vector search. \\
+\textbf{DNAT / SNAT} & \textbf{Destination / Source Network Address Translation:} Rewriting destination or source IP/port headers across network boundaries. \\
 \textbf{HPA} & \textbf{Horizontal Pod Autoscaler:} Kubernetes control loop scaling replica counts based on observed metric ratios. \\
+\textbf{IMDS} & \textbf{Instance Metadata Service:} Link-local endpoint (\texttt{169.254.169.254}) issuing instance metadata and Managed Identity tokens. \\
 \textbf{KEDA} & \textbf{Kubernetes Event-driven Autoscaling:} Operator and external metrics server enabling scale-to-zero microservices. \\
 \textbf{OCI} & \textbf{Open Container Initiative:} Linux Foundation governance body specifying container image and runtime standards. \\
 \textbf{PLEG} & \textbf{Pod Lifecycle Event Generator:} Kubelet component translating container runtime diffs into lifecycle events. \\
 \textbf{PTU} & \textbf{Provisioned Throughput Unit:} Reserved GPU inferencing compute capacity in Azure OpenAI. \\
-\textbf{RRF} & \textbf{Reciprocal Rank Fusion:} Parameter-free rank-aggregation algorithm combining dense vector and lexical search. \\
 \textbf{UDR} & \textbf{User-Defined Route:} Custom route table entry in Azure overriding default system SDN forwarding paths. \\
 \bottomrule
 \end{tabular}
 \caption{Infrastructure, Container, and Networking Taxonomy}
-\label{tab:infra-taxonomy}
+\label{tab:v3-infra-taxonomy}
 \end{table}
 
 \newpage
@@ -181,19 +157,23 @@ Alongside these chapters, students are encouraged to implement the accompanying 
 \toprule
 \textbf{Acronym} & \textbf{Full Definition and Architectural Context} \\
 \midrule
-\textbf{EPSS} & \textbf{Exploit Prediction Scoring System:} Data-driven metric estimating the probability of a CVE being weaponized in the wild. \\
+\textbf{DEK / KEK} & \textbf{Data / Key Encryption Key:} Two-tier envelope encryption separating fast payload encryption from HSM-pinned master keys. \\
+\textbf{EPSS} & \textbf{Exploit Prediction Scoring System:} Data-driven metric estimating the 30-day probability of a CVE being exploited in the wild. \\
+\textbf{mTLS} & \textbf{Mutual TLS:} Transport Layer Security handshake in which both client and server present and verify X.509 certificates. \\
 \textbf{OIDC} & \textbf{OpenID Connect:} Identity layer built on OAuth 2.0 enabling federated workload token exchange. \\
-\textbf{PIM} & \textbf{Privileged Identity Management:} Cloud identity governance tool providing Just-In-Time role activation. \\
+\textbf{PIM} & \textbf{Privileged Identity Management:} Cloud identity governance tool providing Just-In-Time (JIT) role activation. \\
+\textbf{PKI} & \textbf{Public Key Infrastructure:} Hierarchy of Certificate Authorities, X.509 certificates, and trust bundles binding keys to identities. \\
 \textbf{SAST} & \textbf{Static Application Security Testing:} Analyzing source code ASTs for security vulnerabilities without executing the code. \\
+\textbf{SBOM} & \textbf{Software Bill of Materials:} Machine-readable component inventory (SPDX or CycloneDX) cataloging dependencies and licenses. \\
 \textbf{SCA} & \textbf{Software Composition Analysis:} Scanning third-party dependencies and container base layers for known CVEs. \\
-\textbf{SLSA} & \textbf{Supply-chain Levels for Software Artifacts:} Security framework standardizing build integrity and provenance. \\
+\textbf{SLSA} & \textbf{Supply-chain Levels for Software Artifacts:} Security framework standardizing build integrity and provenance (Levels 0--3). \\
 \textbf{SPIFFE} & \textbf{Secure Production Identity Framework for Everyone:} Open standard for cryptographic workload identity. \\
 \textbf{SPIRE} & \textbf{SPIFFE Runtime Environment:} Production reference implementation of SPIFFE for automated mTLS issuance. \\
 \textbf{SVID} & \textbf{SPIFFE Verifiable Identity Document:} Cryptographic token (X.509 or JWT) asserting a SPIFFE ID. \\
 \bottomrule
 \end{tabular}
 \caption{Security, DevSecOps, and Identity Governance Taxonomy}
-\label{tab:sec-taxonomy}
+\label{tab:v3-sec-taxonomy}
 \end{table}
 
 \end{document}

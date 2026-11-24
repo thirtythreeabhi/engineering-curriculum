@@ -1,0 +1,535 @@
+\chapter{Embeddings and Vector Databases: Geometry, Indexing, and Internals}
+\label{chap:embeddings}
+
+\begin{chaptergoalsbox}
+\textbf{What You Will Learn:}
+\begin{itemize}[leftmargin=15pt]
+  \item Vector geometry from first principles: representing meaning as coordinates, dot products, cosine similarity, Euclidean ($L_2$) distance, and unit normalization.
+  \item Why exact linear search hits a memory-bandwidth wall and why distances collapse in high dimensions (concentration of measure).
+  \item Inverted File Indexes (IVF): Voronoi partitioning, $k$-means clustering, and $nlist/nprobe$ tuning.
+  \item Hierarchical Navigable Small World (HNSW) graphs: building from 1D skip-lists to multi-layer proximity graphs.
+  \item Out-of-core billion-scale search: Scalar Quantization (SQ8) vs Product Quantization (PQ), Vamana graphs, and Linux \texttt{io\_uring} in DiskANN.
+  \item Storage engine internals: Qdrant's filtered segment traversal vs \texttt{pgvector}'s PostgreSQL buffer pool integration and distance operators.
+\end{itemize}
+
+\textbf{What You Should Already Understand:}
+\begin{itemize}[leftmargin=15pt]
+  \item Basic Python lists, loops, and functions.
+  \item Elementary SQL (\texttt{SELECT}, \texttt{WHERE}, \texttt{ORDER BY}, \texttt{LIMIT}).
+\end{itemize}
+
+\textbf{Why This Topic Exists:}
+Keyword search matches exact characters, so searching for \emph{``unauthorized SSH login''} misses a log entry reading \emph{``failed root password''}. Embedding models solve this by turning text into lists of numbers (vectors) where similar meanings land near each other. However, searching 10 million 1,536-dimensional vectors by brute force forces the CPU to stream 61.44 GB of data from RAM on every single query. Approximate Nearest Neighbor (ANN) indexes trade a tiny sliver of recall for millisecond latency.
+
+\textbf{Motivating Practical Problem:}
+A cybersecurity threat-intelligence platform ingests 50 million endpoint telemetry vectors per day. Analysts need sub-15 ms similarity search while filtering by \texttt{tenant\_id}, \texttt{operating\_system}, and \texttt{timestamp >= NOW() - INTERVAL '7 DAYS'}. A naive vector store either runs out of RAM or returns zero results when post-query filters discard all global nearest neighbors.
+\end{chaptergoalsbox}
+
+\section{From Meaning to Coordinates: 2D Vector Intuition}
+
+Imagine you want a computer to recognize that two alerts describe the same incident even when they share zero words. Instead of storing only raw strings, an \textbf{embedding model} (a neural network trained on billions of text pairs) maps each piece of text to a list of floating-point numbers called a \textbf{vector}. Each coordinate captures a latent semantic feature.
+
+To see how this works without drowning in 1,536 numbers, picture a tiny 2-dimensional world ($D = 2$) where axis 1 measures \emph{Security Risk} and axis 2 measures \emph{Routine Payroll/Finance}:
+\begin{align*}
+s_1 &= \text{``SSH brute force''}      &&\longrightarrow \vec{u} = (0.90,\; 0.10) \\
+s_2 &= \text{``Failed root login''}    &&\longrightarrow \vec{v} = (0.85,\; 0.15) \\
+s_3 &= \text{``Payroll CSV export''}   &&\longrightarrow \vec{w} = (0.10,\; 0.90)
+\end{align*}
+In this 2D plane, $\vec{u}$ and $\vec{v}$ point almost in the exact same direction (high security risk, low finance), while $\vec{w}$ points steeply upward toward finance.
+
+\subsection{Three Ways to Measure Proximity}
+Given any two vectors $\vec{u}, \vec{v} \in \mathbb{R}^D$, search engines rely on three fundamental formulas:
+
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Dot Product (Inner Product)}: Multiply matching coordinates and sum them up:
+  \begin{equation}
+  \langle \vec{u}, \vec{v} \rangle = \vec{u} \cdot \vec{v} = \sum_{i=1}^D u_i v_i
+  \end{equation}
+  For our tiny sentences:
+  \[
+  \vec{u} \cdot \vec{v} = (0.90)(0.85) + (0.10)(0.15) = 0.765 + 0.015 = 0.780
+  \]
+  \[
+  \vec{u} \cdot \vec{w} = (0.90)(0.10) + (0.10)(0.90) = 0.090 + 0.090 = 0.180
+  \]
+  Here $0.780 > 0.180$, so $\vec{v}$ beats $\vec{w}$. However, notice a trap: suppose a verbose, off-topic finance report has the scaled vector $5\vec{w} = (0.50, 4.50)$. Its dot product with $\vec{u}$ is $(0.90)(0.50) + (0.10)(4.50) = 0.900 > 0.780$! Raw dot products reward \emph{longer} vectors (larger magnitudes), not just better alignment.
+
+  \item \textbf{Cosine Similarity and Cosine Distance}: To ignore vector length and measure only the \textbf{angle} $\theta$ between two arrows, we divide each vector by its Euclidean length (its \textbf{$L_2$ norm}, $\|\vec{u}\|_2 = \sqrt{\sum_{i=1}^D u_i^2}$):
+  \begin{equation}
+  S_{\cos}(\vec{u}, \vec{v}) = \frac{\vec{u} \cdot \vec{v}}{\|\vec{u}\|_2 \|\vec{v}\|_2}, \qquad d_{\cos}(\vec{u}, \vec{v}) = 1 - S_{\cos}(\vec{u}, \vec{v})
+  \end{equation}
+  Computing lengths for our three sentences:
+  \[
+  \|\vec{u}\|_2 = \sqrt{0.90^2 + 0.10^2} \approx 0.9055, \quad
+  \|\vec{v}\|_2 = \sqrt{0.85^2 + 0.15^2} \approx 0.8631, \quad
+  \|\vec{w}\|_2 \approx 0.9055
+  \]
+  Therefore:
+  \[
+  S_{\cos}(\vec{u}, \vec{v}) = \frac{0.780}{0.9055 \times 0.8631} \approx 0.9980, \qquad
+  S_{\cos}(\vec{u}, \vec{w}) = \frac{0.180}{0.9055 \times 0.9055} \approx 0.2195
+  \]
+  Even if we scale $\vec{w}$ to $5\vec{w} = (0.50, 4.50)$, its norm grows $5\times$ too, so $S_{\cos}(\vec{u}, 5\vec{w})$ stays $0.2195$. Cosine similarity is completely invariant to vector magnitude.
+
+  \item \textbf{Euclidean Distance ($L_2$)}: Straight-line distance between vector tips:
+  \begin{equation}
+  d_{L_2}(\vec{u}, \vec{v}) = \|\vec{u} - \vec{v}\|_2 = \sqrt{\sum_{i=1}^D (u_i - v_i)^2}
+  \end{equation}
+  Between $\vec{u}$ and $\vec{v}$, $d_{L_2} = \sqrt{(0.05)^2 + (-0.05)^2} \approx 0.0707$, whereas between $\vec{u}$ and $\vec{w}$, $d_{L_2} = \sqrt{0.80^2 + (-0.80)^2} \approx 1.1314$.
+\end{enumerate}
+
+\begin{intuitionbox}[The Normalization Identity]
+If you divide every vector by its own length once at ingestion time ($\|\vec{u}\|_2 = \|\vec{v}\|_2 = 1$), all vectors sit on the surface of a unit sphere, and all three metrics collapse into one:
+\begin{equation}
+\|\vec{u} - \vec{v}\|_2^2 = \|\vec{u}\|_2^2 + \|\vec{v}\|_2^2 - 2(\vec{u} \cdot \vec{v}) = 1 + 1 - 2\cos(\theta) = 2(1 - \cos(\theta)) = 2 \cdot d_{\cos}(\vec{u}, \vec{v})
+\end{equation}
+In production vector databases, \textbf{always pre-normalize vectors to unit length} (many models such as OpenAI's \texttt{text-embedding-3} already emit unit-normalized vectors). That eliminates square roots and divisions at query time, letting the CPU execute pure multiply-accumulate (SIMD) dot products.
+\end{intuitionbox}
+
+\section{Why Brute Force Fails at Scale: Bandwidth and High Dimensions}
+
+\subsection{The Memory-Bandwidth Wall (Not Just FLOPs)}
+Suppose your threat-intelligence platform stores $N = 10{,}000{,}000$ vectors with $D = 1536$ dimensions, each coordinate stored as a 32-bit float (`float32`, 4 bytes). Exact linear search (a \textbf{flat scan}) compares the query against every vector:
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Floating-Point Arithmetic (Compute)}: Computing a dot product over $D = 1536$ dimensions performs 1,536 multiplications and 1,535 additions ($\approx 2D \approx 3{,}072$ FLOPs per vector, or $\approx 30.72\text{ billion FLOPs}$ across 10M vectors; squared $L_2$ adds subtraction for $3D \approx 46.08\text{ billion FLOPs}$). Modern server CPUs execute tens to hundreds of billions of FLOPs per second via AVX-512 SIMD lanes, so compute alone is rarely the bottleneck.
+  \item \textbf{Memory Bandwidth (Data Movement)}: Each query must stream all $10^7 \times 1536 \times 4\text{ bytes} = 61{,}440{,}000{,}000\text{ bytes} \approx \mathbf{61.44\text{ GB}}$ of vector data from DRAM into CPU caches. On a server with 80 GB/s memory bandwidth, just reading the bytes off RAM takes $\approx 768\text{ ms}$ per query---making sub-15 ms latency physically impossible with a flat scan.
+\end{itemize}
+
+\subsection{The Curse of Dimensionality: Concentration of Measure}
+Why can't we just use classic database trees (like B-Trees or $k$-d trees) to skip most of those 61.44 GB? Because spatial intuition from 2D and 3D breaks down completely in $\mathbb{R}^{1536}$.
+
+Consider drawing two independent random vectors $\vec{u}, \vec{v}$ in $D$ dimensions. Each axis adds a small independent difference $(u_i - v_i)^2$. By the law of large numbers, summing 1,536 independent random terms averages out all lucky ``close'' or ``far'' extremes:
+\begin{itemize}[leftmargin=18pt]
+  \item For \textbf{unnormalized} standard normal vectors ($\vec{u}, \vec{v} \sim \mathcal{N}(0, I_D)$), $\mathbb{E}[\|\vec{u}-\vec{v}\|_2^2] = 2D$, so pairwise $L_2$ distances cluster tightly around $\sqrt{2D}$ (at $D=1536$, $\sqrt{3072} \approx 55.43$).
+  \item For \textbf{unit-normalized} vectors ($\|\vec{u}\|_2 = \|\vec{v}\|_2 = 1$), random pairs become nearly perpendicular ($\vec{u} \cdot \vec{v} \to 0$), so by the Normalization Identity their $L_2$ distances concentrate tightly around $\sqrt{2} \approx 1.414$!
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\draw[->, thick, color=headingblue] (0,0) -- (9.2,0) node[right, font=\sffamily\footnotesize] {Unit-Normalized Euclidean Distance $d_{L_2}$};
+\draw[->, thick, color=headingblue] (0,0) -- (0,4.2) node[above, font=\sffamily\footnotesize] {Probability Density $p(d)$};
+
+% Reference tick at sqrt(2) ~ 1.414 -> map d in [0, 2.2] to x in [0, 8.8] (scale 4.0)
+% sqrt(2) * 4 = 5.656
+\draw[dashed, color=gray!60] (5.66, 0) -- (5.66, 3.9);
+\node[below, font=\tiny\sffamily] at (5.66, 0) {$\sqrt{2} \approx 1.414$};
+\node[below, font=\tiny\sffamily] at (0, 0) {$0$};
+\node[below, font=\tiny\sffamily] at (8.0, 0) {$2.0$};
+
+% Low-D (D=3) Wide
+\draw[thick, color=linkblue, domain=0.4:8.4, samples=100]
+  plot (\x, {2.8 * exp(-0.5 * ((\x - 5.2)/1.5)^2)})
+  node[above left, font=\tiny\sffamily, color=linkblue] at (3.6, 1.8) {Low Dim ($D=3$)};
+
+% High-D (D=1536) Sharp spike at sqrt(2)
+\draw[very thick, color=warningRed, domain=4.4:6.9, samples=100]
+  plot (\x, {3.7 * exp(-0.5 * ((\x - 5.66)/0.22)^2)});
+\node[right, font=\tiny\sffamily, color=warningRed] at (6.1, 3.1) {High Dim ($D=1536$)};
+
+\end{tikzpicture}
+\caption{Concentration of Measure for Unit-Normalized Vectors: As $D$ increases from $3$ to $1536$, random vectors become mutually orthogonal and pairwise $L_2$ distances collapse into a narrow spike around $\sqrt{2} \approx 1.414$ (unnormalized $\mathcal{N}(0, I_D)$ vectors likewise collapse around $\sqrt{2D}$).}
+\label{fig:v2-ch01-concentration}
+\end{figure}
+
+In high dimensions, the gap between the nearest neighbor $d_{\min}$ and farthest neighbor $d_{\max}$ shrinks relative to $d_{\min}$:
+\begin{equation}
+\lim_{D \to \infty} \frac{d_{\max} - d_{\min}}{d_{\min}} = 0
+\end{equation}
+Space-partitioning trees ($k$-d trees, $R$-trees) must inspect almost every branch box because every box overlaps the query sphere, collapsing back to $O(N)$ linear scans. To search in milliseconds, we turn to \textbf{clustering (IVF)}, \textbf{proximity graphs (HNSW)}, and \textbf{compression (PQ)}.
+
+\section{The Inverted File Index (IVF): Neighborhoods via Voronoi Cells}
+
+Think of how a delivery network avoids scanning every house in a country: it groups houses into postal ZIP codes, puts a post office (a \textbf{centroid}) in the center of each zone, and only visits the 1 or 2 ZIP codes closest to the destination.
+
+In vector search, this partitioning is called a \textbf{Voronoi diagram} (Figure~\ref{fig:v2-ch01-ivf}). Given $nlist$ centroids $\{\vec{c}_1, \dots, \vec{c}_{nlist}\}$, every point in space belongs to whichever centroid is closest. Each centroid owns an \textbf{inverted list} holding only the vectors inside its cell.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  centroid/.style={draw=warningRed, fill=warningRed, circle, inner sep=2pt},
+  point/.style={draw=headingblue, fill=headingblue!40, circle, inner sep=1.2pt},
+  cell/.style={draw=gray!50, dashed, thick}
+]
+
+\draw[cell] (0,0) -- (2.5, 3.5) -- (5, 3.0) -- (4, 0.5) -- cycle;
+\draw[cell] (5, 3.0) -- (8.5, 3.5) -- (7.5, 0.5) -- (4, 0.5);
+\draw[cell] (0,0) -- (4, 0.5) -- (3.5, -3.0) -- (-0.5, -2.5) -- cycle;
+\draw[cell] (4, 0.5) -- (7.5, 0.5) -- (8.0, -2.8) -- (3.5, -3.0);
+
+\node[centroid, label={[font=\tiny\sffamily]above:$C_1$}] (c1) at (2.2, 1.8) {};
+\node[centroid, label={[font=\tiny\sffamily]above:$C_2$}] (c2) at (6.2, 1.7) {};
+\node[centroid, label={[font=\tiny\sffamily]below:$C_3$}] (c3) at (1.8, -1.2) {};
+\node[centroid, label={[font=\tiny\sffamily]below:$C_4$}] (c4) at (5.8, -1.1) {};
+
+\node[point] at (1.2, 1.2) {}; \node[point] at (2.8, 2.4) {}; \node[point] at (1.5, 2.5) {};
+\node[point] at (3.1, 1.1) {};
+\node[point] at (5.5, 2.2) {}; \node[point] at (7.0, 1.5) {}; \node[point] at (7.8, 2.8) {};
+
+\node[draw=intuitionTeal, fill=intuitionTeal, star, star points=5, inner sep=2.5pt, label={[font=\tiny\sffamily\bfseries, color=intuitionTeal]right:Query $\vec{q}$}] (q) at (4.2, 1.2) {};
+\draw[draw=intuitionTeal, thick, dotted] (q) circle (2.2cm);
+
+\end{tikzpicture}
+\caption{IVF Voronoi Partitioning: Query $\vec{q}$ sits near the boundary between cells $C_1$ and $C_2$. Setting $nprobe=2$ checks both neighboring cells so boundary points are not missed.}
+\label{fig:v2-ch01-ivf}
+\end{figure}
+
+\subsection{How $k$-Means Learns the Centroids}
+How do we pick good centroids? We run \textbf{$k$-means clustering}:
+\begin{enumerate}[leftmargin=18pt]
+  \item Pick $nlist$ sample vectors as initial centroids.
+  \item \textbf{Assignment step}: Assign every training vector to its nearest centroid.
+  \item \textbf{Update step}: Recompute each centroid as the coordinate-wise arithmetic mean of all vectors assigned to it.
+  \item Repeat Steps 2--3 until assignments stop changing (or reach \texttt{max\_iters}).
+\end{enumerate}
+
+Listing~\ref{lst:v2-ch01-ivf} implements a complete IVF index with real $k$-means iterations.
+
+\begin{lstlisting}[language=Python, label={lst:v2-ch01-ivf}, caption={Minimal Inverted File Index (IVF) with Iterative $k$-Means}]
+import numpy as np
+
+class MinimalIVFIndex:
+    def __init__(self, nlist: int = 100, nprobe: int = 5):
+        self.nlist = nlist
+        self.nprobe = nprobe
+        self.centroids: np.ndarray | None = None
+        self.inverted_lists: dict[int, list[tuple[int, np.ndarray]]] = {}
+
+    def train_and_index(
+        self, vectors: np.ndarray, max_iters: int = 15, seed: int = 42
+    ) -> None:
+        rng = np.random.default_rng(seed)
+        N, _ = vectors.shape
+        init_idx = rng.choice(N, self.nlist, replace=False)
+        self.centroids = vectors[init_idx].astype(np.float64).copy()
+
+        assignments = np.zeros(N, dtype=int)
+        for it in range(max_iters):
+            # Broadcast shape (N, 1, D) - (1, nlist, D) -> (N, nlist) distances
+            dists = np.linalg.norm(
+                vectors[:, None, :] - self.centroids[None, :, :], axis=2
+            )
+            new_assignments = np.argmin(dists, axis=1)
+            if it > 0 and np.array_equal(new_assignments, assignments):
+                break
+            assignments = new_assignments
+
+            # Update each centroid to the mean of its assigned members
+            for c_idx in range(self.nlist):
+                members = vectors[assignments == c_idx]
+                if len(members) > 0:
+                    self.centroids[c_idx] = members.mean(axis=0)
+
+        self.inverted_lists = {i: [] for i in range(self.nlist)}
+        for vec_id, (vec, c_idx) in enumerate(zip(vectors, assignments)):
+            self.inverted_lists[int(c_idx)].append((vec_id, vec))
+
+    def search(self, query: np.ndarray, k: int = 5) -> list[tuple[int, float]]:
+        assert self.centroids is not None
+        centroid_dists = np.linalg.norm(self.centroids - query, axis=1)
+        probed_centroids = np.argsort(centroid_dists)[:self.nprobe]
+
+        candidates: list[tuple[int, float]] = []
+        for c_idx in probed_centroids:
+            for vec_id, vec in self.inverted_lists[int(c_idx)]:
+                dist = float(np.linalg.norm(vec - query))
+                candidates.append((vec_id, dist))
+
+        candidates.sort(key=lambda x: x[1])
+        return candidates[:k]
+\end{lstlisting}
+
+\textbf{Step-by-Step Code Walkthrough:} Suppose we index six 2D vectors with \texttt{nlist=2, nprobe=1}: three near $(0.15, 0.18)$ (IDs $0, 1, 2$) and three near $(0.85, 0.85)$ (IDs $3, 4, 5$).
+\begin{enumerate}[leftmargin=18pt]
+  \item Lines 15--16 randomly pick two starting centroids (say vector 0 and vector 1, both in the lower cluster!).
+  \item In iteration 0 (lines 21--24), distances place vector 0 into cluster 0 and vectors $1..5$ into cluster 1.
+  \item Lines 30--33 recompute the centroids: cluster 1's centroid jumps toward the average of vectors $1..5$, pulling it up toward $(0.7, 0.7)$. By iteration 2, cluster 0 captures IDs $\{0, 1, 2\}$ with centroid $\approx (0.15, 0.18)$ and cluster 1 captures IDs $\{3, 4, 5\}$ with centroid $\approx (0.85, 0.85)$, and the loop stops early at line 26.
+  \item When \texttt{search(query=[0.88, 0.82], k=2)} runs (lines 39--50), it measures distance to just 2 centroids, picks cluster 1, and scans only 3 vectors instead of 6.
+\end{enumerate}
+
+\begin{commonmistakebox}[Setting $nprobe=1$ on Boundary Queries]
+As shown in Figure~\ref{fig:v2-ch01-ivf}, a query sitting near the edge between Voronoi cells $C_1$ and $C_2$ may have its true nearest neighbor just across the border in $C_2$. If $nprobe=1$, recall often stalls around 65--75\%. Raising $nlist \approx 4\sqrt{N}$ and probing $nprobe \in [16, 64]$ cells recovers $>95\%$ recall while still skipping $>98\%$ of the dataset.
+\end{commonmistakebox}
+
+\section{HNSW Graphs: From 1D Skip-Lists to Multi-Layer Navigation}
+
+To understand \textbf{Hierarchical Navigable Small World (HNSW)} graphs (Malkov \& Yashunin, 2020), start with a 1-dimensional sorted linked list of 1,000 numbers. Walking one node at a time from index 0 to 842 takes 842 hops ($O(N)$). A \textbf{skip-list} fixes this by adding express lanes above the base list:
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Layer 2 (Express Highway)}: Only $\sim 1\%$ of nodes appear here, linked by huge jumps ($0 \to 400 \to 800$).
+  \item \textbf{Layer 1 (Regional Road)}: $\sim 10\%$ of nodes appear here, taking medium steps ($800 \to 830 \to 840$).
+  \item \textbf{Layer 0 (Local Street)}: Every single node lives here ($840 \to 841 \to 842$).
+\end{itemize}
+Search takes $O(\log N)$ hops because you cover huge distances at the top and only inspect fine neighbors at the bottom.
+
+HNSW applies the exact same multi-layer expressway idea to vectors in $\mathbb{R}^D$ (Figure~\ref{fig:v2-ch01-hnsw}). Because vectors have no 1D left-to-right order, edges connect each node to nearby vectors (plus carefully pruned long-range bridges for navigability).
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node/.style={circle, draw=headingblue, fill=codebg, inner sep=2.5pt},
+  activenode/.style={circle, draw=warningRed, fill=warningBg, inner sep=2.5pt, line width=1pt},
+  entrynode/.style={circle, draw=intuitionTeal, fill=intuitionTeal, inner sep=3pt},
+  layer/.style={draw=gray!40, fill=gray!4, rounded corners=3pt, minimum width=10.2cm, minimum height=1.55cm},
+  arrow/.style={-{Stealth[scale=0.8]}, thick, color=headingblue},
+  route/.style={-{Stealth[scale=0.9]}, very thick, color=warningRed}
+]
+
+\node[layer] (l2) at (0, 3.6) {};
+\node[anchor=west, font=\sffamily\bfseries\tiny, color=gray!80] at (-4.9, 4.1) {Layer 2: Long-Range Highway ($p \approx 0.04$)};
+\node[entrynode, label={[font=\tiny\sffamily]above:Entry Point}] (e2) at (-3.5, 3.5) {};
+\node[node] (n21) at (0.5, 3.5) {};
+\node[activenode] (n22) at (3.5, 3.5) {};
+\draw[route] (e2) -- (n21);
+\draw[route] (n21) -- (n22);
+
+\node[layer] (l1) at (0, 1.8) {};
+\node[anchor=west, font=\sffamily\bfseries\tiny, color=gray!80] at (-4.9, 2.3) {Layer 1: Regional Proximity ($p \approx 0.25$)};
+\node[node] (n11) at (-3.5, 1.7) {};
+\node[node] (n12) at (-1.5, 1.7) {};
+\node[node] (n13) at (0.5, 1.7) {};
+\node[activenode] (n14) at (2.2, 1.7) {};
+\node[activenode] (n15) at (3.5, 1.7) {};
+\draw[arrow] (n11) -- (n12); \draw[arrow] (n12) -- (n13);
+\draw[route] (n15) -- (n14);
+
+\node[layer] (l0) at (0, 0) {};
+\node[anchor=west, font=\sffamily\bfseries\tiny, color=gray!80] at (-4.9, 0.5) {Layer 0: All Vectors (up to $2M$ edges)};
+\node[node] (n01) at (-3.5, -0.1) {};
+\node[node] (n02) at (-2.0, -0.1) {};
+\node[node] (n03) at (-0.5, -0.1) {};
+\node[node] (n04) at (0.8, -0.1) {};
+\node[activenode] (n05) at (2.2, -0.1) {};
+\node[activenode] (n06) at (3.5, -0.1) {};
+\node[entrynode, label={[font=\tiny\sffamily, color=intuitionTeal]below:Nearest Neighbor}] (target) at (2.9, -0.1) {};
+\draw[arrow] (n01) -- (n02); \draw[arrow] (n02) -- (n03); \draw[arrow] (n03) -- (n04);
+\draw[route] (n05) -- (target);
+
+\draw[dashed, color=warningRed, thick] (n22) -- (n15);
+\draw[dashed, color=warningRed, thick] (n14) -- (n05);
+
+\end{tikzpicture}
+\caption{HNSW Multi-Layer Graph Traversal: Greedy search crosses long-range edges on sparse upper layers, then drops vertically when no neighbor is closer to the query.}
+\label{fig:v2-ch01-hnsw}
+\end{figure}
+
+\subsection{Probabilistic Layer Assignment and Key Hyperparameters}
+When inserting a new vector, its highest layer $l$ is sampled from an exponentially decaying distribution:
+\begin{equation}
+l = \lfloor -\ln(\text{uniform}(0, 1)) \cdot m_L \rfloor, \qquad m_L = \frac{1}{\ln(M)}
+\end{equation}
+For example, if $M = 16$, then $m_L \approx 0.361$. A random number $u \in (0, 1)$ reaches layer $1$ or higher only when $-\ln(u)/\ln(16) \ge 1$, i.e., $u \le 1/16 = 6.25\%$, and reaches layer $2$ or higher with probability $(1/16)^2 \approx 0.39\%$. Layer 0 holds all $N$ vectors.
+
+Three knobs govern HNSW behavior:
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{$M$} (typically $16 \le M \le 64$): Maximum edges per node on upper layers ($2M$ on Layer 0). Larger $M$ prevents dead-end traps in clustered data at the cost of RAM.
+  \item \textbf{$efConstruction$} (typically $100 \le efConstruction \le 400$): Size of the dynamic candidate queue explored when wiring a newly inserted vector. Higher values build a cleaner graph but slow down ingestion.
+  \item \textbf{$efSearch$} (typically $32 \le efSearch \le 256$): Candidate queue size at query time. You can tune this per request without rebuilding the index.
+\end{itemize}
+
+\section{DiskANN: Quantization (SQ8 vs PQ) and NVMe Search}
+
+HNSW's drawback is RAM cost. Storing 1 billion 768-dimensional `float32` vectors with $M=32$ edges requires:
+\begin{equation}
+10^9 \times \bigl(768 \times 4\text{ bytes} + \text{edge pointers}\bigr) > 3.3\text{ TB of RAM}
+\end{equation}
+\textbf{DiskANN} (Subramanya et al., 2019) keeps a compressed guide in RAM while storing full vectors and adjacency lists on NVMe SSDs. To understand how DiskANN shrinks 3.3 TB down to tens of gigabytes, we must distinguish two compression schemes:
+
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Scalar Quantization (SQ8 --- 1 byte per dimension)}: Each individual 32-bit float ($4$ bytes) is linearly scaled into an 8-bit integer ($0\dots 255$, $1$ byte). A 768-dimensional vector shrinks by $4\times$, from $3{,}072$ bytes to $768$ bytes.
+  \item \textbf{Product Quantization (PQ --- subvector codebooks)}: Rather than keeping 1 byte per dimension, PQ splits a $D$-dimensional vector into $M_{\text{pq}}$ smaller \emph{subvectors} (for instance, $D = 768$ split into $M_{\text{pq}} = 64$ chunks of $12$ dimensions each). Inside each 12-dimensional subspace, $k$-means learns $256$ representative centroids (a 1-byte ID, $0\dots 255$). Each 12-float chunk is replaced by a single 1-byte codebook ID! The entire 768-dimensional vector shrinks from $3{,}072$ bytes down to just \textbf{64 bytes} ($48\times$ compression).
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  ram/.style={draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, font=\sffamily\scriptsize, minimum width=9.8cm, minimum height=1.5cm, align=left},
+  ssd/.style={draw=headingblue, fill=codebg, rounded corners=2pt, font=\sffamily\scriptsize, minimum width=9.8cm, minimum height=1.5cm, align=left},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=warningRed}
+]
+
+\node[ram] (r) at (0, 2.0) {
+  \textbf{DRAM ($\approx 64$ GB for 1B vectors)}:\\
+  $\bullet$ Product Quantized (PQ) subvector codes (e.g., 64 bytes/vector)\\
+  $\bullet$ Fast approximate distance table lookup guides Vamana beam search
+};
+
+\node[ssd] (s) at (0, -0.5) {
+  \textbf{NVMe SSD (Terabyte Scale)}:\\
+  $\bullet$ Full-precision \texttt{float32} vectors + full Vamana adjacency lists\\
+  $\bullet$ Packed together in 4 KB aligned disk pages for exact re-scoring
+};
+
+\draw[arrow] (r.south) -- (s.north) node[midway, right, font=\tiny\sffamily, color=warningRed] {Batched async NVMe reads (\texttt{io\_uring})};
+
+\end{tikzpicture}
+\caption{DiskANN Architecture: Compact PQ subvector codes in DRAM steer the search; batched NVMe reads fetch full-precision vectors and neighbors for final re-scoring.}
+\label{fig:v2-ch01-diskann}
+\end{figure}
+
+\begin{underthehoodbox}[Vamana Graphs and Linux \texttt{io\_uring}]
+DiskANN combines PQ with two systems innovations (Figure~\ref{fig:v2-ch01-diskann}):
+\begin{enumerate}
+  \item \textbf{Vamana Single-Layer Graph}: Instead of HNSW's multi-layer hierarchy (which causes extra disk hops per layer), Vamana builds one flat graph with $\alpha$-pruned long-range edges ($\alpha \ge 1.2$), reaching targets in fewer SSD round-trips.
+  \item \textbf{Linux \texttt{io\_uring}}: Traditional file reads block a thread per I/O syscall. \texttt{io\_uring} is a Linux kernel interface built on shared memory ring buffers between user space and the kernel: the search engine submits a batch of 16 or 32 NVMe page reads in a single syscall and harvests completions asynchronously, saturating NVMe queue depth in single-digit milliseconds.
+\end{enumerate}
+\end{underthehoodbox}
+
+\section{Engine Internals: Qdrant vs \texttt{pgvector}}
+
+\subsection{Qdrant: Segments and Filtered HNSW}
+Qdrant (written in Rust) splits collections into immutable \textbf{segments}, building an HNSW index per segment in background workers. Its standout feature is how it handles metadata filters (like \texttt{WHERE tenant\_id = 42}):
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Pre-filtering} filters rows first, then searches—which either falls back to a brute-force scan or breaks an HNSW graph into disconnected islands.
+  \item \textbf{Post-filtering} finds the top-$k$ global vectors first and discards non-matching rows—causing catastrophic zero-result failures on selective filters.
+  \item \textbf{Filtered HNSW (Qdrant)}: Checks a fast payload bitset \emph{during} graph traversal, continuing to hop through matching edges (plus fallback links) until $k$ valid matches are collected.
+\end{itemize}
+
+\subsection{\texttt{pgvector}: PostgreSQL Pages, Buffer Pools, and Operators}
+PostgreSQL stores table rows and index nodes inside 8 KB disk pages cached in RAM inside a shared memory region called \texttt{shared\_buffers} (backed by the OS page cache). \texttt{pgvector} implements HNSW directly as a PostgreSQL index access method, giving you ACID transactions and relational joins in one database.
+
+PostgreSQL exposes three distance operators for \texttt{vector} columns (remember: \texttt{ORDER BY} sorts ascending, smallest first):
+\begin{itemize}[leftmargin=18pt]
+  \item \texttt{<->} (\texttt{vector\_l2\_ops}): Euclidean $L_2$ distance $\|\vec{u} - \vec{v}\|_2$.
+  \item \texttt{<=>} (\texttt{vector\_cosine\_ops}): Cosine distance $1 - \cos(\theta)$.
+  \item \texttt{<\#>} (\texttt{vector\_ip\_ops}): \emph{Negative} inner product $-\langle \vec{u}, \vec{v} \rangle$ (negated so the largest dot product becomes the smallest number for \texttt{ORDER BY ... ASC}).
+\end{itemize}
+Your query's \texttt{ORDER BY} operator \textbf{must match} the operator class specified in \texttt{CREATE INDEX}, or PostgreSQL ignores the index and runs a sequential table scan.
+
+\begin{lstlisting}[language=SQL, label={lst:v2-ch01-pgvector}, caption={pgvector Production Schema, Index Creation, and Filtered Query}]
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE threat_signatures (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id INT NOT NULL,
+    observed_at TIMESTAMPTZ NOT NULL,
+    embedding vector(1536) NOT NULL
+);
+
+-- Operator class vector_cosine_ops requires <=> in ORDER BY
+CREATE INDEX idx_threat_hnsw ON threat_signatures
+USING hnsw (embedding vector_cosine_ops)
+WITH (m = 24, ef_construction = 128);
+
+SET hnsw.ef_search = 64;
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id, tenant_id, 1 - (embedding <=> '[0.012, -0.045, ...]'::vector) AS similarity
+FROM threat_signatures
+WHERE tenant_id = 42 AND observed_at >= NOW() - INTERVAL '7 days'
+ORDER BY embedding <=> '[0.012, -0.045, ...]'::vector
+LIMIT 10;
+\end{lstlisting}
+
+\begin{productionwarningbox}[\texttt{pgvector} Shared Buffer Thrashing]
+An HNSW index over 1,000,000 vectors of $D = 1536$ exceeds 6 GB on disk. If PostgreSQL \texttt{shared\_buffers} is left at 128 MB and host RAM is small, every random HNSW graph hop misses cache and reads an 8 KB page from disk, driving latency from 5 ms to 800+ ms. Size host RAM and \texttt{shared\_buffers} (typically 25--40\% of RAM, leaving room for the OS page cache) so the active HNSW graph stays memory-resident.
+\end{productionwarningbox}
+
+\begin{realworldbox}[Diagnosing Zero-Result Post-Filtering and Seq Scan Fallbacks]
+A multi-tenant healthcare search API began returning empty lists for smaller clinics while larger hospitals saw normal results. Inspecting the query trace and PostgreSQL execution plan revealed two issues:
+\begin{lstlisting}[basicstyle=\ttfamily\scriptsize]
+INFO  query="chest pain triage" hospital_id="H-901" raw_ann_hits=10 post_filter_hits=0
+EXPLAIN ANALYZE:
+Limit  (actual time=412.18..412.18 rows=0 loops=1)
+  -> Seq Scan on clinical_notes (actual time=412.15..412.15 rows=0)
+       Filter: (hospital_id = 'H-901')
+\end{lstlisting}
+\textbf{Root Causes \& Fix}: First, Hospital \texttt{H-901} held only 0.2\% of total rows, so taking the global top 10 vectors and filtering afterward discarded every hit. Second, a separate query used \texttt{<->} against an index created with \texttt{vector\_cosine\_ops} (\texttt{<=>}), forcing a 412 ms sequential scan. Switching to Qdrant's payload-indexed traversal (or \texttt{pgvector} 0.8+ iterative index scans with matching \texttt{<=>} operators and a B-tree index on \texttt{hospital\_id}) eliminated empty responses and restored 8 ms $p95$ latency.
+\end{realworldbox}
+
+\begin{tryityourselfbox}[Benchmarking Exact Scan vs Cosine Normalization in Pure Python]
+Write a short Python script using \texttt{random.Random(42)} (no external libraries needed) to:
+\begin{enumerate}
+  \item Generate 5,000 random unit-normalized vectors of dimension $D = 64$.
+  \item Generate a unit-normalized query vector $\vec{q}$.
+  \item Verify numerically that sorting by Euclidean distance $\|\vec{q} - \vec{v}\|_2^2$ yields the \emph{exact same} top-5 IDs as sorting by $2(1 - \langle \vec{q}, \vec{v} \rangle)$.
+  \item Measure the elapsed milliseconds for a flat scan over 5,000 vectors and extrapolate to 10,000,000 vectors.
+\end{enumerate}
+(Worked solution is provided in Section~1.8.)
+\end{tryityourselfbox}
+
+\section{Chapter Summary \protect\& Key Takeaways}
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Normalization Identity}: For unit-length vectors ($\|\vec{v}\|_2 = 1$), Euclidean distance squared, Cosine distance, and negative Inner Product produce identical rankings.
+  \item \textbf{Bandwidth \& High Dimensions}: Brute-force search over 10M 1536-dim \texttt{float32} vectors streams 61.44 GB of RAM per query, while concentration of measure collapses distance variance around $\sqrt{2}$ (unit-normalized) or $\sqrt{2D}$ (unnormalized normal).
+  \item \textbf{IVF}: Partitions vectors into Voronoi cells via $k$-means; tune $nlist$ and $nprobe$ to balance speed against boundary recall loss.
+  \item \textbf{HNSW}: Extends 1D skip-lists to metric spaces, achieving $O(\log N \cdot D)$ query complexity governed by $M$, $efConstruction$, and $efSearch$.
+  \item \textbf{Quantization \& DiskANN}: SQ8 compresses floats to 1 byte/dim ($4\times$), whereas Product Quantization encodes subvectors as 1-byte codebook IDs ($32\times$--$64\times$) so Vamana graphs can traverse DRAM guides and batch NVMe reads via \texttt{io\_uring}.
+  \item \textbf{Engine Selection}: Match operators (\texttt{<=>}, \texttt{<->}, \texttt{<\#>}) to index opclasses in \texttt{pgvector}, and prefer in-traversal filtering over post-filtering for selective multi-tenant queries.
+\end{itemize}
+
+\section{Exercises}
+
+\subsection*{Mechanics}
+\textbf{Exercise \thechapter.1}: Prove algebraically that for any two unit vectors $\vec{u}, \vec{v} \in \mathbb{R}^D$ ($\|\vec{u}\|_2 = \|\vec{v}\|_2 = 1$), $\|\vec{u} - \vec{v}\|_2^2 = 2 - 2\langle \vec{u}, \vec{v} \rangle$.
+
+\textbf{Exercise \thechapter.2}: Calculate the RAM (in GB, base 10) required for an unquantized HNSW index of $10{,}000{,}000$ vectors with $D = 1536$ (\texttt{float32}), assuming $M = 32$ bidirectional edges on Layer 0 with 8-byte integer pointers and 10\% upper-layer overhead. Then calculate the vector payload size if compressed using Product Quantization with $M_{\text{pq}} = 96$ subvectors (1 byte/subvector).
+
+\subsection*{Debugging}
+\textbf{Exercise \thechapter.3}: An engineer builds a \texttt{pgvector} index using \texttt{vector\_cosine\_ops}, yet \texttt{EXPLAIN ANALYZE} reports \texttt{Seq Scan on threat\_signatures} taking 350 ms. Identify three distinct reasons PostgreSQL chooses a sequential scan over the HNSW index.
+
+\subsection*{Architecture}
+\textbf{Exercise \thechapter.4}: Design a vector search tier for an e-commerce catalog of 500 million items requiring 1,000 price/stock updates per second, strict in-stock filtering, and sub-20 ms query latency without provisioning 2 TB of RAM.
+
+\section{Detailed Solutions}
+
+\subsection*{Solution \thechapter.1}
+Expanding the squared $L_2$ norm coordinate by coordinate:
+\begin{align*}
+\|\vec{u} - \vec{v}\|_2^2 &= \sum_{i=1}^D (u_i - v_i)^2 = \sum_{i=1}^D u_i^2 + \sum_{i=1}^D v_i^2 - 2\sum_{i=1}^D u_i v_i \\
+&= \|\vec{u}\|_2^2 + \|\vec{v}\|_2^2 - 2\langle \vec{u}, \vec{v} \rangle
+\end{align*}
+Substituting $\|\vec{u}\|_2 = \|\vec{v}\|_2 = 1$ yields $1 + 1 - 2\langle \vec{u}, \vec{v} \rangle = 2 - 2\langle \vec{u}, \vec{v} \rangle$. $\blacksquare$
+
+\subsection*{Solution \thechapter.2}
+\begin{enumerate}
+  \item \textbf{Unquantized HNSW}: Raw vectors use $1536 \times 4 = 6{,}144\text{ bytes}$. Layer 0 edges use $32 \times 8 = 256\text{ bytes}$, plus $\approx 10\%$ for upper layers $\approx 282\text{ bytes}$, totaling $6{,}426\text{ bytes/vector}$. Across $10^7$ vectors: $10^7 \times 6{,}426 = 64.26\text{ GB}$.
+  \item \textbf{PQ Vector Payload}: With $M_{\text{pq}} = 96$ subvectors at 1 byte each, each vector uses $96\text{ bytes}$. Across $10^7$ vectors: $10^7 \times 96 = 0.96\text{ GB}$ (a $64\times$ reduction vs raw \texttt{float32} vectors).
+\end{enumerate}
+
+\subsection*{Solution \thechapter.3}
+PostgreSQL falls back to \texttt{Seq Scan} when:
+\begin{enumerate}
+  \item \textbf{Operator mismatch}: The index uses \texttt{vector\_cosine\_ops} (\texttt{<=>}), but the query orders by \texttt{<->} ($L_2$) or \texttt{<\#>} (inner product).
+  \item \textbf{Missing \texttt{ORDER BY ... LIMIT}}: HNSW index scans only activate when both \texttt{ORDER BY} on the indexed column and a \texttt{LIMIT $k$} clause are present.
+  \item \textbf{Stale statistics or small table}: \texttt{ANALYZE} has not updated planner row estimates, or the table has few rows so the planner estimates a sequential scan is cheaper than random index page reads.
+\end{enumerate}
+
+\subsection*{Solution \thechapter.4}
+\begin{enumerate}
+  \item \textbf{DiskANN / Vamana on NVMe}: Keep 500M PQ-compressed vectors in DRAM ($M_{\text{pq}} = 64 \implies 500\text{M} \times 64\text{ B} = 32\text{ GB}$ RAM) and store full \texttt{float32} vectors plus Vamana adjacency lists on high-IOPS NVMe SSDs read via \texttt{io\_uring}.
+  \item \textbf{Decoupled Volatile Attributes}: Store fast-changing price and \texttt{in\_stock} booleans in an in-memory bitset / Redis / relational table rather than re-indexing immutable vector graphs 1,000 times/sec.
+  \item \textbf{In-Traversal Bitset Filtering}: Intersect candidate node IDs against the \texttt{in\_stock} bitset during beam expansion so out-of-stock products never consume top-$k$ slots.
+\end{enumerate}
+
+\subsection*{Solution (Try It Yourself)}
+\begin{lstlisting}[language=Python]
+import math, random, time
+
+rng = random.Random(42)
+def rand_unit(d: int) -> list[float]:
+    v = [rng.gauss(0.0, 1.0) for _ in range(d)]
+    n = math.sqrt(sum(x * x for x in v))
+    return [x / n for x in v]
+
+vectors = [rand_unit(64) for _ in range(5000)]
+q = rand_unit(64)
+
+t0 = time.perf_counter()
+by_l2 = sorted(range(5000), key=lambda i: sum((a - b) ** 2 for a, b in zip(q, vectors[i])))[:5]
+elapsed_ms = (time.perf_counter() - t0) * 1000.0
+by_ip = sorted(range(5000), key=lambda i: 2.0 * (1.0 - sum(a * b for a, b in zip(q, vectors[i]))))[:5]
+
+assert by_l2 == by_ip
+print(f"Top-5 IDs match: {by_l2}; 5k scan={elapsed_ms:.1f} ms -> 10M est={elapsed_ms * 2000 / 1000:.1f} s")
+\end{lstlisting}
+
+\begin{labbridgebox}[Hands-On Exercise]
+Practice implementing dot products, $L_2$ norms, cosine similarity, and $k$-NN ranking from scratch in Python by running and inspecting \texttt{exercises/volume2/ex01\_vector\_math\_cosine.py}.
+\end{labbridgebox}
+
+\section{Further Reading \protect\& Citations}
+\begin{itemize}[leftmargin=18pt]
+  \item Malkov, Y. A., \& Yashunin, D. A. (2020). \emph{Efficient and Robust Approximate Nearest Neighbor Search Using Hierarchical Navigable Small World Graphs}. IEEE TPAMI, 42(4), 824--836.
+  \item Subramanya, S. J., et al. (2019). \emph{DiskANN: Fast Accurate Billion-point Nearest Neighbor Search on a Single Node}. NeurIPS.
+  \item Jégou, H., Douze, M., \& Schmid, C. (2011). \emph{Product Quantization for Nearest Neighbor Search}. IEEE TPAMI, 33(1), 117--128.
+\end{itemize}

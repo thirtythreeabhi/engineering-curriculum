@@ -2,7 +2,7 @@
 \input{../common/preamble.tex}
 
 \title{\Huge\sffamily\bfseries\color{headingblue} Backend Engineering:\\ Systems, Architecture, and Reliability\\[10pt]
-\Large\sffamily\color{gray} Volume I: Core Runtime Internals, Scalable APIs, Data Persistence, and Production Hardening}
+\Large\sffamily\color{gray} Volume I: Protocols, Concurrency, Runtimes, Persistence, Security, and Verification}
 \author{\large\sffamily Engineering Curriculum Series}
 \date{\sffamily \today}
 
@@ -15,13 +15,13 @@
   \vspace*{2.5cm}
   {\Huge\sffamily\bfseries\color{headingblue} Backend Engineering}\\[12pt]
   {\LARGE\sffamily\bfseries\color{headingblue} Systems, Architecture, and Reliability}\\[18pt]
-  {\Large\sffamily\color{gray} Volume I: Core Runtime Internals, Scalable APIs, Data Persistence, and Production Hardening}\\[30pt]
+  {\Large\sffamily\color{gray} Volume I: Protocols, Concurrency, Runtimes, Persistence, Security, and Verification}\\[30pt]
   \hrule height 1.2pt
   \vspace*{25pt}
-  {\normalsize\sffamily Production-Grade Engineering Curriculum for Senior \& Staff Systems Engineers}
+  {\normalsize\sffamily A First-Principles Systems Textbook for Application Builders Moving from Surface Usage to Deep Mastery}
 \end{center}
 
-\vspace{3.5cm}
+\vspace{3.0cm}
 
 \begin{tcolorbox}[
   enhanced,
@@ -33,17 +33,18 @@
 ]
 \sffamily\small
 \textbf{About Volume I:}
-This textbook provides an uncompromising, deep-dive examination of foundational backend engineering. Moving beyond superficial framework tutorials, this volume exposes runtime execution engines, memory allocators, virtual machines, communication protocols, database storage kernels, concurrent execution models, cryptographic primitives, and production verification paradigms.
+If you have built, deployed, or debugged web applications---whether by writing code yourself or coordinating AI coding agents---you have already encountered HTTP status codes, 	exttt{async/await}, database timeouts, JWT errors, and failing CI pipelines. Seeing these concepts at the framework surface is very different from understanding how bytes cross a socket, how a virtual machine runs bytecode, or why two concurrent SQL queries silently corrupt inventory. This volume starts from a short Foundations Primer and builds every backend layer from first principles up to production rigor.
 
 \vspace{6pt}
-\textbf{Mastery Objectives:}
+\textbf{What You Will Master Across These 7 Chapters:}
 \begin{itemize}[leftmargin=15pt,itemsep=3pt]
-  \item \textbf{Runtime Virtual Machines:} Master PHP 8.1--8.4 Zend Engine internals, zval layout, CoW memory mechanics, and CPython bytecode execution with GIL synchronization.
-  \item \textbf{Transport Protocols \& Microservices:} Architect high-throughput services spanning HTTP/1.1, HTTP/2 binary framing, HTTP/3 QUIC, WebSockets, SSE, and gRPC Protobuf encoding.
-  \item \textbf{Storage Kernels \& Concurrency:} Dissect PostgreSQL storage pages, Write-Ahead Logging (WAL), B-Trees, MVCC snapshot isolation, row locking, and ORM hydrators.
-  \item \textbf{Asynchronous Programming:} Implement event loops, epoll/kqueue selectors, fibers, coroutines, and CSP/Actor models.
-  \item \textbf{Defensive Cryptography \& Security:} Enforce Argon2id, hardened session management, JWT failure mitigation, OAuth2/OIDC PKCE, and OWASP defenses.
-  \item \textbf{Reliability \& Verification:} Build mutation testing pipelines, Testcontainers workflows, circuit breakers, and distributed Redis Lua token-bucket rate limiters.
+  \item \textbf{Chapter 1 --- Networking \& API Protocols:} IP, DNS, TCP, UDP, and TLS 1.3 leading into HTTP/1.1, HTTP/2 binary framing, HTTP/3 QUIC, REST, WebSockets, SSE, and gRPC Protobuf wire encoding.
+  \item \textbf{Chapter 2 --- Concurrency \& Event Loops:} Processes, threads, blocking vs.\ non-blocking I/O, kernel selectors (	exttt{epoll}/	exttt{kqueue}), cooperative vs.\ preemptive scheduling, CSP, Actors, and PHP 8.1+ Fibers.
+  \item \textbf{Chapter 3 --- Modern PHP 8.1--8.4:} PHP-FPM's shared-nothing lifecycle, Zend Engine lexing/AST/opcodes/JIT, 	exttt{zval} Copy-on-Write, cyclic garbage collection, modern types, and PSR-7/15 middleware.
+  \item \textbf{Chapter 4 --- Python \& FastAPI:} Debugging event-loop starvation, ASGI, Starlette middleware, FastAPI dependency injection, Pydantic v2, and CPython internals (PEG AST, bytecode, 	exttt{ceval.c}, and the GIL).
+  \item \textbf{Chapter 5 --- Databases, SQL \& ORMs:} Concurrency anomalies, 2PL vs.\ MVCC, 	exttt{FOR UPDATE SKIP LOCKED}, 	exttt{EXPLAIN (ANALYZE, BUFFERS)}, B-Trees, 8\,KB heap pages, WAL redo recovery, ORMs, and Row-Level Security.
+  \item \textbf{Chapter 6 --- Authentication, Security \& Webhooks:} Cryptography primitives, Argon2id, hardened cookies, JWT exploits, OAuth 2.0 + PKCE, HMAC webhooks with Redis idempotency, RBAC/ABAC/Zanzibar, and OWASP defenses.
+  \item \textbf{Chapter 7 --- Testing \& Reliability:} Testing pyramid, test doubles, mutation testing, property-based testing, Testcontainers, timeouts/jitter, circuit breakers, and atomic Redis Lua rate limiters.
 \end{itemize}
 \end{tcolorbox}
 
@@ -53,14 +54,17 @@ This textbook provides an uncompromising, deep-dive examination of foundational 
 
 \mainmatter
 
-\input{ch01-modern-php.tex}
-\input{ch02-python-fastapi.tex}
-\input{ch03-backend-arch-http-api.tex}
-\input{ch04-databases-sql-orm.tex}
-\input{ch05-async-concurrency.tex}
+\input{../common/ch00-foundations}
+\input{ch01-http-apis.tex}
+\input{ch02-async-concurrency.tex}
+\input{ch03-modern-php.tex}
+\input{ch04-python-fastapi.tex}
+\input{ch05-databases-sql-orm.tex}
 \input{ch06-auth-security.tex}
 \input{ch07-testing-reliability.tex}
 
 \backmatter
+\bibliographystyle{plain}
+\bibliography{../common/bibliography}
 
 \end{document}

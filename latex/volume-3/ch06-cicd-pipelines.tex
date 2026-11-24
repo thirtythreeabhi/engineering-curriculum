@@ -1,0 +1,337 @@
+\chapter{CI/CD Pipelines and Progressive Delivery}
+\label{chap:cicd}
+
+\begin{chaptergoalsbox}
+\textbf{What You Will Learn:}
+\begin{itemize}[leftmargin=12pt]
+  \item GitHub Actions event triggers, concurrency groups, and the security boundary between \texttt{pull\_request} and \texttt{pull\_request\_target}.
+  \item Ephemeral GitHub-hosted VMs vs.\ self-hosted Actions Runner Controller (ARC) pods on Kubernetes.
+  \item Deterministic dependency caching (\texttt{hashFiles}, \texttt{restore-keys}, and 10\,GB/7-day LRU eviction).
+  \item One cohesive PR-to-Production GitHub Actions workflow using OIDC Federation (Chapter~\ref{chap:infra-security}).
+  \item Blue-Green vs.\ Canary deployments: sub-second L7 cutovers vs.\ stepwise traffic ramps.
+  \item Prometheus \texttt{rate()}, SLIs, error budgets, zero-traffic \texttt{NaN} guards, and automated Argo Rollouts gates.
+\end{itemize}
+
+\textbf{What You Should Already Understand:}
+\begin{itemize}[leftmargin=12pt]
+  \item Git branches, pull requests, and commit SHAs.
+  \item Kubernetes Deployments, Services, and Ingress routing (Chapter~\ref{chap:kubernetes}).
+  \item OIDC Workload Identity Federation (Chapter~\ref{chap:infra-security}).
+  \item No prior Prometheus or PromQL background is required; Section~\ref{sec:v3-ch06-promql-primer} teaches counters, \texttt{rate()}, SLIs, and error budgets from scratch.
+\end{itemize}
+
+\textbf{Why This Topic Exists:}
+Shipping code manually does not scale, yet naive CI/CD pipelines introduce two opposite disasters: leaking production credentials when an untrusted pull request executes inside a privileged runner, or blasting a buggy release to 100\% of users simultaneously.
+
+\textbf{Motivating Practical Problem:}
+An engineering team pushes 40 releases per day for a logistics tracking API. Last month, a schema-incompatible release rolled out to all pods at once, knocking out shipment tracking for 45 minutes. Weeks later, an external contributor opened a pull request that modified a build script and nearly exfiltrated cloud credentials from a misconfigured workflow. How do you isolate pull-request execution, keep builds fast via deterministic caching, and gate production rollouts automatically on live metrics?
+\end{chaptergoalsbox}
+
+\section{Workflow Triggers, Security Boundaries, and Concurrency}
+
+Modern CI/CD platforms model pipelines as event-driven workflows triggered by repository activity: code events (\texttt{push}, \texttt{pull\_request}, tags), manual/external triggers (\texttt{workflow\_dispatch}, \texttt{repository\_dispatch}), and cron schedules (\texttt{schedule}).
+
+\subsection{The Critical Boundary: \texttt{pull\_request} vs.\ \texttt{pull\_request\_target}}
+A frequent supply-chain breach starts with mixing up two pull-request triggers:
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{\texttt{on: pull\_request}:} Runs against the ephemeral merge commit of the PR branch in a 	extbf{restricted sandbox}: repository secrets are stripped and \texttt{GITHUB\_TOKEN} is read-only. Even if an external fork edits test scripts, no secrets exist in runner memory.
+  \item \textbf{\texttt{on: pull\_request\_target}:} Runs in the context of the 	extbf{base branch} with access to secrets and write tokens—intended only for lightweight tasks like adding PR labels without checking out untrusted PR code.
+\end{itemize}
+
+\begin{productionwarningbox}[The ``PwnRequest'' Vulnerability]
+Never combine \texttt{on: pull\_request\_target} with checking out the PR's head commit (\texttt{ref: \$\{\{ github.event.pull\_request.head.sha \}\}}) and running \texttt{npm install}, \texttt{pytest}, or \texttt{make}. An attacker can open a PR from a fork whose \texttt{package.json} pre-install hook reads environment variables and posts your cloud tokens to an external server.
+\end{productionwarningbox}
+
+\subsection{Concurrency Groups}
+If a developer pushes three commits within 20 seconds, running three deployments concurrently risks an older commit finishing *after* a newer commit and overwriting staging. Setting a \texttt{concurrency} group (\texttt{group: \$\{\{ github.workflow \}\}-\$\{\{ github.ref \}\}}, \texttt{cancel-in-progress: true}) automatically cancels superseded runs on the same branch.
+
+\section{Runner Architecture and Dependency Caching}
+
+Every job executes inside a 	extbf{runner} (Table~\ref{tab:v3-ch06-runners}):
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lp{6.0cm}p{6.0cm}}
+\toprule
+\textbf{Dimension} & \textbf{GitHub-Hosted Runners} & \textbf{Self-Hosted ARC (Kubernetes)} \\
+\midrule
+\textbf{Lifecycle} & Ephemeral cloud VM destroyed immediately after one job. & Ephemeral Pod per job managed by Actions Runner Controller (ARC). \\
+\textbf{Security Risk} & Clean slate on every run; zero cross-job persistence. & \emph{Persistent} VMs risk backdoors/poisoning; always use ephemeral ARC Pods. \\
+\textbf{Network Access} & Public internet only (unless using private networking/VPN). & Lives inside your private VNet, reaching internal registries and clusters directly. \\
+\bottomrule
+\end{tabular}
+\caption{GitHub-Hosted Ephemeral VMs vs.\ Kubernetes ARC Self-Hosted Runners}
+\label{tab:v3-ch06-runners}
+\end{table}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=0.8cm and 1.2cm,
+  gh/.style={rectangle, draw=headingblue, fill=headingblue!5, rounded corners=2pt, text width=3.8cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  k8s/.style={rectangle, draw=exampleBlue, fill=exampleBg, rounded corners=2pt, text width=4.2cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  pod/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, text width=3.8cm, minimum height=0.8cm, align=center, font=\sffamily\tiny},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=headingblue}
+]
+\node[gh] (gh) {GitHub Actions Queue\\Job Dispatch};
+\node[k8s, right=1.6cm of gh] (arc) {Actions Runner Controller\\(Kubernetes Operator)};
+\node[pod, below=0.6cm of arc] (p1) {Ephemeral Pod 1 (Destroyed on exit)};
+\node[pod, below=0.35cm of p1] (p2) {Ephemeral Pod 2 (Destroyed on exit)};
+
+\draw[arrow] (gh) -- node[above, font=\tiny\sffamily]{Long Poll / Webhook} (arc);
+\draw[arrow] (arc) -- (p1);
+\draw[arrow] (arc) -- (p2);
+\end{tikzpicture}
+\caption{Kubernetes Actions Runner Controller (ARC) Ephemeral Runner Architecture}
+\label{fig:v3-ch06-arc-runners}
+\end{figure}
+
+\subsection{Deterministic Caching and Eviction}
+Downloading Go, Python, or Node dependencies on every ephemeral runner wastes 60--80\% of build time. With \texttt{actions/cache@v4}, a cache key hashes your lockfile with \texttt{\$\{\{ hashFiles('go.sum') \}\}}:
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{Exact Hit:} Same OS + lockfile SHA-256 $\to$ restores dependencies in seconds.
+  \item \textbf{Partial Hit (\texttt{restore-keys}):} If one package changed, the prefix fallback restores the most recent cache so the package manager downloads only the delta, then uploads a new entry under the new hash.
+  \item \textbf{Eviction:} GitHub caps cache storage at 	extbf{10\,GB per repository}, evicting least-recently-used (LRU) entries and purging entries untouched for 	extbf{7 days}.
+\end{itemize}
+
+\section{Walking Through One Cohesive PR-to-Production Workflow}
+
+Listing~\ref{lst:v3-ch06-gh-workflow} ties triggers, concurrency, caching, OIDC keyless login, and immutable digest deployment into one cohesive pipeline.
+
+\begin{lstlisting}[language=yaml, caption={Cohesive PR-to-Production GitHub Actions Pipeline}, label={lst:v3-ch06-gh-workflow}]
+name: Build and Progressive Deploy
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+      - run: go test ./...
+
+  deploy-prod:
+    if: github.event_name == 'push' \&\& github.ref == 'refs/heads/main'
+    needs: test-and-build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - run: |
+          az acr login --name myacr
+          docker build -t myacr.azurecr.io/track-api:${{ github.sha }} .
+          docker push myacr.azurecr.io/track-api:${{ github.sha }}
+          kubectl argo rollouts set image track-api-rollout \
+            track-api=myacr.azurecr.io/track-api:${{ github.sha }}
+\end{lstlisting}
+
+\textbf{Step-by-step trace on a concrete commit:} Suppose a contributor opens a PR changing \texttt{handler.go} (commit \texttt{a1b2c3d}) without touching \texttt{go.sum} (SHA-256 \texttt{9f8e...}).
+\begin{enumerate}[leftmargin=15pt]
+  \item Lines 2--6 trigger \texttt{test-and-build} inside a secret-free \texttt{pull\_request} sandbox.
+  \item Lines 20--25 evaluate the cache key \texttt{Linux-go-9f8e...}, hit the cached Go modules, and run \texttt{go test ./...} (line 26).
+  \item Line 29 skips \texttt{deploy-prod} completely because \texttt{github.event\_name} is \texttt{pull\_request}, never exposing cloud permissions to the PR.
+  \item Once merged to \texttt{main}, \texttt{push} re-runs \texttt{test-and-build}, then \texttt{deploy-prod} requests an OIDC JWT using \texttt{id-token: write} (line 33), exchanges it in \texttt{azure/login@v2} (lines 37--41) with zero static passwords, pushes \texttt{track-api:<sha>}, and updates the Kubernetes Argo Rollout (lines 46--47).
+\end{enumerate}
+
+\section{Blue-Green vs.\ Canary Progressive Delivery}
+
+\subsection{Blue-Green Cutover}
+	extbf{Blue-Green} keeps two identical production environments: 	extbf{Blue} (serving 100\% of live traffic) and 	extbf{Green} (idle release candidate). After smoke tests pass on Green, an L7 reverse proxy (Envoy, Azure App Gateway) or Kubernetes \texttt{Service} label selector switches 100\% of traffic instantaneously (Figure~\ref{fig:v3-ch06-blue-green}). If something fails, flipping the proxy pointer back rolls back in milliseconds.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.88, every node/.style={scale=0.88},
+  node distance=1.0cm and 1.2cm,
+  lb/.style={rectangle, draw=headingblue, fill=headingblue!10, rounded corners=2pt, text width=3.8cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  env/.style={rectangle, draw=exampleBlue, fill=exampleBg, rounded corners=2pt, text width=3.5cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  env_idle/.style={rectangle, draw=gray!60, fill=gray!10, rounded corners=2pt, text width=3.5cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=headingblue}
+]
+\node[lb] (lb) {L7 Reverse Proxy / Ingress\\(Instant Cutover)};
+\node[env, above right=0.2cm and 1.4cm of lb] (blue) {Blue Pool (Active)\\Release v1.4 (100\% Traffic)};
+\node[env_idle, below right=0.2cm and 1.4cm of lb] (green) {Green Pool (Staging)\\Release v1.5 (Smoke Tested)};
+
+\draw[arrow] (lb) -- node[above, font=\tiny\sffamily]{Live Traffic} (blue);
+\draw[arrow, dashed, color=gray!70] (lb) -- node[below, font=\tiny\sffamily]{Atomic Cutover} (green);
+\end{tikzpicture}
+\caption{Blue-Green Traffic Switching at the L7 Proxy Layer}
+\label{fig:v3-ch06-blue-green}
+\end{figure}
+
+\subsection{Canary Rollouts}
+Blue-Green exposes 100\% of users at once to subtle bugs (like connection-pool leaks). 	extbf{Canary rollouts} shift a tiny slice of traffic first—say 5\% $\to$ 20\% $\to$ 50\% $\to$ 100\%—and halt automatically if telemetry degrades.
+
+\section{Prometheus \texttt{rate()}, SLIs, Error Budgets, and Argo Rollouts}
+\label{sec:v3-ch06-promql-primer}
+
+To automate canary rollbacks, your pipeline needs a machine-readable answer to: *``Are the canary pods healthy right now?''*
+
+\subsection{Prometheus Counters, \texttt{rate()}, SLIs, and Error Budgets}
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{Counter Metrics:} Prometheus scrapes HTTP endpoints exporting cumulative counters like \texttt{http\_requests\_total}, which only go up (e.g., $1000 \to 1045 \to 1120$) and reset to $0$ if a pod restarts. Because raw cumulative totals keep growing since boot, you never threshold them directly.
+  \item \textbf{\texttt{rate(metric[2m])}:} Computes the average per-second rate of increase over a sliding 2-minute window while automatically correcting for pod counter resets.
+  \item \textbf{SLIs and Error Budgets:} A 	extbf{Service Level Indicator (SLI)} measures reliability—here, the fraction of requests that succeed without HTTP 5xx server errors:
+  \begin{equation}
+  \text{SLI}_{\text{success}} = \frac{\text{Non-5xx requests/sec}}{\text{Total requests/sec}}
+  \end{equation}
+  If your Service Level Objective (SLO) is $99.9\%$ ($0.999$), your 	extbf{Error Budget} is the remaining $0.1\%$ failure allowance.
+\end{itemize}
+
+\begin{intuitionbox}[Avoiding the Zero-Traffic \texttt{NaN} Trap in PromQL]
+Suppose your canary receives 5\% traffic at 3:00~AM, and for two minutes zero requests hit the canary. Both numerator and denominator rates equal $0$, and in floating-point math $0 / 0 = \texttt{NaN}$ (Not a Number). Because \texttt{NaN >= 0.999} evaluates to \emph{false}, a naive query aborts healthy deployments overnight! Guard the denominator with \texttt{> 0} and append \texttt{or vector(1)} (when quiet off-peak traffic is healthy) or \texttt{or vector(0)} (if zero canary traffic itself means routing broke).
+\end{intuitionbox}
+
+\subsection{Automated Rollbacks with Argo Rollouts}
+Listing~\ref{lst:v3-ch06-argo-rollout} defines a Kubernetes \texttt{Rollout} and \texttt{AnalysisTemplate} incorporating the zero-traffic \texttt{NaN} guard:
+
+\begin{lstlisting}[language=yaml, caption={Argo Rollouts Canary with NaN-Safe PromQL AnalysisTemplate}, label={lst:v3-ch06-argo-rollout}]
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: track-api-rollout
+spec:
+  replicas: 20
+  strategy:
+    canary:
+      analysis:
+        templates:
+        - templateName: success-rate-check
+      steps:
+      - setWeight: 5
+      - pause: {duration: 10m}
+      - setWeight: 20
+      - pause: {duration: 30m}
+      - setWeight: 50
+      - pause: {duration: 15m}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: success-rate-check
+spec:
+  metrics:
+  - name: success-rate
+    interval: 60s
+    successCondition: result[0] >= 0.999
+    failureLimit: 3
+    provider:
+      prometheus:
+        address: http://prometheus-k8s.monitoring:9090
+        query: |
+          (
+            sum(rate(http_requests_total{status!~"5.*",app="track-api-canary"}[2m]))
+            /
+            (sum(rate(http_requests_total{app="track-api-canary"}[2m])) > 0)
+          ) or vector(1)
+\end{lstlisting}
+
+\textbf{Step-by-step trace of Listing~\ref{lst:v3-ch06-argo-rollout}:} Lines 6--18 declare 20 replicas ramping through 5\% (10m), 20\% (30m), and 50\% (15m) canary weights. Every 60 seconds (line 27), Argo queries Prometheus (lines 33--38). Under normal traffic (say 99.95 non-5xx req/s out of 100 req/s), the division yields \texttt{0.9995 >= 0.999} (pass). Under zero traffic, \texttt{> 0} filters out the empty denominator and \texttt{or vector(1)} returns \texttt{1.0} (pass). If three consecutive checks fail ($< 0.999$, line 29), Argo immediately aborts and routes 100\% traffic back to stable pods.
+
+\begin{realworldbox}[A Multi-Hour DNS Caching Outage During Blue-Green Cutover]
+\textbf{Symptom:} After reverting a faulty Blue-Green deployment that switched traffic by updating a public DNS \texttt{A} record from Blue to Green, Green's error logs continue receiving 35\% of production traffic for hours.
+
+\textbf{Diagnostic Steps:}
+\begin{enumerate}[leftmargin=12pt]
+  \item Running \texttt{dig api.logistics.example.com} against authoritative DNS confirms the record already reverted to Blue's IP with a 60-second TTL.
+  \item However, checking client headers and ISP resolvers shows recursive resolvers and JVM/mobile HTTP clients caching the old Green IP up to 24 hours, ignoring short TTLs.
+  \item \textbf{Fix:} Keep public DNS strictly static pointing at an L7 reverse proxy (Envoy or Azure Application Gateway), and perform all Blue-Green or Canary switching inside the proxy backend pool for sub-second rollback.
+\end{enumerate}
+\end{realworldbox}
+
+\begin{tryityourselfbox}[Auditing a Broken Workflow and PromQL Gate]
+Spot and explain all three defects in this pipeline snippet before checking the solutions:
+\begin{enumerate}[leftmargin=12pt]
+  \item Workflow trigger uses \texttt{on: pull\_request\_target} followed by \texttt{actions/checkout@v4} with \texttt{ref: \$\{\{ github.event.pull\_request.head.sha \}\}} and \texttt{npm test}.
+  \item Cache step specifies \texttt{key: \$\{\{ runner.os \}\}-go-\$\{hashFiles('go.sum')\}}.
+  \item Canary PromQL checks \texttt{sum(rate(http\_requests\_total\{status!\textasciitilde{}"5.*"\}[2m])) / sum(rate(http\_requests\_total[2m])) >= 0.999} with no zero-traffic guard.
+\end{enumerate}
+\end{tryityourselfbox}
+
+\begin{labbridgebox}[Simulating DevSecOps Gates and Canary Verification in Project 10]
+Run and inspect the pipeline simulator and canary verification suite:
+\begin{itemize}[leftmargin=12pt]
+  \item \texttt{projects/p10-cicd-security-pipeline/scripts/simulate\_pipeline.py} --- runs local pipeline stages sequentially.
+  \item \texttt{projects/p10-cicd-security-pipeline/scripts/verify\_canary.py} --- simulates canary latency/error-rate evaluation and automated rollback decisions.
+  \item \texttt{projects/p10-cicd-security-pipeline/tests/test\_pipeline\_definition.py} --- verifies workflow structure and canary assertions via \texttt{pytest}.
+\end{itemize}
+\end{labbridgebox}
+
+\section{Chapter Summary \protect\& Key Takeaways}
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{PR Sandboxing:} \texttt{pull\_request} strips secrets; \texttt{pull\_request\_target} holds secrets and must never check out untrusted PR code.
+  \item \textbf{Runners \& Cache:} Use ephemeral VMs or ephemeral ARC Pods; deterministic \texttt{\$\{\{ hashFiles(...) \}\}} keys + \texttt{restore-keys} cut build times within the 10\,GB/7-day LRU cache.
+  \item \textbf{Progressive Delivery:} Blue-Green switches at L7 proxies (never DNS); Canary shifts traffic incrementally (5\% $\to$ 20\% $\to$ 50\% $\to$ 100\%).
+  \item \textbf{Prometheus Gates:} Use \texttt{rate(...[2m])} over counters to compute SLIs, and guard against $0/0 = \texttt{NaN}$ with \texttt{> 0} and \texttt{or vector(1)}.
+\end{itemize}
+
+\section{Exercises}
+
+\subsection{Mechanics}
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Exercise~\thechapter.1:} A workflow uses \texttt{actions/cache@v4} with \texttt{key: Linux-go-\$\{\{ hashFiles('go.sum') \}\}} and no \texttt{restore-keys}. The cache holds \texttt{Linux-go-a1b2c3d4}. A developer updates one Go module, changing the \texttt{go.sum} hash to \texttt{e5f6g7h8}. Trace the cache lookup, state whether a hit or miss occurs, and describe what happens at the end of the job.
+  \item \textbf{Exercise~\thechapter.2:} An Argo Rollout manages 20 total replicas and enters step \texttt{setWeight: 15}. How many canary pods and how many stable pods run during this step?
+\end{enumerate}
+
+\subsection{Debugging}
+\begin{enumerate}[leftmargin=18pt]
+  \setcounter{enumi}{2}
+  \item \textbf{Exercise~\thechapter.3:} Persistent self-hosted GitHub Actions VMs begin failing \texttt{main} branch builds with \texttt{Permission denied: /usr/local/bin/aws} and show a suspicious binary in \texttt{/tmp}. Trace how an untrusted PR compromised subsequent \texttt{main} builds and specify the architectural remediation.
+\end{enumerate}
+
+\subsection{Architecture}
+\begin{enumerate}[leftmargin=18pt]
+  \setcounter{enumi}{3}
+  \item \textbf{Exercise~\thechapter.4:} Design a two-workflow CI/CD architecture for a 50-pod microservice: PRs must run tests and scans without cloud secrets, merges to \texttt{main} must authenticate to Azure via OIDC and roll out progressively in Kubernetes gated by Prometheus HTTP 5xx error rate ($< 0.1\%$) and zero-traffic safety.
+\end{enumerate}
+
+\section{Detailed Solutions}
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Solution~\thechapter.1 (Mechanics):}\\
+  GitHub Actions hashes \texttt{go.sum} to \texttt{e5f6g7h8} and looks up \texttt{Linux-go-e5f6g7h8}. Only \texttt{Linux-go-a1b2c3d4} exists and no \texttt{restore-keys} fallback is configured, so an 	extbf{exact cache miss} occurs and the job downloads modules from scratch. In the post-job step, \texttt{actions/cache} archives the downloaded modules and saves them under \texttt{Linux-go-e5f6g7h8}.
+
+  \item \textbf{Solution~\thechapter.2 (Mechanics):}\\
+  Canary pods $= \lceil 20 \times 0.15 \rceil = \mathbf{3\text{ pods}}$; stable pods $= 20 - 3 = \mathbf{17\text{ pods}}$.
+
+  \item \textbf{Solution~\thechapter.3 (Debugging):}\\
+  \textbf{Root Cause:} External PRs executed on 	extbf{persistent} self-hosted VMs that retained disk state across jobs, allowing a PR test script to drop malware in \texttt{/tmp} and alter host binaries used by later \texttt{main} builds.\\
+  \textbf{Remediation:} Never run untrusted PRs on self-hosted runners; migrate self-hosted pools to Kubernetes 	extbf{ARC ephemeral runner Pods} destroyed cleanly after every job.
+
+  \item \textbf{Solution~\thechapter.4 (Architecture):}\\
+  Split into (1) a \texttt{pull\_request} workflow on ephemeral runners with read-only \texttt{GITHUB\_TOKEN} running lint/tests/SAST, and (2) a \texttt{push: branches: [main]} workflow requesting an OIDC token (\texttt{id-token: write}) to authenticate via \texttt{azure/login@v2}, push an immutable-SHA image, and update an Argo \texttt{Rollout} (50 replicas, steps 5\% $\to$ 20\% $\to$ 50\% $\to$ 100\%) whose \texttt{AnalysisTemplate} checks the \texttt{NaN}-guarded \texttt{rate(...[2m])} success ratio ($\ge 0.999$).
+
+  \item \textbf{Try-It-Yourself Verification:}\\
+  (1) PwnRequest RCE: checking out untrusted PR head inside \texttt{pull\_request\_target} exposes repository secrets to attacker code in \texttt{npm test}.\\
+  (2) Syntax error: \texttt{\$\{hashFiles('go.sum')\}} is missing double curly braces \texttt{\$\{\{ ... \}\}}, so GitHub Actions treats it as a literal string rather than evaluating the hash.\\
+  (3) During zero-traffic windows, $0/0$ produces \texttt{NaN}, falsely failing \texttt{>= 0.999} unless guarded with \texttt{> 0} and \texttt{or vector(1)}.
+\end{enumerate}
+
+\section{Further Reading \protect\& Citations}
+\begin{itemize}[leftmargin=15pt]
+  \item Humble, J., and Farley, D. \emph{Continuous Delivery}. Addison-Wesley, 2010.
+  \item GitHub Documentation. \emph{Security Hardening for GitHub Actions}, \texttt{docs.github.com}, 2025.
+  \item Argo Project. \emph{Argo Rollouts Progressive Delivery Controller}, CNCF.
+\end{itemize}

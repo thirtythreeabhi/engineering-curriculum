@@ -1,61 +1,68 @@
 \chapter{Observability and Tracing: OpenTelemetry, Latency, and LLMOps}
-\label{ch:observability_tracing}
+\label{chap:observability}
 
 \begin{chaptergoalsbox}
 \textbf{What You Will Learn:}
 \begin{itemize}[leftmargin=15pt]
-  \item White-box telemetry in non-deterministic systems: Spans, traces, events, and metrics.
-  \item OpenTelemetry (OTel) Semantic Conventions for Generative AI operations.
-  \item Token economics: Prompt vs completion vs KV-cache pricing, and multi-tenant cost attribution.
-  \item Latency profiling for streaming generation: Time to First Token (TTFT), Inter-Token Latency (ITL), and GPU prefill vs decode mechanics.
-  \item Enterprise observability architectures using Langfuse, OTel Collectors, and tail-based sampling.
-  \item Production PII redaction and compliance hygiene in prompt/completion telemetry.
+  \item Why traditional HTTP 200 monitoring breaks on probabilistic, streaming AI APIs.
+  \item OpenTelemetry from first principles: Traces, Spans, \texttt{TraceID}/\texttt{SpanID}, W3C \texttt{traceparent} headers, and \texttt{asyncio} \texttt{contextvars}.
+  \item OpenTelemetry Generative AI Semantic Conventions (\texttt{gen\_ai.usage.input\_tokens}, \texttt{gen\_ai.usage.output\_tokens}) and FastAPI instrumentation.
+  \item Streaming latency profiling: GPU prefill vs decode, KV-cache prefix reuse, Time to First Token (TTFT), and Inter-Token Latency (ITL).
+  \item Token economics, prompt caching pricing ledgers, PII redaction, and tail-based sampling.
 \end{itemize}
 
 \textbf{What You Should Already Understand:}
 \begin{itemize}[leftmargin=15pt]
-  \item OpenTelemetry core concepts: Tracers, Spans, Context Propagation (W3C TraceContext headers).
-  \item Streaming HTTP protocols: Server-Sent Events (SSE) and chunked transfer encoding.
-  \item Basic DevOps metric aggregates ($p50, p95, p99$ latency percentiles).
+  \item Basic Python functions, classes, and HTTP client/server requests.
+  \item Chapters~3--6 (RAG pipelines, tool-calling agents, and evaluation metrics).
 \end{itemize}
 
 \textbf{Why This Topic Exists:}
-In standard microservices, an HTTP 200 signifies success. In generative AI, an HTTP 200 can conceal a 45-second tail latency spike, an infinite tool-calling loop, a \$25 single-request cost explosion, or a customer receiving a toxic hallucination containing internal database passwords. Real-time distributed tracing is the only lens through which probabilistic AI systems can be governed.
+In conventional web APIs, an HTTP \texttt{200 OK} response in under a second means the system is healthy. In AI engineering, an HTTP \texttt{200 OK} can mask a 40-second tail latency spike, a \$15 runaway agent loop, a silent vector-index fallback, or a leaked credit card number inside a prompt. Distributed tracing gives engineers X-ray vision across every retrieval call, tool invocation, and token stream.
 
 \textbf{Motivating Practical Problem:}
-A customer-facing legal research assistant experiences a sudden surge in $p99$ response times from 3.2 seconds to 28.5 seconds. The team cannot tell whether the bottleneck is OpenAI API degradation, an unindexed vector database search in pgvector, a slow third-party case law scraper tool, or client-side socket congestion. Without distributed span waterfalls, debugging is pure guesswork.
+A legal research assistant's $p99$ response latency (the threshold covering the fastest 99\% of requests while the slowest 1\% exceed it) jumps from 3.2 seconds to 28.5 seconds on a Tuesday afternoon. Without a per-request span waterfall separating vector search, LLM prefill, LLM decode, and SQL tool execution, engineers cannot tell which dependency stalled.
 \end{chaptergoalsbox}
 
-\section{Telemetry in Probabilistic AI Systems}
+\section{Why Black-Box APM Fails on AI Systems}
 
-Traditional APM (Application Performance Monitoring) tools treat LLM calls as generic HTTP POST requests to an external endpoint (\texttt{POST https://api.openai.com/v1/chat/completions}). This black-box approach is fundamentally insufficient:
+Traditional Application Performance Monitoring (APM) treats an LLM invocation as one opaque outbound call: \texttt{POST https://api.openai.com/v1/chat/completions -> 200 OK}. That hides three realities:
 \begin{itemize}[leftmargin=18pt]
-  \item \textbf{Status Code Deception}: An HTTP 200 response may contain a refusal, an unparseable JSON output, or an empty string.
-  \item \textbf{Hidden Cost Dynamics}: Two identical HTTP 200 calls taking 1.5 seconds can have vastly different financial impacts: one consumes 200 cached tokens (\$0.0003), while the other consumes 64,000 un-cached prompt tokens (\$0.16).
-  \item \textbf{Autoregressive Streaming}: Standard APM captures overall request duration, completely obscuring the user's perceived latency: the time elapsed before the first token appears on screen.
+  \item \textbf{HTTP 200 Can Still Be Broken}: A 200 response can contain a safety refusal, invalid JSON, or an empty completion.
+  \item \textbf{Wildly Asymmetric Costs}: Two 1.5-second requests can differ in cost by $500\times$ if one hits a 200-token cached prompt (\$0.0003) while the other sends 64,000 uncached tokens (\$0.16).
+  \item \textbf{Streaming Perception}: Most AI UIs stream words via \textbf{Server-Sent Events (SSE)}—a standard HTTP response kept open so the server pushes \texttt{data:} chunks as each token is produced. Total request duration misses how long the user stared at a blank screen waiting for the very first word.
 \end{itemize}
 
-Production LLMOps demands **white-box distributed tracing**, capturing prompt inputs, model parameters, retrieved context metadata, tool executions, and token metrics inside a standardized span hierarchy.
+\section{OpenTelemetry From First Principles}
 
-\section{OpenTelemetry Semantic Conventions for Generative AI}
+Before recording AI attributes, understand the four building blocks of \textbf{OpenTelemetry (OTel)}, the industry-standard open telemetry specification:
 
-The OpenTelemetry (OTel) standard defines formal semantic conventions for Generative AI entities (\texttt{gen\_ai.*}), creating vendor-neutral telemetry interoperable across Langfuse, Datadog, Honeycomb, and Dynatrace.
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Trace and \texttt{TraceID}}: A \textbf{Trace} represents the complete end-to-end journey of one user request across services, identified globally by a 128-bit hexadecimal \texttt{TraceID} (e.g., \texttt{4bf92f3577b34da6a3ce929d0e0e4736}).
+  \item \textbf{Span and \texttt{SpanID}}: A \textbf{Span} represents one named, timed operation inside that trace (such as \texttt{VectorSearch}, \texttt{chat.completion}, or \texttt{ToolExecution}). Each span carries its own 64-bit \texttt{SpanID}, its \texttt{ParentSpanID}, start/end timestamps, structured key-value \textbf{attributes}, and timestamped \textbf{events} (like \texttt{"first\_token"}). Plotting parent and child spans by start time produces a \textbf{waterfall diagram} (Figure~\ref{fig:v2-ch07-spans}).
+  \item \textbf{W3C \texttt{traceparent} Header}: When Service A calls Service B over HTTP, how does Service B know which trace and parent span it belongs to? Service A injects the W3C TraceContext HTTP header:
+  \begin{center}\small\ttfamily
+  traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+  \end{center}
+  Its four hyphenated fields are: \texttt{version} (\texttt{00}), \texttt{trace-id} (32 hex chars), \texttt{parent-span-id} (16 hex chars), and \texttt{trace-flags} (\texttt{01} = sampled).
+  \item \textbf{Async Context Propagation (\texttt{contextvars})}: Inside a Python \texttt{asyncio} server, hundreds of user requests interleave concurrently on a single thread. A global variable \texttt{CURRENT\_SPAN} would scramble traces across users! Instead, Python provides \texttt{contextvars.ContextVar}—a task-local slot that Python's event loop automatically swaps whenever it switches between coroutines. OpenTelemetry stores the active span inside a \texttt{ContextVar}. \textbf{Watch out}: if you offload work to a separate OS thread (\texttt{loop.run\_in\_executor}) or a background worker queue, a new thread starts with an \emph{empty} \texttt{ContextVar}, breaking the parent-child link unless you explicitly capture \texttt{ctx = otel\_context.get\_current()} and re-attach it inside the worker.
+\end{enumerate}
 
 \begin{figure}[htbp]
 \centering
 \begin{tikzpicture}[
-  root/.style={draw=headingblue, fill=codebg, rounded corners=2pt, font=\sffamily\scriptsize\bfseries, minimum width=9.5cm, minimum height=0.8cm},
+  root/.style={draw=headingblue, fill=codebg, rounded corners=2pt, font=\sffamily\scriptsize\bfseries, minimum width=9.6cm, minimum height=0.8cm},
   agent/.style={draw=exampleBlue, fill=exampleBg, rounded corners=2pt, font=\sffamily\scriptsize, minimum width=8.8cm, minimum height=0.8cm},
-  child/.style={draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, font=\sffamily\tiny\bfseries, minimum width=2.6cm, minimum height=0.7cm, align=center},
+  child/.style={draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, font=\sffamily\tiny\bfseries, minimum width=2.8cm, minimum height=0.75cm, align=center},
   arrow/.style={-{Stealth[scale=0.8]}, thick, color=headingblue}
 ]
 
-\node[root] (session) at (0, 3.2) {{Trace: \texttt{user\_session\_9941} (Trace ID: \texttt{4bf92f3577b34da6a3ce929d0e0e4736})}};
-\node[agent] (chain) at (0, 2.0) {{Span: \texttt{AgentWorkflow.execute} (\texttt{gen\_ai.system="langgraph"})}};
+\node[root] (session) at (0, 3.2) {Trace \texttt{4bf92f35...}: \texttt{POST /chat} (Root Span)};
+\node[agent] (chain) at (0, 2.0) {Child Span: \texttt{AgentWorkflow.execute} (\texttt{gen\_ai.system="langgraph"})};
 
-\node[child] (s1) at (-3.0, 0.6) {Span: \texttt{VectorSearch}\\\texttt{db.system="pgvector"}};
+\node[child] (s1) at (-3.1, 0.6) {Span: \texttt{VectorSearch}\\\texttt{db.system="pgvector"}};
 \node[child] (s2) at (0, 0.6) {Span: \texttt{chat.completion}\\\texttt{gen\_ai.request.model="gpt-4o"}};
-\node[child] (s3) at (3.0, 0.6) {Span: \texttt{ToolExecution}\\\texttt{tool.name="run\_sql\_query"}};
+\node[child] (s3) at (3.1, 0.6) {Span: \texttt{ToolExecution}\\\texttt{tool.name="run\_sql"}};
 
 \draw[arrow] (session.south) -- (chain.north);
 \draw[arrow] (chain.south) -- (s1.north);
@@ -63,11 +70,13 @@ The OpenTelemetry (OTel) standard defines formal semantic conventions for Genera
 \draw[arrow] (chain.south) -- (s3.north);
 
 \end{tikzpicture}
-\caption{OpenTelemetry Span Hierarchy for an Agent Execution.}
-\label{fig:otel_span_hierarchy}
+\caption{OpenTelemetry Span Hierarchy for an AI Agent Request.}
+\label{fig:v2-ch07-spans}
 \end{figure}
 
-\subsection{Standard Semantic Attributes}
+\subsection{OpenTelemetry Semantic Conventions for Generative AI}
+Standardizing attribute names via OTel GenAI Semantic Conventions lets you switch backends (Langfuse, Grafana Tempo, Datadog, Honeycomb) without rewriting application instrumentation (Table~\ref{tab:v2-ch07-otel}).
+
 \begin{table}[htbp]
 \centering
 \small
@@ -75,71 +84,114 @@ The OpenTelemetry (OTel) standard defines formal semantic conventions for Genera
 \toprule
 \textbf{Attribute Name} & \textbf{Type} & \textbf{Description / Example} \\
 \midrule
-\texttt{gen\_ai.system} & string & Identifier of provider (\texttt{openai}, \texttt{anthropic}, \texttt{cohere}) \\
-\texttt{gen\_ai.request.model} & string & Model identifier (\texttt{gpt-4o}, \texttt{claude-3-5-sonnet}) \\
+\texttt{gen\_ai.system} & string & Provider identifier (\texttt{openai}, \texttt{anthropic}, \texttt{cohere}) \\
+\texttt{gen\_ai.operation.name} & string & Operation (\texttt{chat}, \texttt{embeddings}, \texttt{execute\_tool}) \\
+\texttt{gen\_ai.request.model} & string & Model name (\texttt{gpt-4o}, \texttt{claude-3-5-sonnet-20241022}) \\
 \texttt{gen\_ai.request.temperature} & float & Sampling temperature ($0.0 \le T \le 2.0$) \\
-\texttt{gen\_ai.request.max\_tokens} & int & Maximum completion tokens allocated \\
+\texttt{gen\_ai.request.max\_tokens} & int & Maximum output token limit \\
 \texttt{gen\_ai.response.id} & string & Provider completion ID (\texttt{chatcmpl-9A8X...}) \\
-\texttt{gen\_ai.usage.prompt\_tokens} & int & Tokens consumed by input prompt \\
-\texttt{gen\_ai.usage.completion\_tokens} & int & Tokens generated in response \\
-\texttt{gen\_ai.usage.cost} & float & Computed financial cost in USD \\
+\texttt{gen\_ai.usage.input\_tokens} & int & Input prompt tokens consumed \\
+\texttt{gen\_ai.usage.output\_tokens} & int & Output completion tokens generated \\
 \bottomrule
 \end{tabular}
-\caption{Key OpenTelemetry Generative AI Semantic Attributes.}
-\label{tab:otel_attributes}
+\caption{OpenTelemetry Generative AI Semantic Attributes.}
+\label{tab:v2-ch07-otel}
 \end{table}
 
-\section{Streaming Latency Profiling: TTFT vs ITL}
+Listing~\ref{lst:v2-ch07-fastapi} shows real \texttt{opentelemetry-sdk} instrumentation inside a FastAPI endpoint, including child spans, span events for TTFT, and explicit context propagation across a worker thread.
 
-When an LLM streams tokens over Server-Sent Events (SSE), response latency splits into two distinct hardware phases:
+\begin{lstlisting}[language=Python, label={lst:v2-ch07-fastapi}, caption={FastAPI OpenTelemetry Instrumentation with Context Propagation}]
+import asyncio
+import time
+from fastapi import FastAPI
+from opentelemetry import context as otel_context, trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
+
+provider = TracerProvider()
+provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
+trace.set_tracer_provider(provider)
+tracer = trace.get_tracer("ai.service")
+
+app = FastAPI()
+
+def blocking_vector_lookup(query: str, parent_ctx) -> list[str]:
+    # Re-attach asyncio parent context inside worker thread!
+    token = otel_context.attach(parent_ctx)
+    try:
+        with tracer.start_as_current_span("VectorSearch") as span:
+            span.set_attribute("db.system", "pgvector")
+            time.sleep(0.02)
+            return ["doc_42", "doc_99"]
+    finally:
+        otel_context.detach(token)
+
+@app.post("/chat")
+async def chat_endpoint(query: str) -> dict:
+    with tracer.start_as_current_span("chat_request") as root:
+        ctx = otel_context.get_current()
+        docs = await asyncio.to_thread(blocking_vector_lookup, query, ctx)
+
+        with tracer.start_as_current_span("chat.completion") as llm_span:
+            llm_span.set_attribute("gen_ai.system", "openai")
+            llm_span.set_attribute("gen_ai.request.model", "gpt-4o")
+            await asyncio.sleep(0.05)
+            llm_span.add_event("first_token", {"ttft_ms": 50.0})
+            llm_span.set_attribute("gen_ai.usage.input_tokens", 1240)
+            llm_span.set_attribute("gen_ai.usage.output_tokens", 85)
+        return {"docs": len(docs), "status": "ok"}
+\end{lstlisting}
+
+\textbf{Step-by-Step Walkthrough:}
+\begin{enumerate}[leftmargin=18pt]
+  \item Lines 8--11 configure \texttt{TracerProvider} with a non-blocking \texttt{BatchSpanProcessor} so exporting telemetry never stalls FastAPI event-loop handlers.
+  \item Line 28 opens the parent \texttt{chat\_request} span and captures the active \texttt{ContextVar} via \texttt{otel\_context.get\_current()} on line 29.
+  \item Line 30 offloads \texttt{blocking\_vector\_lookup} to a thread pool; lines 17--23 re-attach \texttt{parent\_ctx} so \texttt{VectorSearch} appears as a child of \texttt{chat\_request} rather than splitting into an orphaned trace.
+  \item Lines 32--38 record standard \texttt{gen\_ai.*} attributes and emit a \texttt{"first\_token"} event at TTFT.
+\end{enumerate}
+
+\section{Streaming Latency: Prefill, Decode, and KV-Cache Reuse}
+
+When an LLM streams tokens over SSE, total duration splits into two physically distinct GPU phases (Figure~\ref{fig:v2-ch07-ttft}):
+
+\begin{quote}
+\textbf{GPU Prefill vs Decode \& KV-Cache Prefix Reuse:} During \textbf{Prefill}, the GPU reads all prompt tokens in parallel in one large matrix pass, computing intermediate Key and Value attention states (\textbf{KV cache}) and storing them in high-bandwidth GPU memory (HBM). This step is \emph{compute-bound} and determines \textbf{Time to First Token (TTFT)}. Once the first token appears, the GPU enters \textbf{Decode}: it emits one token at a time, and on every step it must stream the model's weights plus the entire KV cache from HBM into on-chip compute memory (SRAM), making decode \emph{memory-bandwidth bound}. Crucially, if consecutive requests share an identical static prompt prefix (like a 4,000-token system prompt), inference servers can reuse cached KV-cache blocks directly (\textbf{Prompt Caching}), skipping redundant prefill compute and slashing both TTFT and input token fees.
+\end{quote}
 
 \begin{figure}[htbp]
 \centering
 \begin{tikzpicture}[
-  bar/.style={draw=headingblue, fill=codebg, rounded corners=2pt, font=\sffamily\scriptsize, align=center, minimum height=0.9cm},
-  arrow/.style={-{Stealth[scale=0.8]}, thick, color=headingblue}
+  bar/.style={draw=headingblue, fill=codebg, rounded corners=2pt, font=\sffamily\scriptsize, align=center, minimum height=0.95cm}
 ]
 
-% Timeline axis
 \draw[->, thick, color=gray!70] (0,0) -- (12.5,0) node[right, font=\tiny\sffamily] {Time (ms)};
-\draw[shift={(0,0)}] (0pt,3pt) -- (0pt,-3pt) node[below, font=\tiny\sffamily] {0ms (Request Sent)};
-\draw[shift={(4.5,0)}] (0pt,3pt) -- (0pt,-3pt) node[below, font=\tiny\sffamily] {450ms (Token 1)};
-\draw[shift={(11.5,0)}] (0pt,3pt) -- (0pt,-3pt) node[below, font=\tiny\sffamily] {1,850ms (End [DONE])};
+\draw[shift={(0,0)}] (0pt,3pt) -- (0pt,-3pt) node[below, font=\tiny\sffamily] {0 ms (Request)};
+\draw[shift={(4.5,0)}] (0pt,3pt) -- (0pt,-3pt) node[below, font=\tiny\sffamily] {450 ms (Token 1)};
+\draw[shift={(11.5,0)}] (0pt,3pt) -- (0pt,-3pt) node[below, font=\tiny\sffamily] {1,850 ms (Token 70)};
 
-% TTFT Block
-\node[bar, fill=warningBg, minimum width=4.5cm] at (2.25, 1.2) {
-  \textbf{Prefill Phase (TTFT = 450ms)}\\
-  Network RTT + GPU Prompt Processing (Compute-Bound)
+\node[bar, fill=warningBg, minimum width=4.5cm] at (2.25, 1.25) {
+  \textbf{Prefill Phase (TTFT = 450 ms)}\\
+  Network RTT + Parallel Prompt Pass
 };
 
-% ITL Block
-\node[bar, fill=intuitionBg, minimum width=7.0cm] at (8.0, 1.2) {
-  \textbf{Decode Phase (Autoregression: 1,400ms)}\\
-  $N=70$ tokens generated $\implies$ ITL $= \frac{1400}{70} = 20\text{ms/token}$ (Memory-Bound)
+\node[bar, fill=intuitionBg, minimum width=7.0cm] at (8.0, 1.25) {
+  \textbf{Decode Phase ($1{,}850 - 450 = 1{,}400\text{ ms}$)}\\
+  $N = 70$ tokens ($69$ steps) $\implies$ ITL $= \frac{1400}{69} \approx 20.29\text{ ms/tok}$
 };
 
 \end{tikzpicture}
-\caption{Streaming Latency Decomposition: TTFT (Prefill) vs ITL (Decode).}
-\label{fig:ttft_vs_itl}
+\caption{Streaming Latency Decomposition: Token 1 completes at TTFT (450 ms); the remaining $N - 1 = 69$ intervals govern average Inter-Token Latency (ITL).}
+\label{fig:v2-ch07-ttft}
 \end{figure}
 
-\subsection{1. Time to First Token (TTFT)}
-TTFT measures the time elapsed from the client dispatching the HTTP request until the first chunk of generated text arrives:
+Notice why we divide by $N_{\text{completion}} - 1$ when computing average \textbf{Inter-Token Latency (ITL)}: Token 1 arrives at TTFT, leaving $N - 1$ inter-token intervals across $(t_{\text{end}} - \text{TTFT})$:
 \begin{equation}
-\text{TTFT} = t_{\text{network\_rtt}} + t_{\text{queue}} + t_{\text{prefill}}
+\text{ITL} = \frac{t_{\text{completion}} - \text{TTFT}}{N_{\text{completion}} - 1}
 \end{equation}
-The \textbf{Prefill phase} is compute-bound. The GPU processes all $N\_{\text{prompt}}$ tokens in parallel through the Transformer self-attention layers to populate the Key-Value (KV) cache. If the prompt is massive (e.g., 50,000 tokens of context), TTFT escalates dramatically.
+Listing~\ref{lst:v2-ch07-stream} tracks TTFT and per-token ITLs on any streaming generator.
 
-\subsection{2. Inter-Token Latency (ITL) / Time Per Output Token (TPOT)}
-Once the first token is emitted, the model enters the \textbf{Decode phase}. Generation is autoregressive: each token requires a separate forward pass reading the entire KV cache from high-bandwidth memory (HBM) into SRAM.
-\begin{equation}
-\text{ITL} = \frac{t_{\text{completion}} - \text{TTFT}}{N_{\text{completion\_tokens}} - 1}
-\end{equation}
-The Decode phase is \textbf{memory-bandwidth bound}. While TTFT determines perceived snappiness, high ITL makes the stream appear sluggish or stuttering.
-
-\begin{lstlisting}[language=Python, caption={Real-Time TTFT and ITL Streaming Metrics Collector}]
+\begin{lstlisting}[language=Python, label={lst:v2-ch07-stream}, caption={Streaming TTFT and ITL Latency Profiler}]
 import time
-from typing import AsyncGenerator
 
 class StreamingMetricsCollector:
     def __init__(self):
@@ -148,55 +200,64 @@ class StreamingMetricsCollector:
         self.end_time: float = 0.0
         self.token_timestamps: list[float] = []
 
-    def start(self):
+    def start(self) -> None:
         self.start_time = time.perf_counter()
 
-    def record_chunk(self):
+    def record_chunk(self) -> None:
         now = time.perf_counter()
         if not self.token_timestamps:
             self.first_token_time = now
         self.token_timestamps.append(now)
 
-    def finalize(self) -> dict:
+    def finalize(self) -> dict[str, float | int]:
         self.end_time = time.perf_counter()
         total_tokens = len(self.token_timestamps)
-        
-        ttft = (self.first_token_time - self.start_time) if self.first_token_time > 0 else 0.0
+        ttft = (self.first_token_time - self.start_time) if total_tokens > 0 else 0.0
         total_duration = self.end_time - self.start_time
-        
-        # Calculate Inter-Token Latencies
-        itls = []
-        for i in range(1, len(self.token_timestamps)):
-            itls.append(self.token_timestamps[i] - self.token_timestamps[i - 1])
-            
+
+        itls = [
+            self.token_timestamps[i] - self.token_timestamps[i - 1]
+            for i in range(1, total_tokens)
+        ]
         avg_itl = (sum(itls) / len(itls)) if itls else 0.0
         p95_itl = sorted(itls)[int(len(itls) * 0.95)] if len(itls) >= 20 else avg_itl
-        
+
         return {
             "total_duration_sec": total_duration,
             "ttft_sec": ttft,
             "total_completion_tokens": total_tokens,
-            "tokens_per_second": total_tokens / total_duration if total_duration > 0 else 0,
             "avg_itl_ms": avg_itl * 1000.0,
-            "p95_itl_ms": p95_itl * 1000.0
+            "p95_itl_ms": p95_itl * 1000.0,
         }
 \end{lstlisting}
 
+\textbf{Step-by-Step Trace:} If \texttt{start()} records $t=0.000$ s and 4 tokens arrive at $0.450, 0.470, 0.495, 0.510$ s: \texttt{ttft = 0.450} s, \texttt{itls = [0.020, 0.025, 0.015]} ($N-1 = 3$ intervals), \texttt{avg\_itl\_ms = 20.0} ms, and \texttt{total\_duration\_sec = 0.510} s.
+
 \section{Token Economics and Multi-Tenant Cost Attribution}
 
-In enterprise software, LLM costs must be budgeted, monitored, and billed back to specific business units, tenants, or features.
-
-\subsection{Pricing Mechanics and Prompt Caching}
-Modern frontier providers utilize asymmetric three-tier pricing:
+Production AI platforms track spend per tenant and feature using three-tier pricing (uncached input, cached prefix input, and output completion tokens):
 \begin{equation}
-\text{Cost} = (N_{\text{uncached\_prompt}} \times P_{\text{in}}) + (N_{\text{cached\_prompt}} \times P_{\text{cache}}) + (N_{\text{completion}} \times P_{\text{out}})
+\text{Cost} = \frac{N_{\text{uncached}}}{10^6} P_{\text{in}} + \frac{N_{\text{cached}}}{10^6} P_{\text{cache}} + \frac{N_{\text{out}}}{10^6} P_{\text{out}}
 \end{equation}
-\begin{itemize}[leftmargin=18pt]
-  \item \textbf{Completion tokens} are $3\times$ to $4\times$ more expensive than prompt tokens because autoregressive decoding saturates GPU memory bandwidth without parallelization.
-  \item \textbf{Prompt Caching} (available in Anthropic, OpenAI, and DeepSeek) offers 50\%--90\% discounts when prompts share an identical prefix longer than 1,024 tokens. Structuring system prompts and RAG contexts with static content at the top maximizes cache hits.
-\end{itemize}
+Table~\ref{tab:model_pricing} lists reference pricing tiers used in Listing~\ref{lst:v2-ch07-cost} and Exercise~\thechapter.2.
 
-\begin{lstlisting}[language=Python, caption={Multi-Tenant Cost Attribution Engine}]
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{Model Identifier} & \textbf{Input (\$/1M)} & \textbf{Cached Input (\$/1M)} & \textbf{Output (\$/1M)} \\
+\midrule
+\texttt{gpt-4o} & \$2.50 & \$1.25 & \$10.00 \\
+\texttt{claude-3-5-sonnet-20241022} & \$3.00 & \$0.30 & \$15.00 \\
+\texttt{gpt-4o-mini} & \$0.15 & \$0.075 & \$0.60 \\
+\bottomrule
+\end{tabular}
+\caption{Illustrative LLM Token Pricing Tiers (USD per 1 Million Tokens).}
+\label{tab:model_pricing}
+\end{table}
+
+\begin{lstlisting}[language=Python, label={lst:v2-ch07-cost}, caption={Multi-Tenant Token Cost Ledger}]
 from dataclasses import dataclass
 
 @dataclass(frozen=True)
@@ -208,38 +269,31 @@ class ModelPricing:
 PRICING_TABLE = {
     "gpt-4o": ModelPricing(2.50, 1.25, 10.00),
     "claude-3-5-sonnet-20241022": ModelPricing(3.00, 0.30, 15.00),
-    "gpt-4o-mini": ModelPricing(0.15, 0.075, 0.60)
+    "gpt-4o-mini": ModelPricing(0.15, 0.075, 0.60),
 }
 
 class CostLedger:
     def __init__(self):
-        # tenant_id -> total_cost_usd
         self.tenant_spend: dict[str, float] = {}
 
     def record_usage(
-        self, 
-        tenant_id: str, 
-        model: str, 
-        prompt_tokens: int, 
-        cached_tokens: int, 
-        completion_tokens: int
+        self, tenant_id: str, model: str,
+        prompt_tokens: int, cached_tokens: int, completion_tokens: int
     ) -> float:
         pricing = PRICING_TABLE.get(model, PRICING_TABLE["gpt-4o"])
-        
         uncached_prompt = max(0, prompt_tokens - cached_tokens)
         cost = (
-            (uncached_prompt / 1_000_000.0) * pricing.input_per_million +
-            (cached_tokens / 1_000_000.0) * pricing.cached_input_per_million +
-            (completion_tokens / 1_000_000.0) * pricing.output_per_million
+            (uncached_prompt / 1_000_000.0) * pricing.input_per_million
+            + (cached_tokens / 1_000_000.0) * pricing.cached_input_per_million
+            + (completion_tokens / 1_000_000.0) * pricing.output_per_million
         )
-        
         self.tenant_spend[tenant_id] = self.tenant_spend.get(tenant_id, 0.0) + cost
         return cost
 \end{lstlisting}
 
-\section{Production Observability: Langfuse and PII Redaction}
+\section{PII Redaction and Tail-Based Sampling}
 
-In production, telemetry pipelines ship traces to dedicated LLMOps backends like \textbf{Langfuse} or an OpenTelemetry Collector.
+Exporting raw prompts to third-party trace platforms risks violating GDPR, HIPAA, or PCI-DSS if users paste SSNs, card numbers, or API keys. Scrub attributes in-process before spans leave the service (Figure~\ref{fig:v2-ch07-pipeline} and Listing~\ref{lst:v2-ch07-pii}).
 
 \begin{figure}[htbp]
 \centering
@@ -248,155 +302,123 @@ In production, telemetry pipelines ship traces to dedicated LLMOps backends like
   arrow/.style={-{Stealth[scale=0.8]}, thick, color=headingblue}
 ]
 
-\node[box, minimum width=2.8cm] (app) at (0, 0) {AI Service\\(FastAPI / LangGraph)};
-\node[box, fill=warningBg, minimum width=3.2cm] (filter) at (4.0, 0) {PII Scrubber \&\\Token Normalizer};
-\node[box, fill=intuitionBg, minimum width=3.2cm] (collector) at (8.2, 0) {OTel Collector\\(Tail Sampling)};
-\node[box, fill=exampleBg, minimum width=2.4cm] (langfuse) at (12.2, 0) {Langfuse /\\Grafana};
+\node[box, minimum width=2.7cm] (app) at (0, 0) {AI Service\\(FastAPI / LangGraph)};
+\node[box, fill=warningBg, minimum width=3.1cm] (filter) at (3.9, 0) {In-Process PII\\Scrubber};
+\node[box, fill=intuitionBg, minimum width=3.2cm] (collector) at (8.0, 0) {OTel Collector\\(Tail Sampling)};
+\node[box, fill=exampleBg, minimum width=2.4cm] (langfuse) at (11.9, 0) {Langfuse /\\Grafana};
 
 \draw[arrow] (app) -- (filter) node[midway, above, font=\tiny\sffamily] {Raw Span};
 \draw[arrow] (filter) -- (collector) node[midway, above, font=\tiny\sffamily] {Redacted};
-\draw[arrow] (collector) -- (langfuse) node[midway, above, font=\tiny\sffamily] {Export};
+\draw[arrow] (collector) -- (langfuse) node[midway, above, font=\tiny\sffamily] {Filtered};
 
 \end{tikzpicture}
-\caption{Production LLMOps Observability and Privacy Scrubbing Pipeline.}
-\label{fig:observability_pipeline}
+\caption{Production Telemetry Pipeline: Scrub PII inside the service process before tail-based sampling at the OTel Collector.}
+\label{fig:v2-ch07-pipeline}
 \end{figure}
 
-\subsection{Data Hygiene and PII Redaction}
-Shipping raw conversational transcripts to logging platforms violates GDPR, HIPAA, and SOC-2 if prompts contain Personally Identifiable Information (PII). Traces must be scrubbed before hitting external exporters:
-
-\begin{lstlisting}[language=Python, caption={High-Throughput Regex PII Redaction Processor}]
+\begin{lstlisting}[language=Python, label={lst:v2-ch07-pii}, caption={In-Process Regex PII Scrubber}]
 import re
 
 class PIIScrubber:
     def __init__(self):
         self.patterns = [
-            # Social Security Numbers
-            (re.compile(r'\b\d{3}-\d{2}-\d{4}\b'), "[REDACTED_SSN]"),
-            # Credit Card Numbers
-            (re.compile(r'\b(?:\d{4}[ -]?){3}\d{4}\b'), "[REDACTED_CREDIT_CARD]"),
-            # API Keys / Bearer Tokens
-            (re.compile(r'(sk-[a-zA-Z0-9]{32,}|ghp_[a-zA-Z0-9]{36})'), "[REDACTED_SECRET]")
+            (re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "[REDACTED_SSN]"),
+            (re.compile(r"\b(?:\d{4}[ -]?){3}\d{4}\b"), "[REDACTED_CARD]"),
+            (re.compile(r"(sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{36})"), "[REDACTED_KEY]"),
         ]
 
     def scrub(self, text: str) -> str:
-        scrubbed = text
         for pattern, replacement in self.patterns:
-            scrubbed = pattern.sub(replacement, scrubbed)
-        return scrubbed
+            text = pattern.sub(replacement, text)
+        return text
 \end{lstlisting}
 
-\begin{underthehoodbox}[Tail-Based Sampling for Cost Control]
-A service handling 10 million LLM invocations daily generates petabytes of trace logs. 
-\textbf{Head-based sampling} (sampling 1\% of requests at the start) is flawed: it drops 99\% of production errors and edge-case exceptions.
-\textbf{Tail-based sampling} buffers spans in memory at the OpenTelemetry Collector until a trace finishes. The collector inspects the entire trace and retains:
-\begin{enumerate}
-  \item 100\% of traces containing an error or HTTP status $\ge 400$.
-  \item 100\% of traces where $p99$ duration exceeds 5.0 seconds.
-  \item 0.1\% of successful, fast traces for baseline statistical health.
-\end{enumerate}
+\begin{underthehoodbox}[Head-Based vs Tail-Based Sampling]
+At 10 million daily requests, storing 100\% of verbose prompt spans is prohibitively expensive. \textbf{Head-based sampling} flips a coin at the start of a request (keeping say 1\%)—meaning 99\% of rare errors and slow outliers vanish! \textbf{Tail-based sampling} buffers spans briefly in the OTel Collector until the trace finishes, keeping 100\% of errors and slow traces ($>5$ s) while retaining only 0.5\% of routine fast traces.
 \end{underthehoodbox}
 
-\begin{realworldbox}[Diagnosing a Multi-Agent Cascading Outage via Tracing]
-During Black Friday, an e-commerce agent system's response latency surged from 2.1s to 58s, triggering widespread gateway timeouts.
-Engineers inspected the Langfuse trace waterfall. The LLM call was blazingly fast (TTFT 350ms). However, the child span for the \texttt{InventoryCheck} tool revealed that an unindexed SQL query was performing a full table scan across 40 million inventory rows. The database lock cascaded into the agent worker pool.
-Adding a composite B-Tree index to the PostgreSQL table resolved the outage in 10 minutes.
+\begin{realworldbox}[Isolating a Cascading SQL Tool Bottleneck via Span Waterfall]
+On a routine Tuesday afternoon, an enterprise order-assistant's $p99$ latency climbed from 2.1 s to 58 s. Inspecting a single slow trace waterfall in Langfuse pinpointed the culprit immediately:
+\begin{lstlisting}[basicstyle=\ttfamily\scriptsize]
+TraceID: 91c8e2... (total=58,140 ms)
+  |-- VectorSearch (pgvector)          18 ms
+  |-- chat.completion (gpt-4o, TTFT)  350 ms
+  |-- ToolExecution (InventoryCheck) 56,910 ms  <-- SQL Seq Scan on 40M rows!
+  +-- chat.completion (final synth)   862 ms
+\end{lstlisting}
+The LLM and vector store were healthy; the \texttt{InventoryCheck} tool was running an unindexed \texttt{WHERE sku = ... AND warehouse\_id = ...} query across 40 million rows. Adding a composite B-tree index restored $p99$ latency to 1.8 s within 10 minutes.
 \end{realworldbox}
 
-\begin{tryityourselfbox}[Instrument a FastAPI Endpoint with OpenTelemetry]
-Using the \texttt{opentelemetry-sdk} Python package:
-\begin{enumerate}
-  \item Create an OpenTelemetry Tracer instance.
-  \item Decorate an asynchronous LLM generation route with a custom span named \texttt{chat\_request}.
-  \item Record attributes: \texttt{gen\_ai.request.model}, \texttt{gen\_ai.usage.prompt\_tokens}, and \texttt{gen\_ai.usage.completion\_tokens}.
-  \item Simulate a streaming response, record TTFT as a span event, and export traces to a local console logger.
-\end{enumerate}
+\begin{tryityourselfbox}[Instrument an Async Streaming Route with OTel \& TTFT]
+Extend Listing~\ref{lst:v2-ch07-fastapi} so that a simulated streaming helper yields 5 token chunks spaced 30 ms apart after an initial 120 ms prefill delay, records TTFT and average ITL via \texttt{StreamingMetricsCollector}, sets \texttt{gen\_ai.usage.output\_tokens = 5}, and prints the exported span JSON to stdout. (Complete solution in Section~7.8.)
 \end{tryityourselfbox}
 
-\section{Chapter Summary \& Key Takeaways}
+\section{Chapter Summary \protect\& Key Takeaways}
 \begin{itemize}[leftmargin=18pt]
-  \item \textbf{White-Box Tracing}: Traditional APM metrics fail on probabilistic systems. Tracing must capture prompts, tools, intermediate states, and token counts.
-  \item \textbf{OpenTelemetry Semantics}: Standardize on vendor-neutral \texttt{gen\_ai.*} attributes to prevent vendor lock-in across observability platforms.
-  \item \textbf{Streaming Latency Breakdown}: TTFT (Time to First Token) isolates network RTT and GPU prefill speed; ITL (Inter-Token Latency) measures autoregressive memory-bandwidth decode speed.
-  \item \textbf{Token Cost Ledgers}: Completion tokens are significantly more expensive than input tokens. Leverage prompt caching and assign multi-tenant cost attribution to prevent budget overruns.
-  \item \textbf{Tail-Based Sampling}: Capture 100\% of errors and latency outliers while aggressively sampling normal traces to manage telemetry storage costs.
-  \item \textbf{Compliance \& Privacy}: Always sanitize traces with inline regex or NER PII scrubbers before writing to long-term telemetry backends.
+  \item \textbf{OpenTelemetry Core}: Traces link spans across services via 128-bit \texttt{TraceID}s, W3C \texttt{traceparent} headers, and Python \texttt{contextvars} (explicitly attached when crossing threads).
+  \item \textbf{GenAI Conventions}: Standardize on \texttt{gen\_ai.usage.input\_tokens} and \texttt{gen\_ai.usage.output\_tokens}.
+  \item \textbf{Prefill vs Decode}: TTFT reflects compute-bound prefill (accelerated by KV-cache prefix reuse); ITL reflects memory-bandwidth-bound decode divided across $N - 1$ token intervals.
+  \item \textbf{Cost \& Privacy}: Attribute spend per tenant using three-tier pricing, scrub PII before export, and use tail-based sampling so errors are never dropped.
 \end{itemize}
 
 \section{Exercises}
 
 \subsection*{Mechanics}
-\textbf{Exercise 7.1}: An LLM streaming request takes 2,400ms in total to generate 80 completion tokens. The client receives the first token 400ms after dispatching the request. Calculate:
-\begin{enumerate}
-  \item The Time to First Token (TTFT).
-  \item The average Inter-Token Latency (ITL) in milliseconds per token.
-  \item The effective generation throughput in tokens per second during the decode phase.
-\end{enumerate}
+\textbf{Exercise \thechapter.1}: A streaming LLM request takes 2,400 ms total to emit 80 completion tokens, with Token 1 arriving at 400 ms. Compute: (1) TTFT, (2) average ITL in ms/token, and (3) decode throughput in tokens/second.
 
-\textbf{Exercise 7.2}: A company issues 100,000 daily queries to Claude 3.5 Sonnet. Each query contains a static 4,000-token system prompt and a dynamic 500-token user query, returning 300 completion tokens. Calculate daily costs with and without prompt caching enabled, using the prices in Table \ref{tab:otel_attributes}.
+\textbf{Exercise \thechapter.2}: A service sends 100,000 daily requests to \texttt{claude-3-5-sonnet-20241022}. Each request has a static 4,000-token system prompt, a 500-token dynamic user query, and 300 completion tokens. Compute daily cost without vs with prompt caching using the rates in Table~\ref{tab:model_pricing}.
 
 \subsection*{Debugging}
-\textbf{Exercise 7.3}: An engineering team instruments their FastAPI service with OpenTelemetry. However, in their distributed tracing UI, the parent \texttt{AgentRun} span and child \texttt{ToolExecution} spans appear as completely disconnected, independent traces. Diagnose the context propagation failure.
+\textbf{Exercise \thechapter.3}: A team instruments FastAPI with OpenTelemetry, yet \texttt{AgentRun} and \texttt{ToolExecution} show up as completely separate top-level traces with different \texttt{TraceID}s whenever \texttt{ToolExecution} runs in \texttt{loop.run\_in\_executor()}. Diagnose the context failure and provide the fix.
 
 \subsection*{Architecture}
-\textbf{Exercise 7.4}: Design an enterprise-grade LLM observability infrastructure for a financial conglomerate subject to strict PCI-DSS and banking confidentiality laws. The architecture must ingest traces from 50 microservices, redact financial account numbers, enforce multi-tenant billing attribution, and support real-time alerting for cost anomalies.
+\textbf{Exercise \thechapter.4}: Design a PCI-DSS compliant LLM observability architecture across 50 microservices that scrubs cardholder numbers before network export, tracks per-tenant token spend, retains 100\% of errors, and alerts on daily spend anomalies.
 
 \section{Detailed Solutions}
 
-\subsection*{Solution 7.1}
-\begin{enumerate}
-  \item TTFT is given directly as the time to the first token: $\text{TTFT} = 400\text{ms}$.
-  \item Total duration $T = 2400\text{ms}$. 
-  The decode phase duration is:
-  \[
-  T_{\text{decode}} = T - \text{TTFT} = 2400 - 400 = 2000\text{ms}
-  \]
-  Number of tokens generated during the decode phase $= 80 - 1 = 79$ tokens.
-  \[
-  \text{Average ITL} = \frac{T_{\text{decode}}}{N - 1} = \frac{2000\text{ms}}{79} \approx 25.32\text{ms/token}
-  \]
-  \item Effective throughput during decode:
-  \[
-  \text{Throughput} = \frac{79 \text{ tokens}}{2.0 \text{ seconds}} = 39.5 \text{ tokens/second}
-  \]
-\end{enumerate}
+\subsection*{Solution \thechapter.1}
+1. $\text{TTFT} = 400\text{ ms}$. 2. Decode duration $= 2400 - 400 = 2000\text{ ms}$ across $80 - 1 = 79$ intervals, so $\text{ITL} = 2000 / 79 \approx 25.32\text{ ms/token}$. 3. Decode throughput $= 79 / 2.0\text{ s} = 39.5\text{ tokens/sec}$.
 
-\subsection*{Solution 7.2}
-Total prompt tokens $= 4500$ (4000 static system prompt $+ 500$ dynamic user query).
-Completion tokens $= 300$.
-Queries per day $= 100,000$.
-
-\textbf{Case A: Without Prompt Caching}
+\subsection*{Solution \thechapter.2}
+From Table~\ref{tab:model_pricing} for \texttt{claude-3-5-sonnet-20241022}: \$3.00/1M input, \$0.30/1M cached input, \$15.00/1M output.
 \begin{itemize}
-  \item Prompt Cost: $100,000 \times \frac{4500}{1,000,000} \times \$3.00 = 450 \times \$3.00 = \$1,350.00$
-  \item Completion Cost: $100,000 \times \frac{300}{1,000,000} \times \$15.00 = 30 \times \$15.00 = \$450.00$
-  \item Total Daily Cost $= \$1,350 + \$450 = \$1,800.00$
+  \item \textbf{Without caching}: Input $= 10^5 \times \frac{4500}{10^6} \times \$3.00 = \$1{,}350.00$; Output $= 10^5 \times \frac{300}{10^6} \times \$15.00 = \$450.00$; Total $= \mathbf{\$1{,}800.00/\text{day}}$.
+  \item \textbf{With caching}: Cached prefix $= 10^5 \times \frac{4000}{10^6} \times \$0.30 = \$120.00$; Uncached query $= 10^5 \times \frac{500}{10^6} \times \$3.00 = \$150.00$; Output $= \$450.00$; Total $= \mathbf{\$720.00/\text{day}}$ (60\% savings).
 \end{itemize}
 
-\textbf{Case B: With Prompt Caching (4000 cached tokens @ \$0.30/M, 500 uncached @ \$3.00/M)}
-\begin{itemize}
-  \item Cached Prompt Cost: $100,000 \times \frac{4000}{1,000,000} \times \$0.30 = 400 \times \$0.30 = \$120.00$
-  \item Uncached Prompt Cost: $100,000 \times \frac{500}{1,000,000} \times \$3.00 = 50 \times \$3.00 = \$150.00$
-  \item Completion Cost: $\$450.00$ (unchanged)
-  \item Total Daily Cost $= \$120 + \$150 + \$450 = \$720.00$
-\end{itemize}
-Prompt caching saves $\$1,080.00$ per day (a 60\% net reduction).
+\subsection*{Solution \thechapter.3}
+OpenTelemetry tracks the active span in an \texttt{asyncio} \texttt{ContextVar}. Worker threads spawned by \texttt{run\_in\_executor()} do not automatically inherit the coroutine's \texttt{ContextVar}, so the child span sees no parent and mints a fresh \texttt{TraceID}. Fix: capture \texttt{ctx = otel\_context.get\_current()} on the event-loop side, pass \texttt{ctx} into the executor function, and wrap the body in \texttt{token = otel\_context.attach(ctx)} / \texttt{otel\_context.detach(token)}.
 
-\subsection*{Solution 7.3}
-The issue is missing \textbf{TraceContext propagation across asynchronous coroutine boundaries}. In Python \texttt{asyncio}, OpenTelemetry relies on \texttt{contextvars}. If a tool execution runs inside a separate thread pool (\texttt{run\_in\_executor}) or an un-instrumented background task without propagating the active context (\texttt{otel\_context.attach(context)}), the child span cannot locate its parent span ID, causing it to initialize a brand-new Trace ID and fragmenting the distributed trace waterfall.
+\subsection*{Solution \thechapter.4}
+1. \textbf{In-Process Scrubbing}: Run \texttt{PIIScrubber} inside every microservice before span attributes are serialized. 2. \textbf{Internal Collector Gateway}: Export spans over mTLS gRPC to an internal VPC OTel Collector cluster. 3. \textbf{Tail-Based Sampling}: Retain 100\% of errors and $>5$ s traces, 0.5\% of normal traces, while extracting exact \texttt{gen\_ai.usage.*} metrics into Prometheus/ClickHouse for 100\% accurate tenant billing and anomaly alerts.
 
-\subsection*{Solution 7.4}
-Architecture:
-\begin{enumerate}
-  \item \textbf{In-Process PII Sanitization}: Client libraries execute a compiled Rust regex/WASM scrubber before serializing span attributes to prevent raw credit card/account numbers from entering telemetry wire buffers.
-  \item \textbf{Internal OTel Collector Gateway}: Spans are dispatched via gRPC (mTLS) to an internal OpenTelemetry Collector cluster deployed within the VPC.
-  \item \textbf{Tail-Based Sampling Processor}: The Collector buffers spans and filters: traces containing errors or exceeding latency thresholds are saved; routine traces are sampled at 0.5\%.
-  \item \textbf{Dedicated Langfuse Enterprise Instance}: Hosted on-premise or within a private Kubernetes cluster with encryption at rest and Role-Based Access Control (RBAC).
-\end{enumerate}
+\subsection*{Solution (Try It Yourself)}
+\begin{lstlisting}[language=Python]
+async def stream_with_telemetry():
+    collector = StreamingMetricsCollector()
+    with tracer.start_as_current_span("chat.completion") as span:
+        span.set_attribute("gen_ai.request.model", "gpt-4o")
+        collector.start()
+        await asyncio.sleep(0.12)  # Simulated prefill
+        for idx in range(5):
+            collector.record_chunk()
+            if idx == 0:
+                span.add_event("first_token")
+            await asyncio.sleep(0.03)  # Simulated decode step
+        metrics = collector.finalize()
+        span.set_attribute("gen_ai.usage.output_tokens", metrics["total_completion_tokens"])
+        span.set_attribute("llm.ttft_ms", round(metrics["ttft_sec"] * 1000, 2))
+        span.set_attribute("llm.avg_itl_ms", round(metrics["avg_itl_ms"], 2))
+    provider.force_flush()
+\end{lstlisting}
 
-\section{Further Reading \& Citations}
+\begin{labbridgebox}[Project Bridge]
+Combine evaluation and telemetry by inspecting how \texttt{projects/p07-llm-eval-pipeline/evaluator/harness.py} aggregates per-case latency and scores, and consider where OpenTelemetry spans attach around graph nodes in \texttt{projects/p05-langgraph-agent-state/agent/graph.py}.
+\end{labbridgebox}
+
+\section{Further Reading \protect\& Citations}
 \begin{itemize}[leftmargin=18pt]
-  \item OpenTelemetry Community. (2024). \emph{Semantic Conventions for Generative AI Operations}. OpenTelemetry Specification. \url{https://opentelemetry.io/docs/specs/semconv/gen-ai/}.
-  \item Langfuse. (2024). \emph{Open Source LLM Engineering Platform Documentation}. \url{https://langfuse.com/docs}.
-  \item Sambanova Systems. (2024). \emph{Demystifying LLM Inference Performance: Prefill, Decode, TTFT, and ITL Benchmarks}. Technical Whitepaper.
+  \item OpenTelemetry. (2025). \emph{Semantic Conventions for Generative AI Systems}. \url{https://opentelemetry.io/docs/specs/semconv/gen-ai/}.
+  \item W3C. (2021). \emph{Trace Context Recommendation (\texttt{traceparent})}. \url{https://www.w3.org/TR/trace-context/}.
+  \item Langfuse. (2025). \emph{Open Source LLM Engineering Platform Documentation}. \url{https://langfuse.com/docs}.
 \end{itemize}

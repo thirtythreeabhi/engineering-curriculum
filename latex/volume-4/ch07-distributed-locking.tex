@@ -4,48 +4,57 @@
 \begin{chaptergoalsbox}
 \textbf{What you will learn:}
 \begin{itemize}[leftmargin=12pt]
-  \item The fundamental requirements of a distributed lock: Mutual Exclusion, Deadlock Freedom, and Fault Tolerance.
-  \item Time-to-Live (TTL) lease mechanics, heartbeat renewal threads, and why leases fail under process pauses.
-  \item The Redlock Algorithm debate: Salvatore Sanfilippo's multi-node proposal vs. Martin Kleppmann's formal critique.
-  \item The three hazards: Stop-The-World (STW) garbage collection pauses, hypervisor CPU starvation, and asynchronous I/O stalls.
-  \item Fencing tokens and monotonically increasing generation counters: why the storage layer must enforce correctness.
-  \item Database-native alternatives: PostgreSQL session advisory locks and ZooKeeper/etcd ephemeral sequential nodes.
+  \item How single-machine locks (\texttt{CMPXCHG}, \texttt{futex}) differ from distributed TTL leases, and why OS pauses (\texttt{SIGSTOP}, STW GC) break naive locks.
+  \item Single-instance Redis locks: \texttt{SET ... NX PX}, why \texttt{KEYS[1]}/\texttt{ARGV[1]} matter in Lua, and atomic ownership-checked release.
+  \item Heartbeat lock-renewal (watchdog) threads in Python---how they extend leases and why they still fail under whole-process pauses.
+  \item The Redlock algorithm debate: Salvatore Sanfilippo's multi-node quorum proposal vs. Martin Kleppmann's safety critique.
+  \item Storage-enforced Fencing Tokens, PostgreSQL session advisory locks, and ZooKeeper/etcd ephemeral sequential nodes.
 \end{itemize}
 
 \textbf{What you should already understand:}
 \begin{itemize}[leftmargin=12pt]
-  \item Physical clock skew and network unreliability from Chapter~\ref{ch:distributed-fundamentals}.
-  \item Redis single-threaded execution and key expiration from Chapter~\ref{ch:redis-caching}.
+  \item Clock skew and slow hangs from Chapter~\ref{ch:distributed-fundamentals}, and Redis single-threaded Lua execution from Chapter~\ref{ch:redis-caching}.
+  \item No prior C or kernel synchronization background is assumed---we explain hardware compare-and-swap, futexes, and OS signals directly.
 \end{itemize}
 
 \textbf{Why this topic exists:}
-When multiple distributed workers execute background tasks (e.g., generating billing invoices or running batch settlements), engineers often implement a distributed lock in Redis to ensure only one worker runs at a time. Without cryptographic or storage-level fencing, these locks regularly fail, corrupting shared data.
+When 20 Kubernetes pods run background jobs, teams often drop in a Redis lock so only one pod executes a monthly billing run or updates a shared S3 manifest. Without understanding process pauses and fencing tokens, that lock silently allows two workers into the critical section at the same time---charging customers twice or overwriting files.
 
 \textbf{Motivating practical problem:}
-A SaaS provider uses a 30-second Redis distributed lock to prevent duplicate monthly subscription billing. Worker A acquires the lock, but enters an unexpected 35-second JVM garbage collection pause. The lock TTL expires in Redis. Worker B acquires the lock and begins charging customers. Worker A awakes from GC and resumes its execution. Both workers charge the entire customer database in parallel, generating massive customer complaints.
+A billing service uses a 30-second Redis lock to guard nightly invoice generation. Worker~A acquires the lock, loads 10,000 invoices into memory, and hits a 35-second Stop-The-World garbage collection pause. Redis expires the key at second 30; Worker~B acquires the lock and starts billing. At second 35, Worker~A unfreezes and charges the same customers in parallel.
 \end{chaptergoalsbox}
 
-\section{The Mechanics of Leases and Locks}
+\section{From OS Mutexes to Distributed Leases}
 
-On a single operating system, a mutex is backed by atomic hardware instructions (\texttt{CMPXCHG}) and kernel wait queues (futex). If a thread crashes while holding a mutex, the OS kernel cleans up descriptors or terminates the process.
-
-In distributed systems, no overarching kernel exists. If Client A acquires a lock and crashes, the lock would remain held forever unless protected by an automated timeout. Therefore, distributed locks are universally implemented as \textbf{Leases} with a finite Time-to-Live (TTL).
-
-\subsection{Basic Redis Lock Pattern}
-
-The standard single-instance Redis lock is acquired using atomic \texttt{SET}:
-\begin{lstlisting}[language=bash]
-SET resource_name my_random_value NX PX 30000
-\end{lstlisting}
+On a single server, threads synchronize using hardware and kernel primitives:
 \begin{itemize}[leftmargin=18pt]
-  \item \texttt{NX}: Only set the key if it does not already exist (mutual exclusion).
-  \item \texttt{PX 30000}: Automatically expire the key after 30,000 milliseconds (deadlock freedom).
-  \item \texttt{my\_random\_value}: A cryptographically unique string (UUID) per client.
+  \item \textbf{\texttt{CMPXCHG} (Compare-And-Swap)}: A CPU machine instruction that atomically reads a memory word, checks if it equals an expected value (say \texttt{0}), and swaps it to \texttt{1} in one indivisible hardware step so two cores cannot both claim it.
+  \item \textbf{\texttt{futex} (Fast Userspace Mutex)}: A Linux kernel mechanism that lets a thread sleep cleanly in a kernel wait queue without burning 100\% CPU in a loop while another thread holds the lock.
 \end{itemize}
+If a process crashes on a single machine, the OS kernel immediately cleans up its resources and wakes waiters. Across a network, there is no global kernel watching crashed workers. If Worker~A acquires a lock and loses power, no one will ever unlock it unless the lock automatically expires. Consequently, distributed locks must be implemented as \textbf{Leases} with a finite Time-To-Live (TTL).
 
-To safely release the lock, the client must verify that it still owns the lock before deleting it, preventing Client A from deleting a lock that has already expired and been acquired by Client B. This requires an atomic Lua script:
+\begin{intuitionbox}[Correctness vs. Efficiency Locks]
+Before designing a lock, ask what breaks if two workers momentarily overlap:
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{Efficiency Lock}: Prevents wasted duplicate work (e.g., two workers generating the same thumbnail cache). An occasional overlap wastes CPU, not data. A simple Redis TTL lock is fine.
+  \item \textbf{Correctness Lock}: Prevents data corruption, double charges, or lost updates. A simple Redis lock is \textbf{unsafe} here unless paired with storage-side \textbf{Fencing Tokens}.
+\end{itemize}
+\end{intuitionbox}
 
-\begin{lstlisting}[language=Python, caption={Atomic Lock Release in Python via Lua}]
+\subsection{Basic Redis Lock and Lua \texttt{KEYS[1]}/\texttt{ARGV[1]} Atomicity}
+
+To acquire a single-instance Redis lease, the client writes a unique random UUID token with \texttt{NX} (create only if absent) and \texttt{PX} (millisecond expiry):
+\begin{lstlisting}[language=bash]
+SET lock:billing "8f1c9a2e-..." NX PX 30000
+\end{lstlisting}
+
+Why store a random UUID instead of \texttt{"1"}? Suppose Worker~A's lease expires after 30s while Worker~A is stalled, and Worker~B acquires the lock. If Worker~A later runs a blind \texttt{DEL lock:billing}, it would delete \emph{Worker~B's} active lock! Instead, release must check ownership first and delete only if the value still matches---executed atomically inside Redis via Lua.
+
+In Redis Lua scripts, all Redis key names must be passed in \texttt{KEYS[1], KEYS[2], ...} while arguments (like the UUID token or TTL) go in \texttt{ARGV[1], ARGV[2], ...}. Passing keys via \texttt{KEYS[]} lets Redis Cluster inspect the keys upfront to verify they belong to the local hash slot before executing the script uninterrupted on its single-threaded event loop.
+
+\begin{lstlisting}[language=Python, caption={Atomic Lock Acquire and Lua Release in Python}]
+import uuid
+
 LUA_RELEASE_LOCK = """
 if redis.call('get', KEYS[1]) == ARGV[1] then
     return redis.call('del', KEYS[1])
@@ -54,24 +63,87 @@ else
 end
 """
 
+def acquire_lock(redis_client, resource_key: str, ttl_ms: int = 30000) -> str | None:
+    token = str(uuid.uuid4())
+    acquired = redis_client.set(resource_key, token, nx=True, px=ttl_ms)
+    return token if acquired else None
+
 def release_lock(redis_client, resource_key: str, lock_token: str) -> bool:
-    res = redis_client.eval(LUA_RELEASE_LOCK, 1, resource_key, lock_token)
-    return res == 1
+    # numkeys=1 binds resource_key -> KEYS[1] and lock_token -> ARGV[1]
+    return redis_client.eval(LUA_RELEASE_LOCK, 1, resource_key, lock_token) == 1
 \end{lstlisting}
+
+\textbf{Step-by-step trace:}
+\begin{enumerate}[leftmargin=18pt]
+  \item Worker~A calls \texttt{acquire\_lock(r, "lock:job42", 30000)}. Suppose \texttt{token = "uuid-A"}. Redis executes \texttt{SET lock:job42 "uuid-A" NX PX 30000}, returning \texttt{True}, so \texttt{acquire\_lock} returns \texttt{"uuid-A"}.
+  \item While \texttt{lock:job42} exists, Worker~B calls \texttt{acquire\_lock(r, "lock:job42", 30000)}. \texttt{NX} fails, returning \texttt{None}.
+  \item If Worker~A finishes in 5 seconds and calls \texttt{release\_lock(r, "lock:job42", "uuid-A")}, Lua sees \texttt{GET == "uuid-A"}, deletes the key, and returns \texttt{1} (\texttt{True}). If Worker~A's lease had already expired and Worker~B now holds \texttt{"uuid-B"}, Lua sees \texttt{"uuid-B" != "uuid-A"} and returns \texttt{0} (\texttt{False}) without touching B's lock.
+\end{enumerate}
+
+\section{Heartbeat Lock-Renewal Threads (Watchdogs)}
+
+What if a valid job legitimately takes 45 seconds, longer than a 30-second TTL? Setting a huge initial TTL (like 1 hour) means a crashed worker leaves the lock deadlocked for 1 hour. Instead, client libraries (such as Java's Redisson watchdog) spawn a background \textbf{heartbeat renewal thread} that refreshes the TTL periodically (commonly every $\text{TTL}/3$) while work is still running.
+
+\begin{lstlisting}[language=Python, caption={Background Heartbeat Lock-Renewal Thread in Python}]
+import threading
+
+LUA_RENEW_LOCK = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('pexpire', KEYS[1], ARGV[2])
+else
+    return 0
+end
+"""
+
+class LockWatchdog:
+    def __init__(self, redis_client, key: str, token: str, ttl_ms: int = 9000):
+        self.redis = redis_client
+        self.key = key
+        self.token = token
+        self.ttl_ms = ttl_ms
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._renew_loop, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _renew_loop(self) -> None:
+        interval_sec = (self.ttl_ms / 1000.0) / 3.0  # Renew every 1/3 TTL (3.0s)
+        while not self._stop_event.wait(timeout=interval_sec):
+            renewed = self.redis.eval(LUA_RENEW_LOCK, 1, self.key, self.token, self.ttl_ms)
+            if renewed == 0:
+                break  # Lock lost or already released; stop renewing
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._thread.join(timeout=2.0)
+\end{lstlisting}
+
+\textbf{Step-by-step trace:} Suppose \texttt{ttl\_ms = 9000} ($9\text{ s}$).
+\begin{enumerate}[leftmargin=18pt]
+  \item Worker~A acquires \texttt{lock:batch} with token \texttt{"uuid-A"} and calls \texttt{watchdog.start()}.
+  \item Every $9.0 / 3 = 3.0\text{ seconds}$, \texttt{\_stop\_event.wait(3.0)} times out and runs \texttt{LUA\_RENEW\_LOCK}.
+  \item Inside Redis, Lua verifies \texttt{GET lock:batch == "uuid-A"} and runs \texttt{PEXPIRE lock:batch 9000}, resetting the countdown back to $9\text{ s}$.
+  \item If Worker~A dies abruptly (\texttt{SIGKILL}), the daemon thread dies too, and the lock safely expires within $9\text{ s}$. When Worker~A finishes normally after $14\text{ s}$, it calls \texttt{watchdog.stop()} (waking \texttt{\_stop\_event} immediately) and then \texttt{release\_lock()}.
+\end{enumerate}
+
+\begin{commonmistakebox}[Why Watchdog Renewal Threads Still Fail Under Process Pauses]
+A watchdog thread runs \emph{inside the same OS process} as your worker. If the runtime triggers a full Stop-The-World garbage collection pause, or the kernel sends \texttt{SIGSTOP} (a POSIX OS signal that freezes every thread in the process until \texttt{SIGCONT}, used by debuggers and container snapshots), or hypervisor CPU starvation stalls the VM for 12 seconds, the watchdog thread freezes alongside the worker thread! Redis expires the lock at second 9, Worker~B acquires it, and when Worker~A unfreezes at second 12 it resumes writing with zero knowledge that time elapsed.
+\end{commonmistakebox}
 
 \section{The Redlock Debate: Sanfilippo vs. Kleppmann}
 
-To make Redis distributed locks fault-tolerant against single-node crashes, Salvatore Sanfilippo proposed the \textbf{Redlock Algorithm}:
+A single Redis master is a single point of failure; if you add an asynchronous Redis replica and the primary crashes before replicating the lock key, the promoted replica has no record of the lock and hands it to a second worker! To tolerate node crashes without asynchronous replication races, Salvatore Sanfilippo proposed \textbf{Redlock}:
 \begin{enumerate}[leftmargin=18pt]
-  \item Deploy $N$ independent Redis master nodes (typically $N=5$) with no replication.
-  \item The client attempts to acquire the lock across all $N$ nodes sequentially with a small timeout (e.g., $5\text{ to }50\text{ ms}$).
-  \item The client considers the lock acquired if and only if it acquired the lock on a majority of nodes ($\lfloor N/2 \rfloor + 1 \ge 3$) and the total elapsed time is strictly less than the lock validity time.
-  \item If the client fails to acquire the majority, it unlocks all nodes (even those it failed to lock).
+  \item Deploy $N$ independent Redis masters (typically $N=5$) with no replication between them.
+  \item The client records start time $t_0$ and sequentially requests \texttt{SET key token NX PX ttl} on all $5$ nodes with tight per-node timeouts ($5\text{--}50\text{ ms}$).
+  \item The lock succeeds only if acquired on a majority ($\ge 3$ of $5$) \emph{and} total elapsed time $(t_{\text{now}} - t_0) < \text{ttl}$.
+  \item If majority fails, the client unlocks all $5$ nodes immediately.
 \end{enumerate}
 
 \subsection{Martin Kleppmann's Critique}
 
-In 2016, distributed systems researcher Martin Kleppmann published a comprehensive critique demonstrating why Redlock is unsafe for correctness:
+In 2016, Martin Kleppmann showed why Redlock (and in fact \emph{any} pure lease lock without storage verification) cannot guarantee safety:
 
 \begin{figure}[htbp]
 \centering
@@ -80,30 +152,30 @@ In 2016, distributed systems researcher Martin Kleppmann published a comprehensi
   box/.style={rectangle, draw=headingblue, fill=codebg, thick, rounded corners=2pt, minimum width=2.4cm, minimum height=1.0cm, align=center, font=\sffamily\footnotesize},
   storage/.style={cylinder, draw=exampleBlue, fill=exampleBg, thick, shape border rotate=90, minimum width=2.2cm, minimum height=1.4cm, align=center, font=\sffamily\footnotesize}
 ]
-  \node[box] (c1) at (0, 2) {\textbf{Client 1}\\Holds Lock\\Enters GC Pause};
+  \node[box] (c1) at (0, 2) {\textbf{Client 1}\\Holds Lock\\Enters GC / \texttt{SIGSTOP}};
   \node[box, fill=mistakeBg] (lock) at (5, 2) {\textbf{Distributed Lock}\\TTL Expires!};
   \node[box, fill=exampleBg] (c2) at (10, 2) {\textbf{Client 2}\\Acquires New Lock};
-  \node[storage] (store) at (5, -1.5) {\textbf{Shared Storage}\\(S3 / Shared DB)};
+  \node[storage] (store) at (5, -1.5) {\textbf{Shared Storage}\\(S3 / PostgreSQL)};
 
   \draw[-{Stealth[scale=1.0]}, thick, color=warningRed] (c1) -- node[above, font=\sffamily\tiny] {1. Lock Acquired} (lock);
   \draw[-{Stealth[scale=1.0]}, thick, color=mistakeAmber] (lock) -- node[above, font=\sffamily\tiny] {2. Expiry} (c2);
   \draw[-{Stealth[scale=1.0]}, thick, color=exampleBlue] (c2) -- node[right, font=\sffamily\tiny] {3. Write Data (Valid)} (store);
-  \draw[-{Stealth[scale=1.0]}, thick, dashed, color=warningRed] (c1) |- node[below, font=\sffamily\tiny] {4. Wakes from GC $\to$ Delayed Corrupting Write!} (store);
+  \draw[-{Stealth[scale=1.0]}, thick, dashed, color=warningRed] (c1) |- node[below, font=\sffamily\tiny] {4. Wakes from Pause $\to$ Delayed Corrupting Write!} (store);
 \end{tikzpicture}
-\caption{The Distributed Lock GC Pause Hazard and Corrupting Write}
-\label{fig:gc-pause-hazard}
+\caption{The Process Pause Hazard: Why Lease Locks Alone Cannot Protect Shared Storage}
+\label{fig:v4-ch07-gc-pause}
 \end{figure}
 
-Kleppmann identified three inescapable real-world conditions that break Redlock:
+Three real-world hazards defeat Redlock:
 \begin{enumerate}[leftmargin=18pt]
-  \item \textbf{Process Pauses}: A full JVM garbage collection cycle, SIGSTOP signal, or page fault can pause a client for tens of seconds. During the pause, the lock expires. When the process awakes, it has no awareness that time has passed and executes its mutated write concurrently with another client.
-  \item \textbf{Asynchronous Network Latency}: Packets can be delayed arbitrarily in transit.
-  \item \textbf{Clock Skew and System Time Steps}: Redlock relies on physical wall-clock elapsed time to determine whether a lease is valid. If NTP steps a node's clock forward, a key can expire instantly before the client uses it.
+  \item \textbf{Process Pauses}: As shown in Figure~\ref{fig:v4-ch07-gc-pause}, a STW GC pause or \texttt{SIGSTOP} after acquiring the lock lets the TTL expire; Client~1 wakes up blind to the pause and overwrites Client~2's work.
+  \item \textbf{Clock Jumps}: Redlock depends on wall-clock TTL tracking; an NTP forward step on one Redis host can prematurely expire keys before the client's validity window ends.
+  \item \textbf{Network Delays}: Even without GC, delayed TCP packets can stall Client~1's write in flight until after Client~2 acquires the lock.
 \end{enumerate}
 
-\section{Fencing Tokens: Storage-Enforced Mutual Exclusion}
+\section{Fencing Tokens: Storage-Enforced Safety}
 
-Kleppmann demonstrated that a distributed lock service \textbf{cannot guarantee mutual exclusion by itself}. To achieve true safety, the shared storage tier must participate in verification using \textbf{Fencing Tokens}.
+Because a lock server cannot stop a paused client from sending stale writes over the network, **the storage tier itself must validate lock freshness** using a monotonically increasing **Fencing Token**.
 
 \begin{figure}[htbp]
 \centering
@@ -125,75 +197,84 @@ Kleppmann demonstrated that a distributed lock service \textbf{cannot guarantee 
 
   \node[anchor=north, font=\sffamily\tiny, color=warningRed] at (5, -3.0) {Condition: $33 \le 34 \implies$ Storage Rejects Stale Token!};
 \end{tikzpicture}
-\caption{Fencing Tokens Enforcing Correctness at the Storage Boundary}
-\label{fig:fencing-tokens}
+\caption{Fencing Tokens Enforcing Mutual Exclusion at the Storage Boundary}
+\label{fig:v4-ch07-fencing-tokens}
 \end{figure}
 
-\textbf{Fencing Token Protocol Rules:}
-\begin{enumerate}[leftmargin=18pt]
-  \item Every time the lock service grants a lock, it increments an atomic counter and returns the value as a fencing token (e.g., Token 33, Token 34).
-  \item When a client writes to the database or storage layer, it attaches its fencing token to the write request.
-  \item The storage layer maintains the highest token it has ever observed. If a write arrives with a token smaller than or equal to the highest observed token ($Token_{\text{incoming}} \le Token_{\text{max}}$), the storage layer \textbf{rejects the write with an error}.
-\end{enumerate}
-
+Every time the consensus lock service grants a lock, it increments an atomic sequence counter (e.g., $33 \to 34$) and returns it as the fencing token. Every write to PostgreSQL includes that token:
 \begin{lstlisting}[language=SQL, caption={PostgreSQL Storage-Side Fencing Enforcement}]
--- Storage Table with Monotonic Fencing Guard
 CREATE TABLE document_storage (
     doc_id VARCHAR(64) PRIMARY KEY,
     payload TEXT NOT NULL,
     fencing_token BIGINT NOT NULL
 );
 
--- Atomic Write guarded by Fencing Token
+-- Atomic conditional update: succeeds only if incoming token is strictly newer
 UPDATE document_storage
 SET payload = 'new content from client',
     fencing_token = 34
 WHERE doc_id = 'doc_991'
-  AND fencing_token < 34; -- Rejects any stale worker with token <= 33
+  AND fencing_token < 34; -- Rejects delayed Client 1 carrying token 33 (0 rows updated)
 \end{lstlisting}
+\textbf{Step-by-step trace:} Suppose \texttt{doc\_991} starts at \texttt{fencing\_token = 32}. Client~2 wakes up with token \texttt{34} and executes the \texttt{UPDATE}; \texttt{32 < 34} is true, so PostgreSQL updates \texttt{payload} and sets \texttt{fencing\_token = 34} (\texttt{rowcount = 1}). Seconds later, Client~1 wakes up from GC and sends its delayed \texttt{UPDATE} with \texttt{fencing\_token = 33}. PostgreSQL checks \texttt{34 < 33} (false!), updates \textbf{0 rows}, and rejects the stale write safely.
 
 \section{Database-Native and Consensus Alternatives}
 
-When systems require distributed locking without the operational complexity of Redlock or custom fencing tokens, two proven alternatives exist:
-
 \subsection{PostgreSQL Session Advisory Locks}
-PostgreSQL provides application-level locks that do not lock physical rows or tables. Advisory locks operate within the database's internal lock manager and are tied to a database connection session:
+If your data already lives in PostgreSQL, you can acquire an application-level **session advisory lock** tied to the TCP connection inside PostgreSQL's lock manager:
 \begin{lstlisting}[language=SQL]
--- Non-blocking lock attempt (returns true/false immediately)
-SELECT pg_try_advisory_lock(149204);
-
--- Critical section execution ...
-
--- Explicit release
-SELECT pg_advisory_unlock(149204);
+SELECT pg_try_advisory_lock(149204);   -- Returns true/false immediately without blocking
+-- Execute protected work on this exact DB connection...
+SELECT pg_advisory_unlock(149204);     -- Explicit unlock (or auto-released on disconnect)
 \end{lstlisting}
-If the worker crashes or the TCP socket drops, PostgreSQL automatically releases the advisory lock immediately.
+If the worker crashes or drops its socket, PostgreSQL releases the advisory lock automatically. (Warning: never use session advisory locks behind connection poolers like PgBouncer in *transaction pooling* mode, because different transactions get multiplexed onto the same DB session!)
 
 \subsection{ZooKeeper / etcd Ephemeral Sequential Nodes}
-In Apache ZooKeeper or etcd (which run Raft/ZAB consensus):
+Consensus stores like ZooKeeper and \texttt{etcd} provide native monotonic counters (e.g., ZooKeeper `zxid` or etcd `revision`) that double directly as fencing tokens:
 \begin{itemize}[leftmargin=18pt]
-  \item The client creates an \textbf{ephemeral sequential} znode: \texttt{/locks/resource-00000001}.
-  \item An ephemeral node exists only as long as the client's heartbeat session is active. If the client crashes, the consensus cluster deletes the node.
-  \item Clients order themselves by sequence number. Client A holds the lock if its sequence number is the lowest in the directory.
-  \item Other clients set a \textbf{Watch} on the immediately preceding node, avoiding herd stampedes and waking up sequentially as locks are released.
+  \item Each contender creates an \textbf{ephemeral sequential} znode (e.g., \texttt{/locks/job-00000033}).
+  \item Ephemeral nodes are tied to a heartbeat session and vanish automatically if the worker dies.
+  \item Only the holder of the lowest sequence number owns the lock; every other client puts a \textbf{Watch} solely on the node immediately ahead of it (e.g., \texttt{00000034} watches \texttt{00000033}), preventing thundering-herd wakeups.
 \end{itemize}
 
-\section{Summary \& Key Takeaways}
+\begin{realworldbox}[Diagnosing Duplicate Billing from a Stale Lease Pause]
+\textbf{Symptom:} Customer support reports duplicate invoices for batch \texttt{2026-11-01}, while application logs show two workers claimed the same lock seconds apart.\\
+\textbf{Sample Logs:}
+\begin{verbatim}
+02:00:01.104 [worker-a] Acquired lock:billing (ttl=30s, token=412)
+02:00:01.410 [worker-a] JVM Full GC pause started (heap allocation spike)
+02:00:31.200 [redis]    Key lock:billing expired
+02:00:31.250 [worker-b] Acquired lock:billing (ttl=30s, token=413)
+02:00:34.880 [worker-b] Committed batch_2026_11_01 (fencing_token=413)
+02:00:36.510 [worker-a] JVM GC finished (paused 35.1s); attempting DB write (token=412)
+02:00:36.518 [postgres] UPDATE affected 0 rows (stale fencing_token 412 <= 413); aborted!
+\end{verbatim}
+\textbf{Takeaway:} Even though Redis expired the lock and Worker~A woke up mid-job, storage-side fencing (\texttt{412 <= 413}) caught and blocked the stale write before any duplicate charge reached Stripe.
+\end{realworldbox}
+
+\begin{tryityourselfbox}[Trace Watchdog Renewal & Storage Fencing Failure]
+\begin{enumerate}[leftmargin=18pt]
+  \item In \texttt{LockWatchdog} above, suppose \texttt{ttl\_ms = 9000}. At $t=0$, Worker~A acquires the lock. At $t=3\text{ s}$ and $t=6\text{ s}$, renewals succeed. At $t=7\text{ s}$, Worker~A receives \texttt{SIGSTOP} for $12\text{ s}$ (until $t=19\text{ s}$). At exactly what timestamp $t$ does Redis expire the lock?
+  \item Suppose a storage service forgets to check \texttt{fencing\_token} on \texttt{DELETE} operations, checking it only on \texttt{UPDATE}. Describe how Client~1 waking up with token~33 can still corrupt Client~2's work.
+\end{enumerate}
+\end{tryityourselfbox}
+
+\section{Summary \protect\& Key Takeaways}
 \begin{itemize}[leftmargin=18pt]
-  \item Distributed locks require leases with TTLs to prevent permanent deadlocks caused by crashed clients.
-  \item Redis locks must be released using atomic Lua scripts comparing unique ownership tokens.
-  \item Martin Kleppmann proved that distributed locks alone cannot guarantee safety due to GC pauses, asynchronous network delays, and clock jumps.
-  \item True safety requires \textbf{Fencing Tokens}: monotonically increasing integers passed to the storage engine, which rejects any write with a token older than the highest observed.
-  \item Robust alternatives include PostgreSQL session advisory locks and ZooKeeper/etcd ephemeral sequential znodes.
+  \item Distributed locks rely on TTL leases instead of kernel \texttt{CMPXCHG}/\texttt{futex} wait queues so crashed clients do not deadlock clusters forever.
+  \item Redis lock release and watchdog renewal must run as atomic Lua scripts (\texttt{KEYS[1]}/\texttt{ARGV[1]}) verifying UUID ownership before modifying keys.
+  \item Watchdog threads and Redlock cannot prevent overlapping writes when a process suffers a STW GC pause, \texttt{SIGSTOP}, or clock jump.
+  \item True mutual exclusion requires **Fencing Tokens**: monotonically increasing counters validated by the storage layer on every mutation.
+  \item PostgreSQL session advisory locks and ZooKeeper/etcd ephemeral sequential nodes offer battle-tested consensus or database-native alternatives.
 \end{itemize}
 
 \section{Exercises}
 
-\subsection{Mechanics}
-Write an atomic Redis Lua script to extend (heartbeat renew) an existing lock's TTL by 10,000 milliseconds only if the client still owns the lock.
+\subsection*{Exercise~\thechapter.1 (Mechanics): Atomic Watchdog Renewal Script}
+Write an atomic Redis Lua script that extends a lock's TTL by \texttt{10000} milliseconds only if the caller's UUID still matches the value stored at \texttt{KEYS[1]}. Explain why \texttt{PEXPIRE} is preferable to \texttt{EXPIRE}.
 
-\subsection{Debugging}
-A developer writes a distributed lock wrapper in Python:
+\subsection*{Exercise~\thechapter.2 (Debugging): Two Fatal Bugs in \texttt{BadLock}}
+Identify two critical production bugs in the lock wrapper below:
 \begin{lstlisting}[language=Python]
 class BadLock:
     def acquire(self, key):
@@ -203,14 +284,16 @@ class BadLock:
     def release(self, key):
         redis.delete(key)
 \end{lstlisting}
-Identify two critical bugs that will lead to catastrophic production failures.
 
-\subsection{Architecture}
-You are designing an automated recurring billing engine that executes every night at 02:00 AM across a cluster of 50 Kubernetes pods. Design an end-to-end architecture using PostgreSQL advisory locks and transaction fencing to guarantee that no invoice is charged twice, even during pod rollouts.
+\subsection*{Exercise~\thechapter.3 (Architecture): Exactly-Once Nightly Billing Across 50 Pods}
+Design a nightly 02:00 AM billing system across 50 Kubernetes pods using PostgreSQL advisory locks, optimistic row-version fencing, and payment gateway idempotency keys to guarantee zero duplicate charges during rolling deploys.
+
+\subsection*{Exercise~\thechapter.4 (Try-It-Yourself Lab): Lease Expiry Timing & Fencing Gaps}
+Solve both parts of the \emph{Try It Yourself} box above.
 
 \section{Detailed Solutions}
 
-\subsection{Solution to Mechanics Exercise}
+\subsection*{Solution to Exercise~\thechapter.1}
 \begin{lstlisting}[language=Python]
 LUA_RENEW_LOCK = """
 if redis.call('get', KEYS[1]) == ARGV[1] then
@@ -219,40 +302,34 @@ else
     return 0
 end
 """
-# Usage: redis.eval(LUA_RENEW_LOCK, 1, "lock:invoice", client_uuid, 10000)
+# Call: redis_client.eval(LUA_RENEW_LOCK, 1, "lock:invoice", client_uuid, 10000)
 \end{lstlisting}
+\texttt{PEXPIRE} operates in milliseconds (matching \texttt{SET ... PX}), giving finer lease granularity than second-level \texttt{EXPIRE}.
 
-\subsection{Solution to Debugging Exercise}
-\textbf{Critical Bug 1: No TTL / Lease Expiration.}
-The call \texttt{redis.set(key, "1", nx=True)} omits an expiration parameter (\texttt{ex} or \texttt{px}). If the worker process encounters a kernel panic, OOM kill, or power failure while holding the lock, the key \texttt{"1"} persists in Redis forever. All other workers will loop infinitely in \texttt{time.sleep(0.1)}, freezing the entire system permanently.
-\textbf{Critical Bug 2: Blind Lock Deletion.}
-In \texttt{release()}, the code executes \texttt{redis.delete(key)}. Because the stored value is a static \texttt{"1"} rather than a unique UUID, any worker can inadvertently delete a lock held by a different worker.
+\subsection*{Solution to Exercise~\thechapter.2}
+\textbf{Bug 1 (No TTL):} \texttt{redis.set(key, "1", nx=True)} sets no expiration. If the lock holder crashes or is OOM-killed, \texttt{key} stays in Redis forever and all other pods spin permanently in \texttt{while not ...}.\\
+\textbf{Bug 2 (Blind Delete & Static Token):} Storing static \texttt{"1"} and calling \texttt{redis.delete(key)} lets a stalled worker delete a newer worker's active lock.
 
-\subsection{Solution to Architecture Exercise}
-\textbf{Architecture:}
+\subsection*{Solution to Exercise~\thechapter.3}
 \begin{enumerate}[leftmargin=18pt]
-  \item \textbf{Global Leader Election via Advisory Lock}: A worker pod attempts to acquire a cluster-wide leader lock using PostgreSQL:
-  \begin{lstlisting}[language=SQL]
-  SELECT pg_try_advisory_lock(hashtext('daily_billing_job_2026_11_23'));
-  \end{lstlisting}
-  If the function returns \texttt{false}, the pod immediately terminates and waits for tomorrow's schedule. Only one pod becomes the billing orchestrator.
-  \item \textbf{Row-Level Invoice Fencing}: The leader queries unprocessed invoices and processes them in batches. To prevent concurrent worker collisions or mid-job pod restarts, each invoice update utilizes an optimistic concurrency version column and status transition:
-  \begin{lstlisting}[language=SQL]
-  UPDATE invoices
-  SET status = 'PROCESSING',
-      lock_version = lock_version + 1,
-      locked_by = 'pod_worker_7a'
-  WHERE id = :invoice_id
-    AND status = 'PENDING'
-    AND lock_version = :expected_version;
-  \end{lstlisting}
-  If \texttt{rowcount == 0}, the invoice was already claimed.
-  \item \textbf{Idempotent Payment Execution}: Pass \texttt{invoice\_id || '\_' || lock\_version} to Stripe as the payment idempotency key.
+  \item \textbf{Leader Election}: Each pod calls \texttt{SELECT pg\_try\_advisory\_lock(hashtext('billing\_2026\_11\_24'));} on a direct non-pooled Postgres connection. Only the single winning pod proceeds.
+  \item \textbf{Optimistic Row Fencing}: Claim each pending invoice atomically with \texttt{UPDATE invoices SET status='PROCESSING', lock\_version = lock\_version + 1 WHERE id=:id AND status='PENDING' AND lock\_version=:v;}. Only \texttt{rowcount == 1} proceeds.
+  \item \textbf{Payment Idempotency}: Pass \texttt{f"inv\_\{id\}\_v\{lock\_version\}"} as the Stripe/payment gateway idempotency key.
 \end{enumerate}
 
-\section{Further Reading \& Citations}
+\subsection*{Solution to Exercise~\thechapter.4}
+\begin{enumerate}[leftmargin=18pt]
+  \item At $t=6\text{ s}$, \texttt{LUA\_RENEW\_LOCK} reset the TTL to $9\text{ s}$, setting expiration at $6 + 9 = \mathbf{15\text{ s}}$. During the \texttt{SIGSTOP} ($t=7\text{ s}$ to $19\text{ s}$), the watchdog thread is frozen, so the lock expires silently at $t=15\text{ s}$---four seconds before Worker~A resumes!
+  \item Client~2 writes a valid record with token~34; Client~1 wakes up with stale token~33 and executes an unguarded \texttt{DELETE} that erases Client~2's newly written record. Fencing must protect *every* mutating operation (\texttt{INSERT}, \texttt{UPDATE}, and \texttt{DELETE}).
+\end{enumerate}
+
+\begin{labbridgebox}[Fencing Token Lab & Production Locking]
+Run \texttt{exercises/volume4/ex04\_distributed\_lock\_fencing.py} to verify how \texttt{FencedStorageService.write()} rejects stale token~1 after Client~2 acquires token~2, and inspect Redis-backed idempotency locking inside \texttt{projects/p12-end-to-end-platform}.
+\end{labbridgebox}
+
+\section{Further Reading \protect\& Citations}
 \begin{itemize}[leftmargin=18pt]
-  \item Kleppmann, M. (2016). \emph{How to do distributed locking}. Available at \url{https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html}.
-  \item Sanfilippo, S. (2016). \emph{Is Redlock safe?}. Available at \url{http://antirez.com/news/101}.
-  \item Hunt, P., et al. (2010). \emph{ZooKeeper: Wait-free coordination for large distributed systems}. In USENIX Annual Technical Conference (ATC 10), 145--158.
+  \item Kleppmann, M. (2016). \emph{How to do distributed locking}. \url{https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html}.
+  \item Sanfilippo, S. (2016). \emph{Is Redlock safe?}. \url{http://antirez.com/news/101}.
+  \item Hunt, P., et al. (2010). \emph{ZooKeeper: Wait-free coordination for large distributed systems}. USENIX ATC 10, 145--158.
 \end{itemize}

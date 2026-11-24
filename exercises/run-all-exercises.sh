@@ -12,7 +12,34 @@ echo "--- [Volume 1: Backend Engineering Exercises] ---"
 php "$EX_DIR/volume1/ex01_php_cow_zval.php"
 php "$EX_DIR/volume1/ex02_php_pdo_prepared_transactions.php"
 python3 "$EX_DIR/volume1/ex03_python_asyncio_event_loop.py"
-python3 -c "import sqlite3; conn = sqlite3.connect(':memory:'); conn.executescript(open('$EX_DIR/volume1/ex04_sql_mvcc_isolation.sql').read()); print('[PASS] Exercise 1.4 verified (SQL transactions & solvency constraint passed).')"
+python3 - <<'PY'
+import sqlite3
+
+with open("/home/abhi/engineering-curriculum/exercises/volume1/ex04_sql_mvcc_isolation.sql", "r", encoding="utf-8") as f:
+    sql_script = f.read()
+
+conn = sqlite3.connect(":memory:")
+conn.executescript(sql_script)
+
+rows = conn.execute(
+    "SELECT account_id, balance_cents FROM bank_accounts ORDER BY account_id"
+).fetchall()
+assert rows == [("ACC-001", 80000), ("ACC-002", 70000)], f"Unexpected balances: {rows}"
+
+# Verify CHECK (balance_cents >= 0) rejects overdraft and ROLLBACK preserves balances
+try:
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute("UPDATE bank_accounts SET balance_cents = balance_cents - 100000 WHERE account_id = 'ACC-001'")
+    assert False, "Expected sqlite3.IntegrityError for negative balance!"
+except sqlite3.IntegrityError:
+    conn.rollback()
+
+after = conn.execute(
+    "SELECT account_id, balance_cents FROM bank_accounts ORDER BY account_id"
+).fetchall()
+assert after == [("ACC-001", 80000), ("ACC-002", 70000)], f"Rollback failed: {after}"
+print("[PASS] Exercise 1.4 verified (SQLite BEGIN IMMEDIATE, exact balances, and CHECK constraint rollback passed).")
+PY
 python3 "$EX_DIR/volume1/ex05_jwt_timing_safe_verifier.py"
 
 echo ""

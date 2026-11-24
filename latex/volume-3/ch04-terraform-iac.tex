@@ -1,0 +1,371 @@
+\chapter{Terraform and Infrastructure as Code}
+\label{chap:terraform}
+
+\begin{chaptergoalsbox}
+\textbf{What You Will Learn:}
+\begin{itemize}[leftmargin=12pt]
+  \item Imperative scripts vs.\ declarative Infrastructure as Code (IaC), HCL2 syntax, \texttt{dynamic}/\texttt{for\_each} blocks, and input validation.
+  \item Terraform's Directed Acyclic Graph (DAG) engine: implicit vs.\ explicit dependencies, cycle detection, and Kahn's topological sort traced step-by-step.
+  \item Remote state internals (\texttt{terraform.tfstate} schema, \texttt{lineage}, \texttt{serial}) and why plaintext secrets live in state even with \texttt{sensitive = true}.
+  \item Distributed mutual exclusion via Azure Blob Storage leases (\texttt{x-ms-lease-action}, HTTP 412).
+  \item Three-way drift reconciliation (\texttt{plan} vs.\ \texttt{apply}) and module hardening with \texttt{lifecycle \{ prevent\_destroy = true \}}.
+\end{itemize}
+
+\textbf{What You Should Already Understand:}
+\begin{itemize}[leftmargin=12pt]
+  \item Azure Resource Groups, Virtual Networks, Subnets, and Route Tables (Chapter~\ref{chap:azure-fundamentals}).
+  \item Basic JSON documents and HTTP status codes (201, 412).
+  \item No prior graph-theory coursework is required; Section~\ref{sec:v3-ch04-dag} builds DAGs and Kahn's topological sort from scratch.
+\end{itemize}
+
+\textbf{Why This Topic Exists:}
+Clicking through a cloud console or running one-off Azure CLI scripts produces undocumented environments that cannot be reproduced reliably in staging or disaster recovery. Terraform replaces manual steps with declarative HCL2 files reviewed in Git pull requests, ordered mathematically into parallel execution waves, and locked against concurrent edits.
+
+\textbf{Motivating Practical Problem:}
+Two platform engineers run a deployment script against the same production Virtual Network within ten seconds of each other. Without distributed locking, both processes read version 14 of the state file and write conflicting version 15 snapshots, orphaning 40 database NICs. On the next run, Terraform plans to destroy the database tier. How do you order cloud API calls safely using a dependency graph, lock shared state with Azure Blob leases, and guard critical resources against accidental destruction?
+\end{chaptergoalsbox}
+
+\section{Declarative Infrastructure and HCL2 Syntax}
+
+When provisioning cloud resources, engineers choose between two models:
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{Imperative (Procedural):} Step-by-step scripts (\texttt{az network vnet create ...}). If step 3 fails halfway through, re-running the script often crashes with ``Resource already exists'' unless you hand-code idempotency checks for every call.
+  \item \textbf{Declarative:} You describe the *desired end state* (``there must exist a VNet \texttt{10.0.0.0/16} containing two subnets''). The IaC engine inspects reality, computes the delta, and issues only the create, update, or delete calls needed to converge.
+\end{itemize}
+
+\subsection{HCL2 Blocks, Expressions, and \texttt{dynamic}/\texttt{for\_each}}
+Terraform configurations use 	extbf{HCL2 (HashiCorp Configuration Language v2)}, built from five core block types:
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{\texttt{terraform \{\}}:} Pins Terraform CLI version, required providers, and remote state backend.
+  \item \textbf{\texttt{provider \{\}}:} Configures the cloud API plugin (e.g., \texttt{azurerm}, \texttt{kubernetes}).
+  \item \textbf{\texttt{resource \{\}}:} Declares a managed cloud object (e.g., \texttt{azurerm\_subnet}).
+  \item \textbf{\texttt{data \{\}}:} Performs a read-only lookup of an existing resource managed elsewhere.
+  \item \textbf{\texttt{variable \{\}}, \texttt{locals \{\}}, \texttt{output \{\}}:} Parameterize inputs, compute intermediate expressions, and export attributes.
+\end{enumerate}
+
+When a resource needs repeated nested blocks (such as NSG rules), HCL2 avoids copy-paste repetition with \texttt{dynamic} blocks and \texttt{for\_each}:
+
+\begin{lstlisting}[language=hcl, caption={HCL2 Dynamic NSG Rules and Input Validation}]
+variable "subnet_cidr" {
+  type        = string
+  description = "IPv4 CIDR between /24 and /28."
+  validation {
+    condition     = can(cidrnetmask(var.subnet_cidr)) \&\& tonumber(split("/", var.subnet_cidr)[1]) >= 24 \&\& tonumber(split("/", var.subnet_cidr)[1]) <= 28
+    error_message = "subnet_cidr must be a valid IPv4 CIDR between /24 and /28."
+  }
+}
+
+locals {
+  security_rules = {
+    https = { port = 443,  priority = 100 }
+    mtls  = { port = 8443, priority = 110 }
+  }
+}
+
+resource "azurerm_network_security_group" "api_nsg" {
+  name                = "nsg-api-prod"
+  location            = "eastus"
+  resource_group_name = "rg-clinic-prod"
+
+  dynamic "security_rule" {
+    for_each = local.security_rules
+    content {
+      name                       = "allow-${security_rule.key}"
+      priority                   = security_rule.value.priority
+      direction                  = "Inbound"
+      access                     = "Allow"
+      protocol                   = "Tcp"
+      source_port_range          = "*"
+      destination_port_range     = security_rule.value.port
+      source_address_prefix      = "VirtualNetwork"
+      destination_address_prefix = "*"
+    }
+  }
+}
+\end{lstlisting}
+
+\textbf{Step-by-step trace of Listing 1:}
+\begin{enumerate}[leftmargin=15pt]
+  \item Lines 1--8 validate \texttt{var.subnet\_cidr} before any Azure API call runs. On input \texttt{"10.0.1.0/24"}, \texttt{cidrnetmask} succeeds and \texttt{split("/", ...)[1]} evaluates to \texttt{24}, passing validation. On \texttt{"10.0.1.0/29"}, \texttt{29 <= 28} is false, aborting \texttt{terraform plan} immediately with the custom error message.
+  \item Lines 10--15 define a map \texttt{local.security\_rules} with two keys (\texttt{https}, \texttt{mtls}).
+  \item Lines 22--35 iterate over that map using \texttt{dynamic "security\_rule"}: iteration 1 sets \texttt{security\_rule.key = "https"}, generating \texttt{name = "allow-https"}, \texttt{priority = 100}, \texttt{destination\_port\_range = 443}; iteration 2 sets \texttt{key = "mtls"}, generating \texttt{name = "allow-mtls"}, \texttt{priority = 110}, \texttt{port = 8443}.
+\end{enumerate}
+
+\section{The Directed Acyclic Graph (DAG) Engine}
+\label{sec:v3-ch04-dag}
+
+In HCL2, the order in which you write blocks in a file does \emph{not} matter. Instead, Terraform parses all files and constructs a 	extbf{Directed Acyclic Graph (DAG)}: a network of resource nodes connected by one-way dependency arrows ($u \to v$ meaning ``$u$ must finish before $v$ can start'') containing zero closed loops.
+
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{Implicit Dependencies:} Whenever resource $B$ references an attribute of resource $A$ (such as \texttt{resource\_group\_name = azurerm\_resource\_group.rg.name}), Terraform inserts the directed edge $A \to B$ automatically.
+  \item \textbf{Explicit Dependencies:} When two resources have a runtime ordering constraint without sharing an attribute (for example, a Pod must wait until a Key Vault RBAC role assignment propagates), add \texttt{depends\_on = [azurerm\_role\_assignment.kv]}.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1.0cm and 1.2cm,
+  node/.style={rectangle, draw=headingblue, fill=headingblue!5, rounded corners=2pt, text width=3.8cm, minimum height=0.8cm, align=center, font=\sffamily\scriptsize\bfseries},
+  leaf/.style={rectangle, draw=exampleBlue, fill=exampleBg, rounded corners=2pt, text width=3.8cm, minimum height=0.8cm, align=center, font=\sffamily\scriptsize\bfseries},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=headingblue}
+]
+\node[node] (rg) {\texttt{azurerm\_resource\_group.rg}\\(Wave 0: in-degree 0)};
+\node[node, below left=1.0cm and -0.2cm of rg] (vnet) {\texttt{azurerm\_virtual\_network.vnet}\\(Wave 1)};
+\node[node, below right=1.0cm and -0.2cm of rg] (kv) {\texttt{azurerm\_key\_vault.kv}\\(Wave 1)};
+\node[leaf, below=1.0cm of $(vnet)!0.5!(kv)$] (app) {\texttt{azurerm\_linux\_web\_app.app}\\(Wave 2)};
+
+\draw[arrow] (rg) -- (vnet);
+\draw[arrow] (rg) -- (kv);
+\draw[arrow] (vnet) -- (app);
+\draw[arrow] (kv) -- (app);
+\end{tikzpicture}
+\caption{4-Resource Terraform DAG Partitioned into Parallel Execution Waves}
+\label{fig:v3-ch04-terraform-dag}
+\end{figure}
+
+\subsection{Tracing Kahn's Topological Sort Step-by-Step}
+First, Terraform runs 	extbf{Tarjan's strongly connected components check} to verify there are no dependency cycles; if $A \to B \to A$ exists, it halts with \texttt{Error: Cycle}. Next, Terraform plans parallel execution waves using 	extbf{Kahn's Algorithm} (tracking each node's \emph{in-degree}, the count of unfinished prerequisites pointing into it).
+
+Trace Figure~\ref{fig:v3-ch04-terraform-dag} with 4 resources ($\text{RG}$, $\text{VNet}$, $\text{KV}$, $\text{App}$) where edges are $\text{RG} \to \text{VNet}$, $\text{RG} \to \text{KV}$, $\text{VNet} \to \text{App}$, and $\text{KV} \to \text{App}$:
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{llp{4.6cm}p{4.8cm}}
+\toprule
+\textbf{Wave} & \textbf{Ready Queue (in-deg = 0)} & \textbf{Executed in Parallel} & \textbf{In-Degree Updates After Wave} \\
+\midrule
+Initial & \texttt{[RG]} & --- & $\text{RG}:0,\; \text{VNet}:1,\; \text{KV}:1,\; \text{App}:2$ \\
+Wave 0 & \texttt{[RG]} & Provision \texttt{RG} & Decrement \texttt{VNet} ($1\to 0$), \texttt{KV} ($1\to 0$) \\
+Wave 1 & \texttt{[VNet, KV]} & Provision \texttt{VNet} \& \texttt{KV} concurrently! & Decrement \texttt{App} twice ($2\to 1\to 0$) \\
+Wave 2 & \texttt{[App]} & Provision \texttt{App} & All 4 nodes processed ($4 = |V|$, acyclic!) \\
+\bottomrule
+\end{tabular}
+\caption{Step-by-Step Trace of Kahn's Algorithm on the 4-Resource Graph}
+\label{tab:v3-ch04-kahn-trace}
+\end{table}
+
+Up to \texttt{-parallelism=10} resources in the same wave execute concurrently across worker threads. If at the end fewer than $|V|$ nodes were processed, a cycle remains and Terraform aborts.
+
+\section{Remote State and Distributed Blob Locking}
+
+To track which HCL block corresponds to which real cloud object, Terraform maintains a JSON database called \textbf{\texttt{terraform.tfstate}}:
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{Identity Mapping:} Maps logical name \texttt{azurerm\_subnet.app} to its physical ARM resource URI (\texttt{/subscriptions/.../subnets/snet-app}).
+  \item \textbf{\texttt{lineage} \& \texttt{serial}:} A permanent UUID identifying the state file and a monotonically increasing revision counter preventing accidental state swaps.
+\end{itemize}
+
+\begin{productionwarningbox}[Plaintext Secrets Inside \texttt{terraform.tfstate}]
+Marking a variable or output \texttt{sensitive = true} only hides it from terminal stdout. 	extbf{Terraform always stores every resource attribute—including database passwords and TLS private keys—as plaintext inside \texttt{terraform.tfstate}.} Never commit \texttt{terraform.tfstate} to Git. Store it in a remote backend encrypted at rest with Azure RBAC access control.
+\end{productionwarningbox}
+
+\subsection{Mutual Exclusion via Azure Blob Leases}
+To prevent two CI runners from corrupting state simultaneously, the \texttt{azurerm} backend uses 	extbf{Azure Blob Storage Leases} (Figure~\ref{fig:v3-ch04-blob-lease}):
+\begin{enumerate}[leftmargin=15pt]
+  \item Before reading or mutating state, Runner 1 sends an HTTP \texttt{PUT} with header \texttt{x-ms-lease-action: acquire} (infinite lease). Azure Storage locks the blob, generates a UUID Lease ID, and returns \texttt{201 Created}.
+  \item If Runner 2 starts concurrently, its acquire request hits the locked blob and Azure immediately returns 	extbf{HTTP 412 (Precondition Failed)}, aborting Runner 2 safely with \texttt{Error acquiring the state lock}.
+  \item When Runner 1 finishes uploading the new JSON state, it sends \texttt{x-ms-lease-action: release}.
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.86, every node/.style={scale=0.86},
+  node distance=1.1cm and 1.2cm,
+  runner/.style={rectangle, draw=headingblue, fill=headingblue!5, rounded corners=2pt, text width=3.8cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  blob/.style={cylinder, draw=exampleBlue, fill=exampleBg, shape border rotate=90, minimum height=2.2cm, minimum width=2.7cm, aspect=0.25, font=\sffamily\scriptsize\bfseries, align=center},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=headingblue}
+]
+\node[runner] (r1) {Runner 1 (Build 101)\\\texttt{terraform apply}};
+\node[runner, below=1.2cm of r1] (r2) {Runner 2 (Build 102)\\\texttt{terraform apply}};
+\node[blob, right=2.1cm of r1] (blob) {State Blob\\\texttt{prod.tfstate}\\Lease Held by Build 101};
+
+\draw[arrow] (r1) -- node[above, font=\tiny\sffamily]{1. \texttt{acquire} $\to$ 201 Created} (blob);
+\draw[arrow] (r2) -- node[below, font=\tiny\sffamily]{2. \texttt{acquire} $\to$ \color{warningRed}HTTP 412 Failed} (blob);
+\end{tikzpicture}
+\caption{Distributed State Locking via Azure Blob Storage Leases}
+\label{fig:v3-ch04-blob-lease}
+\end{figure}
+
+\begin{lstlisting}[language=hcl, caption={Production Azure Remote Backend Using Entra ID Auth}]
+terraform {
+  required_version = ">= 1.8.0"
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~> 3.100"
+    }
+  }
+
+  backend "azurerm" {
+    resource_group_name  = "rg-terraform-state-eastus"
+    storage_account_name = "sttfstateclinicprod"
+    container_name       = "tfstate"
+    key                  = "core-infrastructure.tfstate"
+    use_azuread_auth     = true
+  }
+}
+\end{lstlisting}
+
+\textbf{Step-by-step trace of Listing 2:} Lines 2--8 pin Terraform $\ge 1.8.0$ and the \texttt{azurerm} provider within minor updates of \texttt{3.100}. Lines 10--16 point state storage to blob \texttt{core-infrastructure.tfstate}. Setting \texttt{use\_azuread\_auth = true} (line 15) authenticates via Entra ID / OIDC tokens (which we build from scratch in Chapter~\ref{chap:infra-security}) rather than static Storage Account access keys.
+
+\section{Three-Way Drift Reconciliation and Lifecycle Guards}
+
+Whenever someone edits a firewall rule manually in the Azure Portal, reality diverges from Git. Terraform reconciles three distinct views during \texttt{terraform plan} (Figure~\ref{fig:v3-ch04-three-way}):
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Desired State ($S_{\text{desired}}$):} Your HCL2 code in Git.
+  \item \textbf{Recorded State ($S_{\text{recorded}}$):} The last snapshot in \texttt{terraform.tfstate}.
+  \item \textbf{Actual Reality ($S_{\text{actual}}$):} Live attributes fetched from ARM APIs during the refresh phase.
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1.2cm and 1.4cm,
+  statebox/.style={circle, draw=headingblue, fill=headingblue!10, minimum size=2.5cm, align=center, font=\sffamily\scriptsize\bfseries},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=headingblue}
+]
+\node[statebox] (des) {Desired State\\(Git HCL2)};
+\node[statebox, right=2.3cm of des] (act) {Actual Reality\\(Live Azure API)};
+\node[statebox, below=1.7cm of $(des)!0.5!(act)$] (rec) {Recorded State\\(\texttt{tfstate} JSON)};
+
+\draw[arrow, thick, color=warningRed] (rec) -- node[left, font=\tiny\sffamily]{Refresh ($\Delta_{\text{drift}}$)} (act);
+\draw[arrow, thick, color=exampleBlue] (des) -- node[above, font=\tiny\sffamily]{Plan Diff ($\Delta_{\text{action}}$)} (act);
+\draw[arrow, dashed] (des) -- (rec);
+\end{tikzpicture}
+\caption{Three-Way State Reconciliation in Terraform}
+\label{fig:v3-ch04-three-way}
+\end{figure}
+
+Comparing $S_{\text{actual}}$ against $S_{\text{recorded}}$ surfaces manual out-of-band drift ($\Delta_{\text{drift}}$), while comparing $S_{\text{desired}}$ against $S_{\text{actual}}$ produces the plan actions ($\Delta_{\text{action}}$): \texttt{+} (create), \texttt{\textasciitilde{}} (update in place via \texttt{PATCH}/\texttt{PUT}), \texttt{-/+} (destroy and recreate because an immutable field like VNet address space changed), or \texttt{-} (destroy).
+
+\subsection{Protecting Critical Resources: \texttt{prevent\_destroy} vs.\ \texttt{precondition}}
+Module authors often confuse \texttt{lifecycle \{ precondition \}} with destruction protection. In Terraform, \texttt{precondition} and \texttt{postcondition} validate assumptions during resource *creation or update*; 	extbf{they do not prevent \texttt{terraform destroy} from deleting a resource}. To block accidental deletion of stateful production databases or subnets, you must set 	extbf{`prevent\_destroy = true`} inside the \texttt{lifecycle} block:
+
+\begin{lstlisting}[language=hcl, caption={Guarding a Production Subnet with \texttt{prevent\_destroy} and \texttt{precondition}}]
+resource "azurerm_subnet" "data_subnet" {
+  name                 = var.subnet_name
+  resource_group_name  = var.resource_group_name
+  virtual_network_name = var.vnet_name
+  address_prefixes     = [var.subnet_cidr]
+
+  lifecycle {
+    prevent_destroy = true
+
+    precondition {
+      condition     = length(var.subnet_name) >= 4
+      error_message = "Subnet name must follow naming convention (>= 4 chars)."
+    }
+  }
+}
+\end{lstlisting}
+
+With \texttt{prevent\_destroy = true} (line 8), any \texttt{terraform plan} or \texttt{terraform destroy} that proposes destroying or replacing (\texttt{-/+}) \texttt{data\_subnet} aborts with an error before issuing a single \texttt{DELETE} API call.
+
+\begin{commonmistakebox}[Pinning Modules to Mutable Branches]
+Writing \texttt{source = "git::https://github.com/org/tf-modules.git?ref=main"} pulls unreviewed breaking changes whenever a teammate runs \texttt{terraform init -upgrade}. Always pin modules to immutable semantic tags such as \texttt{?ref=v2.4.1}.
+\end{commonmistakebox}
+
+\begin{realworldbox}[Diagnosing a Stuck Blob Lease Without Corrupting State]
+\textbf{Symptom:} A CI pipeline fails with:
+\begin{verbatim}
+Error: Error acquiring the state lock
+Lock Info:
+  ID:        9f2a1c44-8b10-4e3a-9211-0e12a9881102
+  Operation: OperationTypeApply
+  Who:       runner-build-101@github-actions
+  Created:   2026-11-24 14:02:11 UTC
+\end{verbatim}
+\textbf{Safe Diagnostic Protocol:}
+\begin{enumerate}[leftmargin=12pt]
+  \item \emph{Never} run \texttt{terraform force-unlock 9f2a1c44-...} blindly! Two concurrent writers bypassing a lock will overwrite \texttt{tfstate} with conflicting JSON or zero-byte truncation, causing the next drift run to destroy live databases.
+  \item Inspect GitHub Actions build \texttt{101} and Azure Storage Activity Logs for \texttt{LeaseBlob} calls. Confirm whether \texttt{runner-build-101} is still alive and writing to ARM.
+  \item Only after verifying that build \texttt{101} crashed hard (for example, runner VM preempted) and zero ARM mutations remain in flight, run \texttt{terraform force-unlock 9f2a1c44-8b10-4e3a-9211-0e12a9881102} and immediately inspect \texttt{terraform plan} for partial resources before resuming.
+\end{enumerate}
+\end{realworldbox}
+
+\begin{tryityourselfbox}[Hand-Tracing Kahn's Algorithm and Spotting a Cycle]
+Examine this 5-resource dependency list:
+\begin{itemize}[leftmargin=12pt]
+  \item \texttt{RG} depends on nothing.
+  \item \texttt{VNet} depends on \texttt{RG}.
+  \item \texttt{SubnetA} and \texttt{SubnetB} each depend on \texttt{VNet}.
+  \item \texttt{Gateway} depends on \texttt{SubnetA} and \texttt{SubnetB}.
+\end{itemize}
+(1) Write out the initial in-degree of all 5 nodes and trace the exact parallel execution waves using Kahn's algorithm. (2) Now suppose someone adds \texttt{depends\_on = [Gateway]} onto \texttt{VNet}: trace why Kahn's algorithm halts early and state which nodes remain unvisited.
+\end{tryityourselfbox}
+
+\begin{labbridgebox}[DAG Resolution and Modular Terraform in Python \& HCL]
+Run and inspect both accompanying labs:
+\begin{itemize}[leftmargin=12pt]
+  \item \texttt{exercises/volume3/ex02\_terraform\_dag\_resolver.py} --- implements \texttt{TerraformDagPlanner.plan\_execution\_waves()} using Kahn's algorithm with cycle detection on a 6-resource Azure topology.
+  \item \texttt{projects/p09-terraform-infrastructure/} --- modular root (\texttt{main.tf}, \texttt{providers.tf}), \texttt{modules/networking/}, \texttt{modules/security/}, \texttt{modules/compute/}, and automated HCL syntax validation in \texttt{tests/test\_terraform\_syntax.py}.
+\end{itemize}
+\end{labbridgebox}
+
+\section{Chapter Summary \protect\& Key Takeaways}
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{HCL2:} Declarative blocks (\texttt{resource}, \texttt{data}, \texttt{variable}) with \texttt{dynamic}/\texttt{for\_each} and pre-API \texttt{validation}.
+  \item \textbf{DAG Execution:} Tarjan checks for cycles; Kahn's algorithm groups zero-in-degree nodes into parallel waves up to \texttt{-parallelism=N}.
+  \item \textbf{Remote State \& Locking:} \texttt{tfstate} holds secrets in plaintext and must live in encrypted remote storage locked via Azure Blob leases (HTTP 412 on conflict).
+  \item \textbf{Three-Way Drift \& Guards:} \texttt{plan} reconciles $S_{\text{desired}}$, $S_{\text{recorded}}$, and $S_{\text{actual}}$. Use \texttt{lifecycle \{ prevent\_destroy = true \}} (not \texttt{precondition}) to block accidental deletion.
+\end{itemize}
+
+\section{Exercises}
+
+\subsection{Mechanics}
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Exercise~\thechapter.1:} Four Terraform resources have edges $R_1 \to R_3$, $R_3 \to R_4$, and $R_2 \to R_4$. Trace Kahn's algorithm step-by-step (in-degrees and waves) and state the maximum concurrency at Wave 0.
+  \item \textbf{Exercise~\thechapter.2:} Explain the exact ARM REST API difference between a \texttt{terraform plan} line marked \texttt{\textasciitilde{} update in-place} versus \texttt{-/+ destroy and then create replacement}.
+\end{enumerate}
+
+\subsection{Debugging}
+\begin{enumerate}[leftmargin=18pt]
+  \setcounter{enumi}{2}
+  \item \textbf{Exercise~\thechapter.3:} A pipeline fails with \texttt{Error: Cycle: azurerm\_subnet.app, azurerm\_route\_table.rt, azurerm\_subnet\_route\_table\_association.assoc}. Explain how mutual attribute references (or \texttt{depends\_on}) between a Subnet, Route Table, and Association create a cycle, and show the clean DAG refactoring.
+\end{enumerate}
+
+\subsection{Architecture}
+\begin{enumerate}[leftmargin=18pt]
+  \setcounter{enumi}{3}
+  \item \textbf{Exercise~\thechapter.4:} Design a multi-environment (\texttt{dev}, \texttt{staging}, \texttt{prod}) Terraform repository layout separating blast radius across Azure Subscriptions, isolating remote state blobs, pinning reusable modules, and authenticating CI runners without static passwords.
+\end{enumerate}
+
+\section{Detailed Solutions}
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Solution~\thechapter.1 (Mechanics):}\\
+  Initial in-degrees: $R_1:0,\; R_2:0,\; R_3:1,\; R_4:2$.
+  \begin{itemize}[leftmargin=12pt]
+    \item \textbf{Wave 0:} Queue has $[R_1, R_2]$ (maximum concurrency = \textbf{2}). Completing $R_1$ drops $R_3$ to $0$; completing $R_2$ drops $R_4$ to $1$.
+    \item \textbf{Wave 1:} Queue has $[R_3]$. Completing $R_3$ drops $R_4$ to $0$.
+    \item \textbf{Wave 2:} Queue has $[R_4]$. All 4 resources processed.
+  \end{itemize}
+
+  \item \textbf{Solution~\thechapter.2 (Mechanics):}\\
+  \textbf{In-place (\texttt{\textasciitilde{}}):} The cloud API supports mutating the attribute via \texttt{PATCH}/\texttt{PUT} while keeping the existing physical resource ID alive (e.g., adding a tag or NSG rule), causing zero downtime.\\
+  \textbf{Replacement (\texttt{-/+}):} The changed attribute is immutable in ARM (e.g., subnet address prefix or VM OS disk image). Terraform must issue \texttt{DELETE} then \texttt{POST}/\texttt{PUT} to build a new resource, causing downtime unless paired with \texttt{create\_before\_destroy}.
+
+  \item \textbf{Solution~\thechapter.3 (Debugging):}\\
+  A cycle arises when blocks form a closed loop—for example, \texttt{azurerm\_route\_table.rt} references an attribute (or \texttt{depends\_on}) of \texttt{azurerm\_subnet.app}, while \texttt{azurerm\_subnet.app} has a \texttt{depends\_on} (or local expression) referencing \texttt{azurerm\_subnet\_route\_table\_association.assoc}, which itself references both \texttt{rt.id} and \texttt{app.id}.\\
+  \textbf{Refactoring:} Remove cross-references between \texttt{azurerm\_subnet.app} and \texttt{azurerm\_route\_table.rt} so both build independently in Wave 0/1, and let only the standalone association block reference their IDs:
+  \begin{lstlisting}[language=hcl]
+  resource "azurerm_subnet_route_table_association" "assoc" {
+    subnet_id      = azurerm_subnet.app.id
+    route_table_id = azurerm_route_table.rt.id
+  }
+  \end{lstlisting}
+  This converts the loop into a clean DAG: $\text{Subnet} \to \text{Assoc} \leftarrow \text{Route Table}$.
+
+  \item \textbf{Solution~\thechapter.4 (Architecture):}\\
+  Use separate root directories (\texttt{environments/dev/}, \texttt{environments/staging/}, \texttt{environments/prod/}) rather than shared workspaces. Each environment configures its own \texttt{backend "azurerm"} pointing to an isolated blob in a dedicated Subscription, bounding blast radius. Reusable logic lives in \texttt{modules/} (or a separate repo) pinned by immutable Git tags (\texttt{?ref=v1.2.0}). CI runners authenticate via OIDC Workload Identity Federation (\texttt{use\_azuread\_auth = true}), eliminating static credentials (detailed in Chapter~\ref{chap:infra-security}).
+
+  \item \textbf{Try-It-Yourself Verification:}\\
+  (1) Initial in-degrees: \texttt{RG:0, VNet:1, SubnetA:1, SubnetB:1, Gateway:2}. Wave 0: \texttt{[RG]}; Wave 1: \texttt{[VNet]}; Wave 2: \texttt{[SubnetA, SubnetB]} (parallel!); Wave 3: \texttt{[Gateway]}.\\
+  (2) Adding \texttt{Gateway -> VNet} sets \texttt{VNet}'s initial in-degree to $2$ (\texttt{RG} and \texttt{Gateway}). After Wave 0 (\texttt{RG}), \texttt{VNet}'s in-degree drops to $1$, leaving the ready queue \emph{empty}. Four nodes (\texttt{VNet, SubnetA, SubnetB, Gateway}) remain unvisited ($1 < 5$), proving a cycle!
+\end{enumerate}
+
+\section{Further Reading \protect\& Citations}
+\begin{itemize}[leftmargin=15pt]
+  \item Brikman, Y. \emph{Terraform: Up \& Running}. 3rd ed., O'Reilly Media, 2022.
+  \item Tarjan, R. \emph{Depth-First Search and Linear Graph Algorithms}. SIAM Journal on Computing, 1972.
+  \item HashiCorp. \emph{Terraform Lifecycle Meta-Arguments and State Locking}, \texttt{developer.hashicorp.com/terraform}.
+\end{itemize}

@@ -1,27 +1,69 @@
 \documentclass[11pt,oneside]{book}
 \input{../common/preamble.tex}
 
-\title{\Huge\sffamily\bfseries Distributed Systems Engineering\\[12pt]
-\Large\sffamily Architectures, Consensus, Messaging, and Resilient Storage}
-\author{\sffamily Modern Engineering Curriculum --- Volume IV}
-\date{\sffamily 2026 Edition}
-
 \begin{document}
 \frontmatter
-\maketitle
+\pagestyle{empty}
 
+\begin{center}
+  \vspace*{2.0cm}
+  {\Huge\sffamily\bfseries\color{headingblue} Distributed Systems Engineering}\\[12pt]
+  {\LARGE\sffamily\color{gray} Volume IV: Architectures, Consensus, Messaging, and Resilient Storage}\\[28pt]
+  \hrule height 1.2pt
+  \vspace*{25pt}
+  {\normalsize\sffamily Modern Engineering Curriculum --- 2026 Edition}
+\end{center}
+
+\vspace{2.2cm}
+
+\begin{tcolorbox}[
+  enhanced,
+  colback=white,
+  colframe=gray!30!white,
+  boxrule=0.8pt,
+  arc=2pt,
+  left=15pt,right=15pt,top=12pt,bottom=12pt
+]
+\sffamily\small
+\textbf{About Volume IV (Distributed Systems Engineering):}
+Moving an application from a single server to multiple machines changes every rule you take for granted. Memory is no longer shared, clocks disagree, packets vanish, and one slow dependency can bring down an entire fleet. This volume teaches distributed systems from first principles: starting from the physics of fiber-optic cables and operating system sockets, building up through logical clocks, consensus, atomic transactions, event streaming, caching, locking, sagas, and fault-tolerance mathematics.
+
+\vspace{8pt}
+\textbf{Who This Volume Is For:}
+Software engineers who have built or shipped web services and want to move beyond treating Kafka, Redis, PostgreSQL replication, and Kubernetes clusters as mysterious black boxes. No prior knowledge of distributed consensus theory, operating system kernel internals, or database recovery logs is assumed---each chapter introduces the underlying OS, networking, and storage mechanics before diving into production internals.
+
+\vspace{8pt}
+\textbf{Mastery Objectives across Nine Chapters:}
+\begin{itemize}[leftmargin=15pt,itemsep=3pt]
+  \item \textbf{Fundamentals of Time \& Failure (Ch.~1):} Reason about optical-fiber latency floors, TCP/TLS round trips, NTP clock drift, Google TrueTime, Lamport clocks, Vector Clocks, and the FLP impossibility theorem.
+  \item \textbf{CAP, PACELC \& Consensus (Ch.~2):} Navigate quorum math ($R+W>N$), consistency guarantees from Eventual to Strict Serializability, and Raft leader election, log repair, snapshots, and joint consensus.
+  \item \textbf{Distributed Transactions (Ch.~3):} Bridge single-node 2PL and Write-Ahead Logging to Two-Phase Commit (2PC), Three-Phase Commit (3PC), XA prepared transactions, and Wound-Wait deadlock prevention.
+  \item \textbf{Messaging & Delivery Semantics (Ch.~4):} Design idempotent consumers, bounded prefetch backpressure, Dead Letter Queues, and tombstone compaction around the impossibility of physical exactly-once delivery.
+  \item \textbf{Kafka & RabbitMQ Internals (Ch.~5):} Understand Linux page cache and \texttt{sendfile(2)} zero-copy I/O, ISR/KRaft replication, producer batching, consumer rebalancing, AMQP exchanges, and Erlang BEAM quorum queues.
+  \item \textbf{Redis & Caching Topologies (Ch.~6):} Trace Redis's single-threaded event loop, SDS/dict/skiplist/\texttt{listpack} structures, XFetch stampede defense, Bloom filters, Lua atomicity, and 16,384-slot clustering.
+  \item \textbf{Distributed Locking (Ch.~7):} Build TTL leases and heartbeat renewals while understanding why GC pauses break naive locks (Redlock critique) and how storage-side fencing tokens restore safety.
+  \item \textbf{Sagas, CQRS & Event Sourcing (Ch.~8):} Eliminate dual-write bugs using the Transactional Outbox and logical WAL CDC (Debezium), orchestrate compensating sagas, and project immutable event streams safely.
+  \item \textbf{Reliability & Fault Tolerance (Ch.~9):} Prevent cascading failures with $\varphi$-Accrual failure detectors, Full-Jitter backoff, Circuit Breakers, Bulkheads, Little's Law concurrency limits, and Chaos Engineering.
+\end{itemize}
+\end{tcolorbox}
+
+\newpage
+\pagestyle{fancy}
 \tableofcontents
+\newpage
 
 \mainmatter
 
-\include{ch01-distributed-fundamentals}
-\include{ch02-cap-consistency}
-\include{ch03-transactions-concurrency}
-\include{ch04-messaging-systems}
-\include{ch05-kafka-rabbitmq}
-\include{ch06-redis-caching}
-\include{ch07-distributed-locking}
-\include{ch08-sagas-cqrs-eventsourcing}
-\include{ch09-reliability-fault-tolerance}
+\input{ch01-distributed-fundamentals.tex}
+\input{ch02-cap-consistency.tex}
+\input{ch03-transactions-concurrency.tex}
+\input{ch04-messaging-systems.tex}
+\input{ch05-kafka-rabbitmq.tex}
+\input{ch06-redis-caching.tex}
+\input{ch07-distributed-locking.tex}
+\input{ch08-sagas-cqrs-eventsourcing.tex}
+\input{ch09-reliability-fault-tolerance.tex}
+
+\backmatter
 
 \end{document}

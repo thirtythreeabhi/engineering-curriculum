@@ -4,29 +4,29 @@
 \begin{chaptergoalsbox}
 \textbf{What you will learn:}
 \begin{itemize}[leftmargin=12pt]
-  \item Core messaging patterns: Point-to-Point queues vs. Publish-Subscribe (Pub/Sub) event streams.
-  \item Delivery semantics: At-most-once, At-least-once, and Exactly-once processing (deduplication windows and idempotent consumers).
-  \item Competing consumers, backpressure, prefetch buffers, and flow control.
-  \item Poison messages, retry topologies, and Dead Letter Queues (DLQs).
-  \item Idempotency keys, out-of-order message handling, and tombstone markers.
+  \item Structural trade-offs between traditional Message Queues (RabbitMQ, SQS) and persistent Event Streams (Kafka, Pulsar).
+  \item Why physical exactly-once delivery is impossible (the Two Generals' Problem), and how At-Least-Once + Idempotent Consumers achieve Effectively-Once processing.
+  \item Consumer backpressure, AMQP prefetch windows (\texttt{basicQos}), and avoiding memory alarms.
+  \item Poison messages, bounded retry queues, exponential backoff, and Dead Letter Queues (DLQs).
+  \item Representing deletions in immutable logs via Tombstone Markers and log compaction.
 \end{itemize}
 
 \textbf{What you should already understand:}
 \begin{itemize}[leftmargin=12pt]
-  \item TCP sockets, HTTP REST interfaces, and asynchronous job queues.
-  \item Relational transaction concepts and data persistence from Volume I.
+  \item Network unreliability from Chapter~\ref{ch:distributed-fundamentals} and local database ACID transactions from Chapter~\ref{ch:transactions-concurrency}.
+  \item Basic SQL \texttt{INSERT} and \texttt{UNIQUE} primary-key constraints.
 \end{itemize}
 
 \textbf{Why this topic exists:}
-Synchronous HTTP/gRPC RPC calls introduce tight temporal and spatial coupling: if the downstream service is down or experiencing high latency, the upstream caller blocks, saturating connection pools and cascading into catastrophic cluster-wide failure. Asynchronous messaging decouples producers and consumers in both time and space.
+When Service~A calls Service~B over synchronous HTTP, Service~B's slowdown immediately blocks Service~A's worker threads and cascades across the platform. Asynchronous messaging decouples services in time and capacity---but introduces duplicate deliveries, poison payloads, and consumer lag that destroy naive pipelines.
 
 \textbf{Motivating practical problem:}
-A payment processing pipeline uses an asynchronous queue to charge customer credit cards. During a transient database timeout, the queue re-delivers 10,000 unacknowledged messages. Because the consumer lacks idempotency guards, 4,200 customers are charged double, causing massive credit card dispute chargeback fees and merchant account suspension.
+An automated invoicing service reads charge jobs from a queue. During a 15-second database failover, 8,000 jobs time out before sending acknowledgments, so the broker redelivers all 8,000 messages. Because the worker inserts a new ledger row without checking an idempotency key, 3,400 customers are billed twice.
 \end{chaptergoalsbox}
 
 \section{Queues vs. Streams: Structural Trade-Offs}
 
-Distributed message passing architectures generally fall into two distinct paradigms: message queues and event streams.
+Asynchronous messaging systems follow two distinct storage and delivery models: \textbf{destructive message queues} and \textbf{immutable event streams}.
 
 \begin{figure}[htbp]
 \centering
@@ -35,7 +35,6 @@ Distributed message passing architectures generally fall into two distinct parad
   box/.style={rectangle, draw=headingblue, fill=codebg, thick, rounded corners=2pt, minimum width=2.4cm, minimum height=1.0cm, align=center, font=\sffamily\footnotesize},
   elem/.style={rectangle, draw=exampleBlue, fill=exampleBg, thick, minimum width=0.8cm, minimum height=0.6cm, font=\sffamily\tiny}
 ]
-  % Queue diagram
   \node[anchor=west, font=\sffamily\bfseries\small, color=headingblue] at (-0.5, 2.2) {Message Queue (Destructive Consumer Ack)};
   \node[box] (p1) at (0, 1.2) {Producer};
   \node[elem] (m1) at (2.2, 1.2) {$M_4$};
@@ -46,7 +45,6 @@ Distributed message passing architectures generally fall into two distinct parad
   \draw[-{Stealth[scale=1.0]}, thick] (m3) -- (c1);
   \node[anchor=north, font=\sffamily\tiny, color=warningRed] at (4.2, 0.7) {Deleted on ACK};
 
-  % Log diagram
   \node[anchor=west, font=\sffamily\bfseries\small, color=headingblue] at (-0.5, -0.6) {Event Stream / Commit Log (Non-Destructive Offset Tracking)};
   \node[box] (p2) at (0, -1.6) {Producer};
   \node[elem] (e0) at (2.0, -1.6) {$0$};
@@ -55,15 +53,15 @@ Distributed message passing architectures generally fall into two distinct parad
   \node[elem] (e3) at (4.4, -1.6) {$3$};
   \node[elem] (e4) at (5.2, -1.6) {$4$};
 
-  \node[box, fill=intuitionBg] (c_a) at (7.8, -1.0) {Consumer A (Off: 4)};
-  \node[box, fill=tryBg] (c_b) at (7.8, -2.2) {Consumer B (Off: 2)};
+  \node[box, fill=intuitionBg] (c_a) at (8.0, -1.0) {Consumer A (Off: 4)};
+  \node[box, fill=tryBg] (c_b) at (8.0, -2.2) {Consumer B (Off: 2)};
 
   \draw[-{Stealth[scale=1.0]}, thick] (p2) -- (e0);
   \draw[-{Stealth[scale=1.0]}, thick, color=intuitionTeal] (e4) -- (c_a);
   \draw[-{Stealth[scale=1.0]}, thick, color=tryViolet] (e2) -- (c_b);
 \end{tikzpicture}
 \caption{Comparison of Traditional Message Queues vs. Persistent Log Streams}
-\label{fig:queue-vs-stream}
+\label{fig:v4-ch04-queue-vs-stream}
 \end{figure}
 
 \begin{table}[htbp]
@@ -72,43 +70,33 @@ Distributed message passing architectures generally fall into two distinct parad
 \toprule
 \textbf{Dimension} & \textbf{Traditional Message Queue (RabbitMQ, SQS)} & \textbf{Event Stream / Append Log (Kafka, Pulsar)} \\
 \midrule
-\textbf{State Retention} & Transient. Messages are deleted immediately upon successful consumer acknowledgment. & Persistent. Immutable append-only log retained by time (retention hours) or size. \\
-\textbf{Consumer Scalability} & Competing consumers pull from a single shared queue; work is distributed dynamically. & Partition-bound. Maximum parallel consumers in a group equals the number of partitions. \\
-\textbf{Replayability} & Impossible. Once acknowledged, the message ceases to exist. & Native. Any consumer can reset its offset backwards to replay historical days of data. \\
-\textbf{Ordering} & Total FIFO across a single queue, but broken when competing consumers fail and requeue. & Strict per-partition ordering guaranteed indefinitely. \\
+\textbf{State Retention} & Transient. Messages are removed as soon as a consumer acknowledges (\texttt{ACK}) completion. & Persistent. Immutable append-only log retained by time (e.g., 7 days) or byte limit. \\
+\textbf{Consumer Scaling} & Competing workers pull tasks dynamically from one shared queue. & Partition-bound. Maximum parallel consumers in a group equals the partition count. \\
+\textbf{Replayability} & Impossible once acknowledged. & Native. Consumers can rewind their offset pointer and replay history. \\
+\textbf{Ordering} & FIFO on a single queue, but disrupted if a worker fails and re-queues a message behind others. & Strict per-partition offset order preserved indefinitely. \\
 \bottomrule
 \end{tabular}
 \caption{Architectural Comparison: Queues vs. Streams}
-\label{tab:queue-vs-stream}
+\label{tab:v4-ch04-queue-vs-stream}
 \end{table}
 
-\section{Message Delivery Semantics}
+\section{The Two Generals' Problem and Delivery Semantics}
 
-In an ideal theoretical world, systems would deliver every message exactly once, with zero loss, zero duplication, and zero delay. Across real physical networks, packet losses and timeout retransmissions create distinct delivery semantics:
+Suppose two allied armies stand on opposite ridges overlooking a valley occupied by an enemy garrison. General~A and General~B must attack at the exact same hour to win; if either attacks alone, they are destroyed. Their only way to communicate is sending runners across the valley---and any runner might be captured.
 
-\subsection{At-Most-Once Delivery}
+\begin{intuitionbox}[Why Common Knowledge Cannot Cross an Unreliable Channel]
+General~A sends a runner: \emph{``Attack at dawn.''} Can A attack now? No---the runner may have been captured. So B sends a runner back: \emph{``Received, attacking at dawn.''} Can B attack now? No---what if B's acknowledgment runner was captured and A calls off the attack? So A must acknowledge the acknowledgment, ad infinitum. Because \emph{any} final message could be dropped on the wire, no finite exchange of acknowledgments can ever prove to both sides that the other side knows the message arrived!
+\end{intuitionbox}
+
+This exact impossibility governs every networked message broker, yielding three real-world delivery semantics:
 \begin{itemize}[leftmargin=18pt]
-  \item \textbf{Mechanics}: The consumer receives the message, advances its offset or sends an acknowledgment to the broker \textbf{before} processing the message.
-  \item \textbf{Failure Mode}: If the consumer crashes during processing, the broker believes the message was handled and never resends it. The message is permanently lost.
-  \item \textbf{Use Case}: High-frequency metrics, sensor telemetry where occasional drops are preferable to blocking backpressure.
+  \item \textbf{At-Most-Once}: The consumer acknowledges (or commits its offset) \emph{before} processing. If the worker crashes mid-work, the message is never redelivered and is permanently lost. Acceptable for high-rate metrics where missing 0.1\% of samples is harmless.
+  \item \textbf{At-Least-Once}: The consumer finishes processing and persists results \emph{before} sending the \texttt{ACK}. If the worker crashes after saving to the database---or if the \texttt{ACK} packet is lost---the broker redelivers the message. Every critical business workflow relies on at-least-once delivery.
+  \item \textbf{Effectively-Once (Idempotent Processing)}: Because physical exactly-once delivery across a network is impossible, brokers and applications fake it cleanly via:
+  \begin{equation}
+  \text{At-Least-Once Delivery} + \text{Idempotent Consumer (Deduplication)} = \text{Effectively-Once Side Effects}
+  \end{equation}
 \end{itemize}
-
-\subsection{At-Least-Once Delivery}
-\begin{itemize}[leftmargin=18pt]
-  \item \textbf{Mechanics}: The consumer receives the message, fully completes processing and persistence, and \textbf{then} sends an acknowledgment to the broker.
-  \item \textbf{Failure Mode}: If the consumer crashes or network packets drop during the ACK transmission, the broker assumes the consumer died and re-delivers the message to another consumer. The message is processed more than once.
-  \item \textbf{Production Reality}: This is the standard delivery mode of modern enterprise systems.
-\end{itemize}
-
-\subsection{The Myth and Reality of ``Exactly-Once''}
-
-\begin{productionwarningbox}[The Network Impossibility of Physical Exactly-Once Delivery]
-Physically delivering a message over an unreliable network exactly once is equivalent to solving the Two Generals' Problem, which is proven impossible. When brokers claim ``exactly-once semantics'' (EOS, such as Kafka's transactional API), they mean \textbf{effectively-once processing}:
-\begin{equation}
-\text{At-Least-Once Delivery} + \text{Idempotent Consumer / Deduplication} = \text{Effectively-Once Execution}
-\end{equation}
-If your downstream consumer executes a non-idempotent side effect (such as sending an SMS, dispatching an email, or calling a third-party non-transactional REST API), duplicates \textbf{will} trigger multiple side effects unless guarded by an application-level idempotency key.
-\end{productionwarningbox}
 
 \begin{figure}[htbp]
 \centering
@@ -122,63 +110,81 @@ If your downstream consumer executes a non-idempotent side effect (such as sendi
   \node[db] (db) at (10, 0) {PostgreSQL};
 
   \draw[-{Stealth[scale=1.0]}, thick] (broker) -- node[above, font=\sffamily\tiny] {1. Deliver(Msg, ID=X)} (consumer);
-  \draw[-{Stealth[scale=1.0]}, thick, color=exampleBlue] (consumer) -- node[above, font=\sffamily\tiny] {2. Atomic Tx (Data + ID=X)} (db);
+  \draw[-{Stealth[scale=1.0]}, thick, color=exampleBlue] (consumer) -- node[above, font=\sffamily\tiny] {2. Atomic Tx (Order + ID=X)} (db);
   \draw[-{Stealth[scale=1.0]}, thick, dashed, color=warningRed] (consumer) -- node[below, font=\sffamily\tiny] {3. ACK Dropped / Crash} (broker);
-  \draw[-{Stealth[scale=1.0]}, thick, color=warningRed] (broker) to [bend left=40] node[above, font=\sffamily\tiny] {4. Re-deliver(Msg, ID=X)} (consumer);
-  \draw[-{Stealth[scale=1.0]}, thick, color=exampleBlue] (consumer) to [bend right=40] node[below, font=\sffamily\tiny] {5. INSERT fails (Unique ID=X) $\to$ ACK} (db);
+  \draw[-{Stealth[scale=1.0]}, thick, color=warningRed] (broker) to [bend left=40] node[above, font=\sffamily\tiny] {4. Redeliver(Msg, ID=X)} (consumer);
+  \draw[-{Stealth[scale=1.0]}, thick, color=exampleBlue] (consumer) to [bend right=40] node[below, font=\sffamily\tiny] {5. Unique Violation on X $\to$ ACK} (db);
 \end{tikzpicture}
 \caption{Idempotent Consumer Deduplication via Database Unique Constraints}
-\label{fig:idempotent-consumer}
+\label{fig:v4-ch04-idempotent-consumer}
 \end{figure}
 
-\begin{lstlisting}[language=Python, caption={Idempotent Consumer Implementation with Unique Key Deduplication}]
-import psycopg2
+\begin{lstlisting}[language=Python, caption={Idempotent Consumer Implementation with Atomic Deduplication}]
 from psycopg2 import IntegrityError
 
-def process_order_message(conn, message: dict):
+def process_order_message(conn, message: dict) -> str:
     """
-    Guarantees exactly-once side-effect execution via atomic relational transaction.
+    Guarantees effectively-once side effects using one atomic DB transaction.
     """
     message_id = message["id"]
     order_data = message["payload"]
 
     with conn.cursor() as cur:
         try:
-            # 1. Attempt to insert message_id into processed_messages table
+            # Step 1: Claim message_id in deduplication table (PRIMARY KEY)
             cur.execute(
-                "INSERT INTO processed_messages (message_id, processed_at) VALUES (%s, NOW());",
-                (message_id,)
+                "INSERT INTO processed_messages (message_id) VALUES (%s);",
+                (message_id,),
             )
 
-            # 2. Execute business logic within the same transaction
+            # Step 2: Apply business mutation inside the exact same transaction
             cur.execute(
                 """
                 INSERT INTO orders (order_id, customer_id, total_amount, status)
                 VALUES (%s, %s, %s, %s);
                 """,
-                (order_data["order_id"], order_data["customer_id"], order_data["amount"], "CONFIRMED")
+                (
+                    order_data["order_id"],
+                    order_data["customer_id"],
+                    order_data["amount"],
+                    "CONFIRMED",
+                ),
             )
 
             conn.commit()
-            print(f"Successfully processed message {message_id}")
+            return "PROCESSED"
 
         except IntegrityError:
-            # Duplicate message detected! Unique constraint on message_id violated.
+            # message_id already exists -> duplicate redelivery
             conn.rollback()
-            print(f"Message {message_id} already processed. Safely ignoring and ACKing.")
+            return "DUPLICATE_ACKED"
 \end{lstlisting}
+
+\textbf{Step-by-step trace through a mid-transaction crash and redelivery:}
+Suppose \texttt{message = \{"id": "msg\_77", "payload": \{"order\_id": "ord\_9", "customer\_id": "c\_4", "amount": 49.50\}\}}.
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Scenario A (Crash before \texttt{conn.commit()})}: Worker~1 executes both \texttt{INSERT} statements, then suffers a power loss before line~27 (\texttt{conn.commit()}). PostgreSQL automatically rolls back the uncommitted transaction; neither \texttt{processed\_messages} nor \texttt{orders} contains \texttt{msg\_77}/\texttt{ord\_9}. When the broker redelivers \texttt{msg\_77} to Worker~2, both inserts succeed cleanly and commit.
+  \item \textbf{Scenario B (Crash right after \texttt{conn.commit()}, before broker \texttt{ACK})}: Worker~1 commits both rows atomically, then dies before sending \texttt{ACK} to RabbitMQ/Kafka. The broker redelivers \texttt{msg\_77} to Worker~2. Worker~2 hits \texttt{IntegrityError} on line~11 (\texttt{processed\_messages} primary key violation), rolls back cleanly, returns \texttt{"DUPLICATE\_ACKED"}, and acknowledges the broker without inserting a second order.
+\end{enumerate}
+
+\begin{commonmistakebox}[PostgreSQL \texttt{ON CONFLICT DO UPDATE} Lock and Dead-Tuple Costs]
+When using SQL upserts for idempotency (\texttt{INSERT ... ON CONFLICT (idempotency\_key) DO UPDATE SET status = table.status RETURNING *}), even a no-op update acquires an exclusive row lock and writes a new MVCC row version, leaving behind a \textbf{dead tuple} that PostgreSQL's \texttt{VACUUM} must clean up later. Under heavy duplicate bursts, prefer \texttt{ON CONFLICT DO NOTHING} followed by a plain \texttt{SELECT} if you need the existing row, avoiding unnecessary write amplification and lock contention.
+\end{commonmistakebox}
+
+\section{Backpressure, Prefetch Buffers, and Flow Control}
+
+A fast producer can easily publish 50,000 messages per second while downstream workers (making database or HTTP calls) only finish 1,000 per second. Without \textbf{backpressure}---a mechanism for slow consumers to signal the broker to pause pushing new work---queues overflow RAM and crash brokers.
+
+In push-based brokers like RabbitMQ (AMQP 0-9-1), the broker maintains a \textbf{prefetch buffer} of unacknowledged messages pushed over TCP to each consumer. You control its size with \texttt{channel.basicQos(prefetchCount)}:
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Unbounded Prefetch (\texttt{basicQos(0)})}: The default in many client libraries! Zero means ``unlimited.'' RabbitMQ aggressively pushes \emph{every} message in the queue over the network into the consumer's local memory buffer as fast as TCP permits. Meanwhile, the broker must track delivery metadata in RAM for every unacknowledged message until the worker catches up, frequently exhausting broker memory and triggering a cluster-wide \textbf{Memory High Watermark} block.
+  \item \textbf{Bounded Prefetch (\texttt{basicQos(50)})}: RabbitMQ delivers at most 50 unacknowledged messages per consumer channel. Until the worker sends an \texttt{ACK} for a finished message, the broker withholds the 51st message, leaving excess backlog safely spooled on disk at the broker and distributing work fairly across all workers.
+\end{itemize}
+In pull-based brokers like Kafka, backpressure is automatic: consumers call \texttt{poll()} only when ready and bound batch sizes via \texttt{max.poll.records}.
 
 \section{Poison Messages and Dead Letter Queues (DLQ)}
 
-A \textbf{poison message} is a malformed or corrupted payload that causes a consumer to throw an unhandled exception every time it is read (e.g., invalid JSON syntax, null pointer, schema mismatch, or arithmetic overflow).
-
-If a message broker automatically re-queues unacknowledged messages immediately upon consumer failure:
-\begin{enumerate}[leftmargin=18pt]
-  \item Consumer reads message $M$, crashes, and rejects $M$.
-  \item Broker places $M$ back at the head of the queue.
-  \item The same consumer (or a peer) immediately reads $M$ again and crashes.
-  \item \textbf{Catastrophic Loop}: All consumers in the cluster enter an infinite crash loop, throughput drops to zero, and the CPU spikes to 100\% processing the same poison payload.
-\end{enumerate}
+A \textbf{poison message} is a payload that triggers an unhandled exception every time any consumer reads it (malformed JSON, unexpected \texttt{null}, or schema mismatch). If a broker immediately re-queues unacknowledged failures to the front of the queue, workers enter an infinite crash loop, burning 100\% CPU while zero healthy messages move.
 
 \begin{figure}[htbp]
 \centering
@@ -199,47 +205,69 @@ If a message broker automatically re-queues unacknowledged messages immediately 
   \draw[-{Stealth[scale=1.0]}, thick, color=warningRed] (consumer) -- node[above, font=\sffamily\tiny] {Attempt $\ge 3$ Exceeded} (dlq);
 \end{tikzpicture}
 \caption{Production Retry Pipeline with Dead Letter Queue (DLQ) Offloading}
-\label{fig:dlq-pipeline}
+\label{fig:v4-ch04-dlq-pipeline}
 \end{figure}
 
-\begin{underthehoodbox}[Production Dead Letter Queue Invariants]
-A robust messaging topology must adhere to three non-negotiable rules:
-\begin{itemize}[leftmargin=12pt]
-  \item \textbf{Bounded Retries}: Never retry infinitely. Set a hard cap (e.g., 3 to 5 attempts) tracked via an injected message header (\texttt{x-retry-count}).
-  \item \textbf{Exponential Backoff with Jitter}: Never re-queue immediately. Route transient failures to delayed retry exchanges or dead-letter topics with exponential delays (e.g., $1\text{s}, 10\text{s}, 60\text{s}$) to give upstream services recovery windows.
-  \item \textbf{DLQ Diagnostics \& Alerting}: When a message exhausts retries and enters the DLQ, preserve the original payload, the full stack trace, the offending worker host, and trigger a PagerDuty alert.
-\end{itemize}
-\end{underthehoodbox}
+Production topologies enforce three invariants:
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Bounded Retries}: Track attempts via a message header (\texttt{x-retry-count}) and cap retries (e.g., 3--5).
+  \item \textbf{Delayed Retry Queues}: Route transient failures through TTL retry queues ($1\text{ s}, 10\text{ s}, 60\text{ s}$) instead of spinning immediately.
+  \item \textbf{DLQ Inspection}: Route exhausted messages to a Dead Letter Queue with the original payload, exception stack trace, and alert telemetry so engineers can fix the bug and replay safely.
+\end{enumerate}
 
-\section{Summary \& Key Takeaways}
+\section{Tombstone Markers in Immutable Event Streams}
+
+Because an append-only log (like Kafka) cannot go back and overwrite or erase an old record in place, how do you delete a user's profile or comply with a GDPR erasure request?
+
+You append a \textbf{Tombstone Marker}: a record with the entity's key (\texttt{key = "user:42"}) and a \textbf{null payload} (\texttt{value = None}).
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Consumer Interpretation}: Downstream projection consumers seeing \texttt{value is None} for \texttt{"user:42"} execute \texttt{DELETE FROM user\_views WHERE user\_id = 'user:42'}.
+  \item \textbf{Log Compaction}: When Kafka runs log compaction on a compacted topic, it retains only the latest record per key. It deletes all older values for \texttt{"user:42"}, keeps the tombstone marker around for a configurable grace window (\texttt{delete.retention.ms}, default 24 hours) so lagging consumers still see the deletion, and finally removes the tombstone itself to reclaim disk space.
+\end{enumerate}
+
+\begin{realworldbox}[Diagnosing a RabbitMQ Memory Alarm Caused by \texttt{basicQos(0)}]
+\textbf{Symptom:} Publishers time out trying to send order events, and the RabbitMQ dashboard shows a red \texttt{Memory Alarm} banner across broker nodes.\\
+\textbf{Diagnostic CLI Output:}
+\begin{verbatim}
+$ rabbitmqctl list_queues name messages_ready messages_unacknowledged consumers
+orders.process   1200   498800   10
+\end{verbatim}
+\textbf{Diagnosis \& Fix:} Notice \texttt{messages\_ready} is tiny (1,200) while \texttt{messages\_unacknowledged} is 498,800 across only 10 consumers! That proves the consumers connected with \texttt{basicQos(0)} (unlimited prefetch), causing RabbitMQ to shove nearly half a million messages into consumer TCP buffers while holding metadata for all 498,800 in broker RAM past the 40\% watermark. Set \texttt{channel.basicQos(50)} in consumer startup and restart workers to drain the backlog cleanly.
+\end{realworldbox}
+
+\begin{tryityourselfbox}[Idempotent Upsert vs. Tombstone Processing]
+\begin{enumerate}[leftmargin=18pt]
+  \item Trace \texttt{process\_order\_message} above if a malformed message arrives missing the \texttt{"amount"} key (\texttt{KeyError}) inside the \texttt{try} block. Does \texttt{processed\_messages} keep the ID, or does PostgreSQL roll it back? What happens if the broker keeps redelivering that broken message without a DLQ?
+  \item Sketch a 6-line Python consumer handler for a compacted stream that handles both normal JSON payloads and \texttt{None} tombstone markers safely.
+\end{enumerate}
+\end{tryityourselfbox}
+
+\section{Summary \protect\& Key Takeaways}
 \begin{itemize}[leftmargin=18pt]
-  \item Message queues provide transient, destructive delivery for dynamic work distribution, whereas event streams provide immutable, ordered, replayable append logs.
-  \item At-least-once delivery is the practical foundation of distributed messaging. Truly physical exactly-once delivery across networks is physically impossible due to the Two Generals' problem.
-  \item Effectively-once processing requires pairing at-least-once delivery with \textbf{idempotent consumers} using unique idempotency keys and atomic database deduplication tables.
-  \item Unhandled exceptions on malformed payloads create poison message infinite crash loops that can take down entire consumer clusters.
-  \item Production pipelines isolate poison messages using bounded retry counters, delayed retry queues, and Dead Letter Queues (DLQs) with diagnostic telemetry.
+  \item Traditional queues delete messages upon \texttt{ACK} for dynamic task distribution; append-only logs preserve immutable history per partition for replayability.
+  \item The Two Generals' Problem proves physical exactly-once delivery across an unreliable network is impossible; combine at-least-once delivery with atomic database deduplication for effectively-once processing.
+  \item Always bound AMQP consumer prefetch (\texttt{basicQos(50)}) to enforce backpressure and protect broker RAM.
+  \item Isolate poison messages with bounded delayed retries and Dead Letter Queues; use null-value Tombstone Markers to propagate deletions in compacted streams.
 \end{itemize}
 
 \section{Exercises}
 
-\subsection{Mechanics}
-A payment service receives order charge events. Construct an idempotent SQL schema and an \texttt{UPSERT} query in PostgreSQL that safely handles repeated deliveries of payment authorization events without charging the customer twice.
+\subsection*{Exercise~\thechapter.1 (Mechanics): Idempotent SQL Payment Ledger}
+Write a PostgreSQL table schema and idempotent \texttt{INSERT} query that safely handles repeated deliveries of payment authorization events without charging a customer twice or causing unnecessary MVCC dead-tuple bloat on duplicates.
 
-\subsection{Debugging}
-An operations team notices an alert: \emph{RabbitMQ Memory High Watermark Exceeded (Node Alarmed)}. Messages published to \texttt{order.events} are blocked. Investigation reveals that a consumer group has 10 workers, but the queue has 500,000 unacknowledged messages. The consumer configuration contains:
-\begin{lstlisting}[language=Java]
-channel.basicQos(0); // Prefetch count
-\end{lstlisting}
-Explain why RabbitMQ ran out of memory and why consumer workers stopped acknowledging messages.
+\subsection*{Exercise~\thechapter.2 (Debugging): RabbitMQ Memory High Watermark}
+An operations team sees \emph{RabbitMQ Memory High Watermark Exceeded} while 10 workers process \texttt{order.events} with 500,000 unacknowledged messages and \texttt{channel.basicQos(0);}. Explain why the broker stalled both consumers and producers, and provide the fix.
 
-\subsection{Architecture}
-Design a distributed webhook notification delivery system (like Stripe's webhook infrastructure) capable of dispatching 50 million webhooks per day to arbitrary third-party customer endpoints. Address endpoint timeouts, unresponsive customer servers, exponential retry scheduling over 72 hours, and isolation so one slow customer cannot block other customers.
+\subsection*{Exercise~\thechapter.3 (Architecture): Multi-Tenant Webhook Dispatcher}
+Design a distributed webhook delivery pipeline dispatching 50 million webhooks/day to arbitrary third-party URLs. Address customer endpoint timeouts, 72-hour exponential retry scheduling, and noisy-neighbor isolation so one slow customer cannot starve healthy ones.
+
+\subsection*{Exercise~\thechapter.4 (Try-It-Yourself Lab): Exception Rollback & Tombstone Handler}
+Solve both parts of the \emph{Try It Yourself} box above.
 
 \section{Detailed Solutions}
 
-\subsection{Solution to Mechanics Exercise}
+\subsection*{Solution to Exercise~\thechapter.1}
 \begin{lstlisting}[language=SQL]
--- Idempotent Ledger Schema
 CREATE TABLE payment_authorizations (
     idempotency_key VARCHAR(64) PRIMARY KEY,
     customer_id VARCHAR(64) NOT NULL,
@@ -248,43 +276,44 @@ CREATE TABLE payment_authorizations (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Safe Upsert Query: returns existing record on conflict without re-charging
+-- Insert if new; skip lock/dead-tuple write amplification on duplicates
 INSERT INTO payment_authorizations (idempotency_key, customer_id, amount_cents, status)
 VALUES ('pay_tok_948fbc', 'cust_123', 4999, 'AUTHORIZED')
-ON CONFLICT (idempotency_key) DO UPDATE
-SET status = payment_authorizations.status
-RETURNING *;
+ON CONFLICT (idempotency_key) DO NOTHING;
+
+SELECT * FROM payment_authorizations WHERE idempotency_key = 'pay_tok_948fbc';
 \end{lstlisting}
 
-\subsection{Solution to Debugging Exercise}
-\textbf{The basicQos(0) Memory Trap:}
-In AMQP / RabbitMQ, setting \texttt{basicQos(0)} specifies an \textbf{unlimited prefetch count}.
-When workers connect and invoke \texttt{basicConsume}, RabbitMQ attempts to push \emph{every single message in the queue} across the TCP socket into the client workers' in-memory buffers as fast as the network allows.
-Because the workers take time to process each message, hundreds of thousands of messages are pulled out of disk/broker management into unacknowledged RAM buffers.
-The broker must track state metadata for all 500,000 in-flight unacknowledged deliveries in RAM. Once broker memory crosses the 40\% watermark, RabbitMQ triggers an alarm, suspends socket reading, and stops accepting new ACKs and publishes.
-\textbf{The Fix:} Always set a bounded prefetch count:
-\begin{lstlisting}[language=Java]
-channel.basicQos(50); // Fetch at most 50 unacked messages per consumer thread
-\end{lstlisting}
+\subsection*{Solution to Exercise~\thechapter.2}
+\texttt{basicQos(0)} disables prefetch limits, instructing RabbitMQ to push all queued messages into the 10 workers' socket buffers as fast as TCP accepts them. RabbitMQ must keep tracking state for all 500,000 in-flight unacked messages in RAM until its 40\% memory watermark trips, triggering flow-control blocks on publishers. Setting \texttt{channel.basicQos(50);} caps in-flight deliveries to $10 \times 50 = 500$ messages.
 
-\subsection{Solution to Architecture Exercise}
-\textbf{Distributed Webhook Dispatch Architecture:}
+\subsection*{Solution to Exercise~\thechapter.3}
 \begin{enumerate}[leftmargin=18pt]
-  \item \textbf{Partitioning and Customer Isolation}: Route outgoing webhooks into tiered Kafka topics or partitioned queues based on customer hash: \texttt{webhooks.fast} and \texttt{webhooks.slow}. If customer $X$'s endpoint times out continuously, their events are dynamically downgraded to the slow tier, preventing thread starvation for healthy customers.
-  \item \textbf{Tiered Delayed Retry Queues}:
-  \begin{itemize}[leftmargin=12pt]
-    \item Retry 1: 15 seconds delay.
-    \item Retry 2: 5 minutes delay.
-    \item Retry 3: 1 hour delay.
-    \item Retry 4--10: Bounded exponential backoff up to 72 hours.
-  \end{itemize}
-  Implement delays using message timestamps and separate delayed topics (or Redis sorted sets where score is unix execution epoch).
-  \item \textbf{HTTP Client Hard Limits}: Set strict timeouts on outbound connections: connect timeout $3\text{ s}$, read timeout $10\text{ s}$. Enforce circuit breakers per domain: if a customer domain fails 50 consecutive requests, short-circuit immediately.
+  \item \textbf{Tiered Isolation}: Route events to \texttt{webhooks.fast} vs. \texttt{webhooks.slow} partitions keyed by \texttt{customer\_id}. Domains exceeding latency/error budgets are automatically demoted to \texttt{webhooks.slow} so healthy customers keep full worker throughput.
+  \item \textbf{Delayed Retry Tiers}: Use scheduled delay topics or Redis sorted sets (scored by next-attempt Unix timestamp) for 15s $\to$ 5m $\to$ 1h $\to$ exponential backoff up to 72h, then route permanent failures to a DLQ.
+  \item \textbf{Strict Client Limits}: Enforce $3\text{ s}$ connect / $10\text{ s}$ read timeouts and per-domain circuit breakers.
 \end{enumerate}
 
-\section{Further Reading \& Citations}
+\subsection*{Solution to Exercise~\thechapter.4}
+\begin{enumerate}[leftmargin=18pt]
+  \item Raising \texttt{KeyError} exits the \texttt{with conn.cursor()} block before \texttt{conn.commit()} runs, so PostgreSQL rolls back the \texttt{processed\_messages} insert too. Without a DLQ, the broker redelivers the broken payload forever in a poison-message crash loop.
+  \item Tombstone-aware consumer handler:
+  \begin{lstlisting}[language=Python]
+def apply_user_event(cache: dict, key: str, value: dict | None) -> None:
+    if value is None:
+        cache.pop(key, None)   # Tombstone: delete entity from read model
+    else:
+        cache[key] = value     # Normal upsert
+  \end{lstlisting}
+\end{enumerate}
+
+\begin{labbridgebox}[Outbox Relay & End-to-End Microservice Messaging]
+Practice atomic local writes and at-least-once relay mechanics in \texttt{exercises/volume4/ex03\_outbox\_pattern\_relay.py}, and explore full queue + DLQ + idempotent inventory consumption in \texttt{projects/p11-event-driven-microservices}.
+\end{labbridgebox}
+
+\section{Further Reading \protect\& Citations}
 \begin{itemize}[leftmargin=18pt]
-  \item Kleppmann, M. (2017). \emph{Designing Data-Intensive Applications}. O'Reilly Media. Chapter 11: Stream Processing.
+  \item Kleppmann, M. (2017). \emph{Designing Data-Intensive Applications}. O'Reilly Media, Chapter 11.
   \item Hohpe, G., \& Woolf, B. (2003). \emph{Enterprise Integration Patterns}. Addison-Wesley.
-  \item Akidau, T., et al. (2015). \emph{The dataflow model: a practical approach to balancing correctness, latency, and cost in massive-scale, unbounded, out-of-order data processing}. Proceedings of the VLDB Endowment, 8(12), 1792--1803.
+  \item Akkerman, A., et al. (1975). \emph{Some constraints and tradeoffs in the design of network communications} (Two Generals' Problem). ACM SOSP.
 \end{itemize}

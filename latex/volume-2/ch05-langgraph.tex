@@ -1,0 +1,457 @@
+\chapter{LangGraph and Stateful Agent Architectures}
+\label{chap:langgraph}
+
+\begin{chaptergoalsbox}
+\textbf{What You Will Learn:}
+\begin{itemize}[leftmargin=15pt]
+  \item Why in-memory agent loops fail across crashes or human approvals, and how state machines solve durability.
+  \item Channel reducers and monoids in plain English before Bulk Synchronous Parallel (Pregel) supersteps.
+  \item Constructing cyclic \texttt{StateGraph} workflows and tracing state across Supersteps 0, 1, and 2.
+  \item Production persistence: PostgreSQL \texttt{AsyncPostgresSaver} schema (\texttt{checkpoints}, \texttt{checkpoint\_blobs}, \texttt{checkpoint\_writes}) and \texttt{AsyncConnectionPool(open=False)}.
+  \item Human-in-the-loop (HITL) interrupts: \texttt{interrupt\_before} vs \texttt{langgraph.types.interrupt()}, and time-travel debugging.
+\end{itemize}
+
+\textbf{What You Should Already Understand:}
+\begin{itemize}[leftmargin=15pt]
+  \item Tool-calling ReAct loops and Pydantic schemas (Chapter~4).
+  \item Python dictionaries, \texttt{TypedDict}, and basic SQL primary/foreign keys.
+\end{itemize}
+
+\textbf{Why This Topic Exists:}
+Chapter~4's \texttt{ProductionAgentLoop} works well for a 10-second task inside one Python process. However, if the container restarts at step 4—or if a financial transaction needs a compliance officer to click ``Approve'' three hours later—an in-memory \texttt{while} loop loses all progress. Production agents need explicit, serializable state transitions stored in a database after every step.
+
+\textbf{Motivating Practical Problem:}
+A financial reconciliation agent parses corporate invoices, cross-checks an ERP ledger, and—whenever a discrepancy exceeds \$10,000—must pause for a compliance officer's approval before posting ledger adjustments. If the worker crashes mid-audit, it must resume from the exact checkpoint without re-charging APIs or duplicating ledger entries.
+\end{chaptergoalsbox}
+
+\section{Why Single Loops Break Across Process Boundaries}
+
+Early LLM frameworks modeled workflows as linear pipelines:
+\begin{equation}
+\text{Input} \longrightarrow \text{Prompt} \longrightarrow \text{LLM} \longrightarrow \text{Parser} \longrightarrow \text{Result}
+\end{equation}
+Linear pipelines cannot loop back when a tool fails, cannot branch cleanly across parallel workers, and cannot pause for hours while a human reviews a draft. LangGraph reformulates agent orchestration as a \textbf{state machine} inspired by Google's \textbf{Pregel} graph engine (Malewicz et al., 2010).
+
+\begin{intuitionbox}[The Rail Network Metaphor]
+A linear chain is a train on one track: if a signal turns red, the whole trip stalls or derails. A stateful graph is a rail network with switches (\textbf{conditional edges}), sidings (\textbf{tool loops}), and a shared cargo manifest (\textbf{State}). At every station (\textbf{node}), workers inspect the manifest, emit cargo updates (\textbf{deltas}), and pause cleanly at red signals (\textbf{interrupts}) while the manifest sits safely locked in a database vault.
+\end{intuitionbox}
+
+\section{Reducers and Monoids in Plain English}
+
+Suppose two parallel workers inspect different invoices at the exact same moment. Worker A finds discrepancy \texttt{"ERR-101"}, and Worker B finds \texttt{"ERR-102"}. If both run \texttt{state["discrepancies"] = [found\_item]}, Worker B overwrites Worker A's finding! Even \texttt{list.append()} across concurrent tasks can interleave unpredictably.
+
+Instead of letting nodes mutate shared state directly, LangGraph makes every node return a \emph{partial update} (a \textbf{delta}) and delegates merging to a \textbf{channel reducer}:
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Reducer}: Simply a two-argument merge function \texttt{combine(existing\_value, incoming\_delta) -> new\_value}. For example, \texttt{operator.add([A], [B])} returns \texttt{[A, B]}.
+  \item \textbf{Monoid}: A reducer that also obeys two clean rules: (1) \textbf{associativity}—grouping doesn't change the outcome, so $(S \oplus \Delta_A) \oplus \Delta_B = S \oplus (\Delta_A \oplus \Delta_B)$; and (2) an \textbf{identity value} (such as \texttt{[]} for lists or \texttt{0} for addition) that leaves state unchanged when merged.
+\end{itemize}
+Why does this matter in production? Because when two parallel nodes finish in unpredictable order, an associative reducer at the synchronization point combines their deltas deterministically with zero race conditions.
+
+\section{The Pregel Superstep Model and State Trace}
+
+In Pregel, execution advances in discrete rounds called \textbf{Supersteps} (Figure~\ref{fig:v2-ch05-pregel}). Every superstep has three strict phases:
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Parallel Node Execution}: All active nodes in Superstep $t$ read the exact same immutable snapshot $S_t$. Neither node sees the other's in-flight work.
+  \item \textbf{Delta Emission}: Each node returns a dictionary of changes $\Delta_i = f_i(S_t)$.
+  \item \textbf{Barrier \& Channel Reduction}: At the synchronization barrier, LangGraph applies each channel's reducer:
+  \begin{equation}
+  S_{t+1} = S_t \oplus \Delta_A \oplus \Delta_B
+  \end{equation}
+  Only after $S_{t+1}$ is committed to the checkpointer does LangGraph evaluate edges to schedule nodes for Superstep $t+1$.
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  superstep/.style={draw=headingblue!80, fill=codebg, rounded corners=3pt, inner sep=8pt, minimum width=4.0cm, minimum height=4.2cm},
+  nodeblock/.style={draw=exampleBlue!80, fill=exampleBg, rounded corners=2pt, inner sep=4pt, font=\sffamily\scriptsize\bfseries, minimum width=3.1cm, align=center},
+  reducer/.style={draw=intuitionTeal!80, fill=intuitionBg, rounded corners=2pt, inner sep=4pt, font=\sffamily\scriptsize\bfseries, minimum width=3.1cm, align=center},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=headingblue}
+]
+
+\node[superstep] (s1) at (0,0) {};
+\node[above=2pt of s1.north, font=\sffamily\bfseries\footnotesize, color=headingblue] {Superstep $t$};
+\node[nodeblock] (n1) at (0, 1.2) {Execute Node A\\$\Delta_A = f_A(S_t)$};
+\node[nodeblock] (n2) at (0, 0.1) {Execute Node B\\$\Delta_B = f_B(S_t)$};
+\node[reducer] (r1) at (0, -1.2) {Channel Reducers\\$S_{t+1} = S_t \oplus \Delta_A \oplus \Delta_B$};
+
+\draw[dashed, thick, color=gray!60] (2.5, -2.4) -- (2.5, 2.4) node[above, font=\tiny\sffamily, color=gray!80] {Sync Barrier};
+
+\node[superstep] (s2) at (5.0,0) {};
+\node[above=2pt of s2.north, font=\sffamily\bfseries\footnotesize, color=headingblue] {Superstep $t+1$};
+\node[nodeblock] (n3) at (5.0, 0.6) {Execute Node C\\$\Delta_C = f_C(S_{t+1})$};
+\node[reducer] (r2) at (5.0, -1.0) {Channel Reducers\\$S_{t+2} = S_{t+1} \oplus \Delta_C$};
+
+\draw[arrow] (n1.south) -- (r1.north);
+\draw[arrow] (n2.south) -- (r1.north);
+\draw[arrow] (r1.east) -- (n3.west) node[above, midway, font=\tiny\sffamily] {$S_{t+1}$};
+\draw[arrow] (n3.south) -- (r2.north);
+
+\end{tikzpicture}
+\caption{Pregel Superstep Model: Parallel nodes read immutable snapshot $S_t$, emit deltas, and reconcile at the synchronization barrier before $S_{t+1}$ begins.}
+\label{fig:v2-ch05-pregel}
+\end{figure}
+
+\subsection{Defining State Schemas and Graph Topology}
+Listing~\ref{lst:v2-ch05-schema} attaches reducers via \texttt{typing.Annotated}, and Listing~\ref{lst:v2-ch05-graph} wires our financial audit workflow.
+
+\begin{lstlisting}[language=Python, label={lst:v2-ch05-schema}, caption={Defining Typed State Channels with Explicit Reducers}]
+import operator
+from typing import Annotated, Sequence, TypedDict
+from langchain_core.messages import BaseMessage
+from langgraph.graph.message import add_messages
+
+def merge_dict_reducer(
+    current: dict[str, str],
+    update: dict[str, str] | None
+) -> dict[str, str]:
+    """Non-destructive dictionary merge reducer."""
+    if update is None:
+        return current
+    merged = current.copy()
+    merged.update(update)
+    return merged
+
+class FinancialAuditState(TypedDict):
+    messages: Annotated[Sequence[BaseMessage], add_messages]
+    discrepancies: Annotated[list[dict], operator.add]
+    metadata: Annotated[dict[str, str], merge_dict_reducer]
+    audit_status: str                 # Unannotated: last-writer-wins overwrite
+    requires_human_approval: bool     # Unannotated: overwrite
+\end{lstlisting}
+
+\begin{commonmistakebox}[Concurrent Writes Without a Reducer]
+If two nodes run in the same superstep and both return \texttt{\{"audit\_status": ...\}}, LangGraph raises \texttt{InvalidUpdateError} because an unannotated key has no merge rule for two simultaneous writes. Either attach a reducer via \texttt{Annotated} or ensure parallel nodes never write to the same scalar key.
+\end{commonmistakebox}
+
+\begin{lstlisting}[language=Python, label={lst:v2-ch05-graph}, caption={Building the Financial Audit \texttt{StateGraph} with Conditional Routing}]
+from langgraph.graph import StateGraph, START, END
+
+def intake_node(state: FinancialAuditState) -> dict:
+    return {
+        "metadata": {"started_at": "2026-11-23T09:00:00Z"},
+        "audit_status": "in_progress"
+    }
+
+def discrepancy_detector_node(state: FinancialAuditState) -> dict:
+    found = [{"id": "ERR-101", "amount": 14500.00, "vendor": "Acme Corp"}]
+    needs_signoff = any(e["amount"] > 10000 for e in found)
+    return {
+        "discrepancies": found,
+        "requires_human_approval": needs_signoff
+    }
+
+def route_after_detection(state: FinancialAuditState) -> str:
+    if state.get("requires_human_approval"):
+        return "human_approval_gate"
+    return "auto_post_adjustments"
+
+def human_approval_node(state: FinancialAuditState) -> dict:
+    return {"audit_status": "approved_by_compliance"}
+
+def auto_post_node(state: FinancialAuditState) -> dict:
+    return {"audit_status": "posted_to_erp"}
+
+workflow = StateGraph(FinancialAuditState)
+workflow.add_node("intake", intake_node)
+workflow.add_node("detector", discrepancy_detector_node)
+workflow.add_node("human_approval_gate", human_approval_node)
+workflow.add_node("auto_post_adjustments", auto_post_node)
+
+workflow.add_edge(START, "intake")
+workflow.add_edge("intake", "detector")
+workflow.add_conditional_edges(
+    "detector",
+    route_after_detection,
+    {
+        "human_approval_gate": "human_approval_gate",
+        "auto_post_adjustments": "auto_post_adjustments",
+    },
+)
+workflow.add_edge("human_approval_gate", "auto_post_adjustments")
+workflow.add_edge("auto_post_adjustments", END)
+\end{lstlisting}
+
+\subsection{Tracing \texttt{FinancialAuditState} Across Supersteps 0, 1, and 2}
+Suppose we invoke the graph compiled with \texttt{interrupt\_before=["human\_approval\_gate"]} and initial input:
+\texttt{discrepancies=[]}, \texttt{metadata=\{\}}, \texttt{audit\_status="pending"}, \texttt{requires\_human\_approval=False}:
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Superstep 0 (\texttt{intake} runs)}: \texttt{intake\_node} emits \texttt{metadata=\{"started\_at": "2026-11-23T09:00:00Z"\}} and \texttt{audit\_status="in\_progress"}. At the barrier, \texttt{merge\_dict\_reducer} merges into \texttt{metadata}, and \texttt{audit\_status} overwrites to \texttt{"in\_progress"}. Next node: \texttt{"detector"}.
+  \item \textbf{Superstep 1 (\texttt{detector} runs)}: \texttt{discrepancy\_detector\_node} finds \texttt{ERR-101} (\$14,500) and returns \texttt{discrepancies=[...]} and \texttt{requires\_human\_approval=True}. At the barrier, \texttt{operator.add} appends \texttt{ERR-101} to \texttt{discrepancies}, \texttt{metadata} retains \texttt{"started\_at"}, and \texttt{route\_after\_detection} returns \texttt{"human\_approval\_gate"}. Because \texttt{interrupt\_before} matches \texttt{"human\_approval\_gate"}, LangGraph saves the checkpoint and pauses cleanly!
+  \item \textbf{Superstep 2 (Human patch + Resume)}: The compliance officer inspects \texttt{discrepancies}, calls \texttt{aupdate\_state(..., values=\{"metadata": \{"approved\_by": "Officer Smith"\}\})}, and resumes with \texttt{astream(None, config)}. Crucially, \texttt{merge\_dict\_reducer} produces \texttt{metadata=\{"started\_at": ..., "approved\_by": "Officer Smith"\}} without erasing \texttt{"started\_at"}! \texttt{human\_approval\_gate} sets \texttt{audit\_status="approved\_by\_compliance"}, followed in the final superstep by \texttt{auto\_post\_adjustments} setting \texttt{audit\_status="posted\_to\_erp"}.
+\end{enumerate}
+
+\section{Persistence and Checkpointing with PostgreSQL}
+
+To survive server restarts, \texttt{AsyncPostgresSaver} commits every superstep to three PostgreSQL tables (Figure~\ref{fig:v2-ch05-pg-er}):
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{\texttt{checkpoints}} (PK: \texttt{(thread\_id, checkpoint\_ns, checkpoint\_id)}): Stores the JSONB checkpoint metadata, channel versions, and \texttt{parent\_checkpoint\_id} pointer. (\texttt{checkpoint\_ns} isolates subgraphs cleanly within the same thread.)
+  \item \textbf{\texttt{checkpoint\_blobs}} (PK: \texttt{(thread\_id, checkpoint\_ns, channel, version)}): Stores large serialized channel payloads out-of-line by \texttt{(channel, version)}. Because blobs are keyed by version rather than \texttt{checkpoint\_id}, unchanged channels are never duplicated across supersteps!
+  \item \textbf{\texttt{checkpoint\_writes}} (PK: \texttt{(thread\_id, checkpoint\_ns, checkpoint\_id, task\_id, idx)}): Logs intermediate node writes emitted during a superstep for crash recovery and auditability.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  table/.style={draw=headingblue, fill=white, rounded corners=2pt, font=\sffamily\footnotesize, align=left, inner sep=6pt},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=linkblue}
+]
+
+\node[table] (checkpoints) at (0, 0) {
+  \textbf{checkpoints}\\[2pt]
+  \rule{5.2cm}{0.4pt}\\[4pt]
+  \textbf{thread\_id} : TEXT (PK)\\
+  \textbf{checkpoint\_ns} : TEXT (PK)\\
+  \textbf{checkpoint\_id} : TEXT (PK)\\
+  parent\_checkpoint\_id : TEXT\\
+  type : TEXT\\
+  checkpoint : JSONB\\
+  metadata : JSONB
+};
+
+\node[table] (blobs) at (7.4, 0) {
+  \textbf{checkpoint\_blobs}\\[2pt]
+  \rule{5.2cm}{0.4pt}\\[4pt]
+  \textbf{thread\_id} : TEXT (PK)\\
+  \textbf{checkpoint\_ns} : TEXT (PK)\\
+  \textbf{channel} : TEXT (PK)\\
+  \textbf{version} : TEXT (PK)\\
+  type : TEXT\\
+  blob : BYTEA
+};
+
+\node[table] (writes) at (3.7, -3.7) {
+  \textbf{checkpoint\_writes}\\[2pt]
+  \rule{5.6cm}{0.4pt}\\[4pt]
+  \textbf{thread\_id} : TEXT (PK)\\
+  \textbf{checkpoint\_ns} : TEXT (PK)\\
+  \textbf{checkpoint\_id} : TEXT (PK)\\
+  \textbf{task\_id} : TEXT (PK)\\
+  \textbf{idx} : INT (PK)\\
+  channel : TEXT\\
+  type : TEXT\\
+  blob : BYTEA
+};
+
+\draw[arrow] (checkpoints.east) -- (blobs.west) node[above, midway, font=\tiny\sffamily] {by version};
+\draw[arrow] (checkpoints.south) -- ++(0,-0.55) -| (writes.north) node[above, near start, font=\tiny\sffamily] {1 : N};
+
+\end{tikzpicture}
+\caption{Relational Schema of \texttt{PostgresSaver}: \texttt{checkpoint\_ns} scopes subgraphs, \texttt{checkpoints.checkpoint} is \texttt{JSONB}, and \texttt{checkpoint\_blobs} deduplicates payloads via PK \texttt{(thread\_id, checkpoint\_ns, channel, version)}.}
+\label{fig:v2-ch05-pg-er}
+\end{figure}
+
+Listing~\ref{lst:v2-ch05-pg} wires \texttt{AsyncPostgresSaver}. Note \texttt{open=False} in \texttt{AsyncConnectionPool}: in \texttt{psycopg\_pool >= 3.2}, opening pools implicitly in \texttt{\_\_init\_\_} inside an async event loop is deprecated and triggers errors, so pass \texttt{open=False} and explicitly \texttt{await pool.open()}.
+
+\begin{lstlisting}[language=Python, label={lst:v2-ch05-pg}, caption={Configuring \texttt{AsyncPostgresSaver} with \texttt{AsyncConnectionPool(open=False)}}]
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from psycopg_pool import AsyncConnectionPool
+
+async def initialize_production_graph(connection_string: str):
+    pool = AsyncConnectionPool(
+        conninfo=connection_string,
+        max_size=20,
+        open=False,
+        kwargs={"autocommit": True}
+    )
+    await pool.open()
+
+    checkpointer = AsyncPostgresSaver(pool)
+    await checkpointer.setup()  # Idempotent schema creation
+
+    app = workflow.compile(
+        checkpointer=checkpointer,
+        interrupt_before=["human_approval_gate"]
+    )
+    return app, pool
+\end{lstlisting}
+
+\begin{productionwarningbox}[Checkpointer Pool Isolation]
+Keep the checkpointer's \texttt{AsyncConnectionPool} separate from your application's business-query pool. If a slow ERP SQL query inside a node holds a pool connection while the superstep barrier tries to commit checkpoints, shared pools can deadlock under load.
+\end{productionwarningbox}
+
+\section{Human-in-the-Loop (HITL): \texttt{interrupt()} vs Static Breakpoints}
+
+LangGraph offers two ways to pause for human input (Figure~\ref{fig:v2-ch05-hitl}):
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Static Breakpoints (\texttt{interrupt\_before} / \texttt{interrupt\_after})}: Compiled into the graph topology. Execution pauses cleanly at a superstep boundary before (or after) the named node. Resuming via \texttt{astream(None, config)} starts at the next scheduled node.
+  \item \textbf{Dynamic Interrupts (\texttt{langgraph.types.interrupt()})}: Replaces the deprecated \texttt{NodeInterrupt} exception. A node conditionally calls \texttt{decision = interrupt(\{"amount": 14500\})} at runtime; the caller resumes using \texttt{Command(resume={"approved": True})}. \textbf{Crucial detail}: when a node using \texttt{interrupt()} resumes, LangGraph \emph{re-executes that node from its first line} so \texttt{interrupt()} can return the human's \texttt{resume} value! Therefore, never place non-idempotent side effects (like a Stripe charge) \emph{before} \texttt{interrupt()} in the same node.
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  stepbox/.style={draw=headingblue, fill=codebg, rounded corners=2pt, minimum width=2.8cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize},
+  alertbox/.style={draw=warningRed, fill=warningBg, rounded corners=2pt, minimum width=2.8cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries, color=warningRed},
+  humanbox/.style={draw=exampleBlue, fill=exampleBg, rounded corners=2pt, minimum width=2.8cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries, color=exampleBlue},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=headingblue}
+]
+
+\node[stepbox] (start) at (0,0) {Superstep 1\\Run \texttt{detector}};
+\node[alertbox] (interrupt) at (3.5,0) {Breakpoint Hit\\Checkpoint Saved};
+\node[humanbox] (ui) at (7.0,0) {Human Reviewer\\Approves Delta};
+\node[stepbox] (resume) at (10.5,0) {\texttt{aupdate\_state}\\Resume Superstep 2};
+
+\draw[arrow] (start) -- (interrupt) node[above, midway, font=\tiny\sffamily] {Pause};
+\draw[arrow] (interrupt) -- (ui) node[above, midway, font=\tiny\sffamily] {Webhook};
+\draw[arrow] (ui) -- (resume) node[above, midway, font=\tiny\sffamily] {POST /resume};
+
+\end{tikzpicture}
+\caption{Human-in-the-Loop Interrupt Lifecycle.}
+\label{fig:v2-ch05-hitl}
+\end{figure}
+
+Listing~\ref{lst:v2-ch05-hitl} demonstrates both static resumption and dynamic \texttt{langgraph.types.interrupt()}.
+
+\begin{lstlisting}[language=Python, label={lst:v2-ch05-hitl}, caption={HITL Interrupts: Static Breakpoint Resumption and Dynamic \texttt{interrupt()}}]
+from langgraph.types import Command, interrupt
+
+def dynamic_approval_gate(state: FinancialAuditState) -> dict:
+    # Side-effect-free check BEFORE interrupt(); node restarts here on resume
+    high_risk = [d for d in state["discrepancies"] if d["amount"] > 10000]
+    if high_risk:
+        decision = interrupt({"pending_items": high_risk})
+        if not decision.get("approved"):
+            return {"audit_status": "rejected_by_compliance"}
+    return {"audit_status": "approved_by_compliance"}
+
+async def run_compliance_workflow(conn_str: str):
+    app, pool = await initialize_production_graph(conn_str)
+    config = {"configurable": {"thread_id": "session-fin-2026-991"}}
+    initial_input = {
+        "messages": [],
+        "discrepancies": [],
+        "metadata": {},
+        "audit_status": "pending",
+        "requires_human_approval": False,
+    }
+
+    async for event in app.astream(initial_input, config=config):
+        print(f"Event: {event}")
+
+    state_snap = await app.aget_state(config)
+    print(f"Paused before: {state_snap.next}")  # ('human_approval_gate',)
+
+    await app.aupdate_state(
+        config=config,
+        values={"metadata": {"approved_by": "Officer Smith"}}
+    )
+    async for event in app.astream(None, config=config):
+        print(f"Resumed event: {event}")
+    await pool.close()
+\end{lstlisting}
+
+\section{Time-Travel Debugging and History Forking}
+
+Because \texttt{checkpoints} forms an immutable parent-linked tree (like Git commits), you can rewind any failed production thread, patch a corrupted field at an earlier \texttt{checkpoint\_id}, and replay forward from that fork without losing the original audit trail (Listing~\ref{lst:v2-ch05-timetravel}).
+
+\begin{lstlisting}[language=Python, label={lst:v2-ch05-timetravel}, caption={Time-Travel Debugging: Inspecting History and Forking a Checkpoint}]
+async def perform_time_travel(app, thread_id: str):
+    config = {"configurable": {"thread_id": thread_id}}
+    history = [s async for s in app.aget_state_history(config)]
+    for i, snap in enumerate(history):
+        print(f"Step {i}: id={snap.config['configurable']['checkpoint_id']} "
+              f"next={snap.next} status={snap.values.get('audit_status')}")
+
+    target_snap = history[-2]  # Snapshot prior to erroneous node
+    fork_config = await app.aupdate_state(
+        config=target_snap.config,
+        values={"discrepancies": [{"id": "OVERRIDE", "amount": 0.0}]}
+    )
+    async for event in app.astream(None, config=fork_config):
+        print(f"Forked execution: {event}")
+\end{lstlisting}
+
+\begin{realworldbox}[Recovering a Stuck CRM Agent via Checkpoint Forking]
+An automated support workflow repeatedly failed when a malformed \texttt{customer\_id="cust\_"} (truncated) was saved into state early in a thread:
+\begin{lstlisting}[basicstyle=\ttfamily\scriptsize]
+thread_id=crm-8821 checkpoint_id=0193a4-03 next=('lookup_crm',)
+ERROR: CRMClientError: 400 Bad Request for customer_id='cust_' (retry 3/3)
+\end{lstlisting}
+Instead of discarding the customer's 12-turn conversation, the on-call engineer queried \texttt{aget\_state\_history}, located \texttt{checkpoint\_id=0193a4-02} prior to \texttt{lookup\_crm}, patched \texttt{customer\_id="cust\_99210"} via \texttt{aupdate\_state}, and resumed from the forked config—completing the ticket cleanly.
+\end{realworldbox}
+
+\begin{tryityourselfbox}[Two-Tier Approval Routing]
+Extend \texttt{FinancialAuditState} and \texttt{route\_after\_detection} so that:
+\begin{enumerate}
+  \item Discrepancies summing between \$1,000 and \$10,000 route to \texttt{"finance\_manager\_gate"}.
+  \item Discrepancies exceeding \$10,000 route to \texttt{"cro\_gate"}.
+  \item Discrepancies under \$1,000 bypass both gates straight to \texttt{"auto\_post\_adjustments"}.
+\end{enumerate}
+Write the Python routing function and \texttt{add\_conditional\_edges} mapping. (Worked solution in Section~5.8.)
+\end{tryityourselfbox}
+
+\section{Chapter Summary \protect\& Key Takeaways}
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Reducers \& Monoids}: Reducers combine incoming deltas deterministically at superstep barriers; associative reducers prevent race conditions across parallel branches.
+  \item \textbf{Pregel Supersteps}: Nodes read immutable state $S_t$, return deltas, and synchronize before $S_{t+1}$ triggers outgoing edges.
+  \item \textbf{Postgres Persistence}: \texttt{AsyncPostgresSaver} stores thread snapshots in \texttt{checkpoints}, deduplicated channel versions in \texttt{checkpoint\_blobs}, and pending deltas in \texttt{checkpoint\_writes}, using \texttt{AsyncConnectionPool(open=False)}.
+  \item \textbf{HITL Semantics}: Use \texttt{interrupt\_before} for node-level approval gates, or \texttt{langgraph.types.interrupt()} inside a node—keeping non-idempotent side effects \emph{after} \texttt{interrupt()} because resumption re-runs that node from the top.
+  \item \textbf{Time-Travel}: Target historical \texttt{checkpoint\_id}s to fork and replay without mutating past logs.
+\end{itemize}
+
+\section{Exercises}
+
+\subsection*{Mechanics}
+\textbf{Exercise \thechapter.1}: A state schema defines \texttt{counter: int} without a reducer. Two parallel nodes $A$ and $B$ connected from \texttt{START} both return \texttt{\{"counter": 1\}}. Explain what happens at the barrier and write the exact \texttt{Annotated} reducer definition so \texttt{counter} accumulates both updates.
+
+\textbf{Exercise \thechapter.2}: Count the PostgreSQL write operations performed by \texttt{PostgresSaver} over $S$ supersteps if $N$ nodes execute per superstep, each node writes to 2 channels, and $C$ distinct channels change value per superstep.
+
+\subsection*{Debugging}
+\textbf{Exercise \thechapter.3}: A billing graph has a single node \texttt{bill\_and\_confirm} that calls \texttt{stripe.charges.create(...)} on line 2 and then calls \texttt{interrupt("Confirm receipt?")} on line 3. When the user resumes with \texttt{Command(resume=True)}, the customer is charged twice! Explain why LangGraph re-executed the charge and show two ways to fix it.
+
+\subsection*{Architecture}
+\textbf{Exercise \thechapter.4}: Design a resilient order-fulfillment graph that validates inventory, charges a card, schedules warehouse packing, and handles an asynchronous user cancellation webhook arriving at any time before shipment.
+
+\section{Detailed Solutions}
+
+\subsection*{Solution \thechapter.1}
+At the Superstep 0 barrier, LangGraph detects two conflicting scalar writes to \texttt{counter} and raises \texttt{InvalidUpdateError: Conflicting updates for channel 'counter'}. Fix with \texttt{operator.add}:
+\begin{lstlisting}[language=Python]
+import operator
+from typing import Annotated, TypedDict
+
+class CounterState(TypedDict):
+    counter: Annotated[int, operator.add]
+\end{lstlisting}
+
+\subsection*{Solution \thechapter.2}
+Per superstep: $2N$ rows go into \texttt{checkpoint\_writes}, $1$ row goes into \texttt{checkpoints}, and $C$ updated channel payloads go into \texttt{checkpoint\_blobs}. Over $S$ supersteps: $S \times (1 + 2N + C)$ writes. For $S=10, N=3, C=2$: $10 \times (1 + 6 + 2) = 90$ database writes.
+
+\subsection*{Solution \thechapter.3}
+Unlike static \texttt{interrupt\_after=["bill\_and\_confirm"]} (which checkpoints \emph{after} the node finishes and only re-runs if a caller mistakenly passes a fresh input dict instead of \texttt{None}), calling \texttt{langgraph.types.interrupt()} \emph{inside} a node suspends mid-function and \textbf{re-executes that node from its very first line upon resume} so \texttt{interrupt()} can yield the human's \texttt{resume} value. Thus line 2 runs twice! Two fixes: (1) split \texttt{confirm\_gate} and \texttt{charge\_card} into separate nodes and compile with \texttt{interrupt\_before=["charge\_card"]}; or (2) move \texttt{interrupt()} \emph{before} \texttt{stripe.charges.create(...)} (and pass an idempotency key derived from \texttt{thread\_id}).
+
+\subsection*{Solution \thechapter.4}
+1. \textbf{State}: \texttt{OrderState} holds \texttt{order\_id}, \texttt{is\_cancelled: bool}, \texttt{payment\_intent\_id}, and \texttt{status}. 2. \textbf{Webhook Update}: When the cancel webhook arrives, call \texttt{await app.aupdate\_state(\{"configurable": \{"thread\_id": order\_id\}\}, \{"is\_cancelled": True\})}. 3. \textbf{Conditional Guards}: Before \texttt{charge\_card} and \texttt{pack\_warehouse}, conditional edges inspect \texttt{state["is\_cancelled"]} and route to \texttt{refund\_and\_release\_inventory} $\to$ \texttt{END} if true.
+
+\subsection*{Solution (Try It Yourself)}
+\begin{lstlisting}[language=Python]
+def route_after_detection(state: FinancialAuditState) -> str:
+    total = sum(d["amount"] for d in state["discrepancies"])
+    if total > 10000:
+        return "cro_gate"
+    if total >= 1000:
+        return "finance_manager_gate"
+    return "auto_post_adjustments"
+
+workflow.add_conditional_edges(
+    "detector",
+    route_after_detection,
+    {
+        "cro_gate": "cro_gate",
+        "finance_manager_gate": "finance_manager_gate",
+        "auto_post_adjustments": "auto_post_adjustments",
+    },
+)
+\end{lstlisting}
+
+\begin{labbridgebox}[Hands-On Exercise \& Project Bridge]
+Implement typed state channel reducers and immutable history tracking in \texttt{exercises/volume2/ex04\_agent\_state\_reducer.py}, then explore a full stateful graph with HITL approval gates and time-travel in \texttt{projects/p05-langgraph-agent-state/} (\texttt{agent/state.py}, \texttt{agent/graph.py}, \texttt{agent/tools.py}, \texttt{tests/test\_agent\_graph.py}).
+\end{labbridgebox}
+
+\section{Further Reading \protect\& Citations}
+\begin{itemize}[leftmargin=18pt]
+  \item Malewicz, G., et al. (2010). \emph{Pregel: A System for Large-Scale Graph Processing}. ACM SIGMOD.
+  \item Valiant, L. G. (1990). \emph{A Bridging Model for Parallel Computation}. Communications of the ACM, 33(8), 103--111.
+  \item LangChain AI. (2025). \emph{LangGraph Persistence and Human-in-the-Loop Documentation}. \url{https://langchain-ai.github.io/langgraph/}.
+\end{itemize}

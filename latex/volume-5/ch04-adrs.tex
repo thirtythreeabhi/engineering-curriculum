@@ -185,7 +185,7 @@ Assume your mobile engineering team wants to replace 35 disparate REST endpoints
 \end{enumerate}
 \end{tryityourselfbox}
 
-\section{Summary \& Key Takeaways}
+\section{Summary \protect\& Key Takeaways}
 
 \begin{itemize}[leftmargin=18pt]
   \item \textbf{Context Preservation}: ADRs record the \textit{why} behind architectural choices, eliminating Chesterton's Fence dilemmas when engineering teams rotate.
@@ -263,7 +263,7 @@ We will enforce data isolation at the database layer using Postgres RLS policies
 * **Connection Pooling Complexity**: With tools like PgBouncer in transaction-pooling mode, connection state must be explicitly cleared using `DISCARD ALL` or scoped strictly via `SET LOCAL` within an explicit `BEGIN...COMMIT` block to prevent tenant cross-contamination across pooled connections.
 \end{lstlisting}
 
-\section{Further Reading \& Citations}
+\section{Further Reading \protect\& Citations}
 \begin{itemize}[leftmargin=18pt]
   \item Nygard, M. (2011). \textit{Documenting Architecture Decisions}. Cognitect Blog.
   \item Kopp, O., et al. (2018). Markdown Architectural Decision Records (MADR). \url{https://adr.github.io/madr/}.

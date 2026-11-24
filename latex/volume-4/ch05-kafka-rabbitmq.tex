@@ -4,49 +4,108 @@
 \begin{chaptergoalsbox}
 \textbf{What you will learn:}
 \begin{itemize}[leftmargin=12pt]
-  \item Deep architectural dive into Apache Kafka: append-only commit logs, segment files, sparse index binary search, and high-performance I/O via the Linux page cache and \texttt{sendfile(2)} zero-copy.
-  \item Kafka replication topology: Leader-Follower, In-Sync Replicas (ISR), High Watermark (HW), Log End Offset (LEO), and metadata quorum migration from ZooKeeper to KRaft (KIP-500).
-  \item Consumer groups, partition assignment strategies (Range, RoundRobin, CooperativeSticky), and rebalance storms.
-  \item Deep architectural dive into RabbitMQ: the AMQP 0-9-1 protocol, Exchanges (Direct, Fanout, Topic, Headers), and Queue bindings.
-  \item RabbitMQ under the hood: the Erlang/OTP actor model, BEAM scheduler, Mnesia database, legacy Mirrored Queues vs. modern Raft-backed Quorum Queues.
+  \item Kernel I/O fundamentals from first principles: User Space vs. Kernel Space, OS Page Cache, and traditional \texttt{read()}/\texttt{write()} (4 copies) vs. \texttt{sendfile(2)} zero-copy.
+  \item Apache Kafka storage and replication: segmented commit logs, sparse \texttt{.index} binary search, ISR, High Watermark (HW), and KRaft (\texttt{\_\_cluster\_metadata}).
+  \item Kafka producer batching (\texttt{linger.ms}, \texttt{batch.size}, Kafka 3.0+ idempotent defaults) and consumer group rebalancing (\texttt{Range}, \texttt{RoundRobin}, \texttt{CooperativeSticky}).
+  \item RabbitMQ AMQP 0-9-1 routing (Direct, Fanout, Topic, Headers exchanges), Erlang BEAM reductions, Mnesia metadata, and Quorum Queues vs. Classic Mirrored Queues.
 \end{itemize}
 
 \textbf{What you should already understand:}
 \begin{itemize}[leftmargin=12pt]
-  \item Linux virtual file systems, page caches, system calls, and network sockets from Volume I.
-  \item Raft consensus algorithm and quorum replication from Chapter~\ref{ch:cap-consistency}.
+  \item Raft majority quorums from Chapter~\ref{ch:cap-consistency} and queues vs. streams from Chapter~\ref{ch:messaging-systems}.
+  \item No prior Linux kernel or Erlang background is assumed---we introduce page caches, system calls, and BEAM scheduling directly.
 \end{itemize}
 
 \textbf{Why this topic exists:}
-Kafka and RabbitMQ represent the two dominant paradigms in enterprise messaging. Treating them as black boxes leads to catastrophic misconfigurations: using RabbitMQ as a permanent analytics store, or using Kafka for low-latency individual RPC task dispatch.
+Apache Kafka and RabbitMQ look similar on architecture slides---both move messages between services---but their internals are opposites. Treating them interchangeably leads to disaster: storing long-lived audit streams inside RabbitMQ RAM, or trying to route millions of per-user priority tasks through Kafka partitions.
 
 \textbf{Motivating practical problem:}
-A FinTech startup processes 50,000 order cancellations per second through RabbitMQ Classic Mirrored Queues. During a single node reboot, the entire cluster freezes for 4 minutes while Erlang synchronization locks all queues. After migrating to Kafka without understanding consumer rebalances, deploying a new microservice pod triggers an ``eager rebalance storm'' that halts all streaming ingestion for 90 seconds.
+A logistics platform uses RabbitMQ Classic Mirrored Queues to dispatch 40,000 shipment updates per second. When one broker reboots for security patching, resynchronizing mirrored queues locks the broker for four minutes and stalls checkout. After migrating to Kafka without understanding consumer rebalancing, deploying a new pod triggers a 90-second ``stop-the-world'' rebalance storm every time autoscaling runs.
 \end{chaptergoalsbox}
+
+\section{Kernel I/O Primer: Page Cache and Zero-Copy}
+
+Before examining Kafka's disk format, we must answer a puzzle: how does Kafka sustain gigabytes per second of throughput when it writes every message to disk rather than keeping everything in application RAM? The secret lives inside the Linux operating system kernel.
+
+\subsection{User Space, Kernel Space, and the OS Page Cache}
+
+Modern CPUs enforce hardware privilege rings separating memory into two regions:
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Kernel Space}: Privileged OS territory that owns hardware drivers (disks, network cards), TCP sockets, and the Virtual File System (VFS).
+  \item \textbf{User Space}: Unprivileged memory where your Python, Java, or Go application runs. An application cannot touch a disk or network card directly; it must ask the kernel via a \textbf{system call} (such as \texttt{read()}, \texttt{write()}, or \texttt{sendfile()}), which pauses the thread and switches CPU mode into the kernel (a \textbf{context switch}).
+\end{itemize}
+
+Whenever the kernel reads or writes a file on disk, it automatically caches recently used $4\text{ KB}$ disk blocks inside free physical RAM called the \textbf{OS Page Cache}. Crucially, Kafka runs on the JVM, where caching millions of message objects inside Java heap memory wastes RAM on object headers and triggers long Stop-The-World garbage collection pauses. Instead, Kafka writes raw sequential bytes to files and lets the Linux Page Cache hold hot data in RAM with zero JVM GC overhead.
+
+\subsection{Traditional \texttt{read()}/\texttt{write()} vs. \texttt{sendfile(2)} Zero-Copy}
+
+Hardware controllers use \textbf{DMA (Direct Memory Access)} to transfer bytes between Disk/NIC and Kernel RAM without burning CPU cycles. Watch what happens when a traditional server reads a file from disk and sends it over a socket using standard \texttt{read()} followed by \texttt{write()} (Figure~\ref{fig:v4-ch05-zero-copy-comparison}, top):
+\begin{enumerate}[leftmargin=18pt]
+  \item \texttt{read()} context-switches to kernel; DMA copies bytes from Disk $\to$ OS Page Cache (Copy~1).
+  \item CPU copies bytes from Page Cache $\to$ User-Space buffer (Copy~2); context-switches back to user space.
+  \item \texttt{write()} context-switches to kernel; CPU copies bytes from User-Space buffer $\to$ Kernel Socket Buffer (Copy~3).
+  \item Context-switches back to user space while DMA copies Socket Buffer $\to$ NIC (Copy~4).
+\end{enumerate}
+That costs \textbf{4 context switches and 4 data copies} (two of them wasting CPU) even though the broker never modified a single byte!
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.82,
+  box/.style={rectangle, draw=headingblue, fill=codebg, thick, rounded corners=2pt, minimum width=2.3cm, minimum height=0.95cm, align=center, font=\sffamily\tiny}
+]
+  % Top: Traditional 4-copy
+  \node[anchor=west, font=\sffamily\bfseries\footnotesize, color=warningRed] at (0, 2.3) {(a) Traditional \texttt{read()} + \texttt{write()}: 4 Context Switches, 4 Copies (2 CPU Copies)};
+  \node[box] (d1) at (1.0, 1.3) {Disk};
+  \node[box, fill=exampleBg] (pc1) at (4.2, 1.3) {OS Page Cache\\(Kernel)};
+  \node[box, fill=warningBg] (usr1) at (7.4, 1.3) {App Buffer\\(User Space)};
+  \node[box, fill=exampleBg] (sk1) at (10.6, 1.3) {Socket Buffer\\(Kernel)};
+  \node[box] (nic1) at (13.8, 1.3) {NIC};
+
+  \draw[-{Stealth[scale=0.9]}, thick] (d1) -- node[above, font=\sffamily\tiny] {1. DMA} (pc1);
+  \draw[-{Stealth[scale=0.9]}, thick, color=warningRed] (pc1) -- node[above, font=\sffamily\tiny] {2. CPU Copy} (usr1);
+  \draw[-{Stealth[scale=0.9]}, thick, color=warningRed] (usr1) -- node[above, font=\sffamily\tiny] {3. CPU Copy} (sk1);
+  \draw[-{Stealth[scale=0.9]}, thick] (sk1) -- node[above, font=\sffamily\tiny] {4. DMA} (nic1);
+
+  % Bottom: Zero-copy sendfile
+  \node[anchor=west, font=\sffamily\bfseries\footnotesize, color=intuitionTeal] at (0, -0.3) {(b) Linux \texttt{sendfile(2)} Zero-Copy: 2 Context Switches, 2 DMA Copies (0 CPU Copies)};
+  \node[box] (d2) at (1.0, -1.3) {Disk};
+  \node[box, fill=intuitionBg] (pc2) at (5.0, -1.3) {OS Page Cache\\(Kernel)};
+  \node[box, fill=intuitionBg] (sk2) at (9.2, -1.3) {Socket Buffer\\(Descriptor Only)};
+  \node[box] (nic2) at (13.8, -1.3) {NIC};
+
+  \draw[-{Stealth[scale=0.9]}, thick] (d2) -- node[above, font=\sffamily\tiny] {1. DMA} (pc2);
+  \draw[-{Stealth[scale=0.9]}, thick, dashed, color=linkblue] (pc2) -- node[above, font=\sffamily\tiny] {Pointer + Length} (sk2);
+  \draw[-{Stealth[scale=0.9]}, thick, color=intuitionTeal] (pc2) to [bend right=24] node[below, font=\sffamily\tiny] {2. DMA Scatter-Gather directly to NIC} (nic2);
+  \draw[-{Stealth[scale=0.9]}, thick] (sk2) -- (nic2);
+\end{tikzpicture}
+\caption{Side-by-Side Comparison: Traditional 4-Copy Path vs. Kafka \texttt{sendfile(2)} Zero-Copy}
+\label{fig:v4-ch05-zero-copy-comparison}
+\end{figure}
+
+Kafka replaces \texttt{read()}+\texttt{write()} with the Linux \texttt{sendfile(2)} syscall (Figure~\ref{fig:v4-ch05-zero-copy-comparison}, bottom). Only a tiny descriptor (memory offset and byte count) is placed in the Socket Buffer, and the NIC reads directly from the OS Page Cache via DMA scatter-gather. Data never crosses into JVM user space---cutting CPU copies to \textbf{zero} (note: TLS encryption in user space prevents kernel zero-copy unless kernel TLS, \texttt{kTLS}, is enabled).
 
 \section{Apache Kafka Internals}
 
-Apache Kafka was designed by Jay Kreps, Neha Narkhede, and Jun Rao at LinkedIn in 2010. Rather than implementing the complex routing and destructive queue semantics of enterprise JMS brokers, Kafka models messaging as a distributed, partitioned, replicated append-only commit log.
+Designed at LinkedIn in 2010, Kafka models messaging as a distributed, partitioned, replicated append-only commit log.
 
-\subsection{The Commit Log and Storage Architecture}
+\subsection{Commit Log Segments and Sparse Index}
 
-A Kafka \textbf{Topic} is a logical category divided into one or more physical \textbf{Partitions}. A partition is an ordered, immutable sequence of records stored on disk as a directory:
+A Kafka \textbf{Topic} is split into ordered \textbf{Partitions}. On disk, each partition directory stores rolling $1\text{ GB}$ \textbf{segment files}:
 \begin{lstlisting}[language=bash]
 /var/lib/kafka/data/orders-0/
-    00000000000000000000.log
-    00000000000000000000.index
-    00000000000000000000.timeindex
-    leader-epoch-checkpoint
+    00000000000000000000.log        # Records starting at offset 0
+    00000000000000000000.index      # Offset -> byte position sparse map
+    00000000000000000000.timeindex  # Timestamp -> offset sparse map
 \end{lstlisting}
 
 \begin{figure}[htbp]
 \centering
 \begin{tikzpicture}[
   scale=0.85,
-  box/.style={rectangle, draw=headingblue, fill=codebg, thick, rounded corners=2pt, minimum width=2.4cm, minimum height=1.0cm, align=center, font=\sffamily\footnotesize},
   entry/.style={rectangle, draw=exampleBlue, fill=exampleBg, thick, minimum width=1.1cm, minimum height=0.7cm, font=\sffamily\scriptsize}
 ]
-  \node[anchor=west, font=\sffamily\bfseries\footnotesize, color=headingblue] at (0, 2.2) {Segment 0000000000.log};
+  \node[anchor=west, font=\sffamily\bfseries\footnotesize, color=headingblue] at (0, 2.2) {Closed Segment 0000000000.log};
   \node[entry] (e0) at (0.6, 1.4) {Off: 0};
   \node[entry] (e1) at (1.8, 1.4) {Off: 1};
   \node[entry] (e2) at (3.0, 1.4) {Off: 2};
@@ -57,62 +116,26 @@ A Kafka \textbf{Topic} is a logical category divided into one or more physical \
   \node[entry, fill=intuitionBg] (e5) at (8.3, 1.4) {Off: 5};
   \node[entry, fill=gray!15] (e6) at (9.5, 1.4) {Append};
 
-  % Sparse index
   \draw[thick, dashed, color=gray!60] (0, 0.4) -- (11, 0.4);
   \node[anchor=west, font=\sffamily\bfseries\footnotesize, color=headingblue] at (0, 0.0) {Sparse Memory-Mapped Index (.index)};
 
   \node[rectangle, draw=hoodSlate, fill=hoodBg, font=\sffamily\tiny, align=center] at (1.8, -0.8) {Offset 0 $\to$ Pos 0};
-  \node[rectangle, draw=hoodSlate, fill=hoodBg, font=\sffamily\tiny, align=center] at (4.2, -0.8) {Offset 4096 $\to$ Pos 65536};
-  \node[rectangle, draw=hoodSlate, fill=hoodBg, font=\sffamily\tiny, align=center] at (7.5, -0.8) {Offset 8192 $\to$ Pos 131072};
+  \node[rectangle, draw=hoodSlate, fill=hoodBg, font=\sffamily\tiny, align=center] at (4.8, -0.8) {Offset 4096 $\to$ Pos 65536};
+  \node[rectangle, draw=hoodSlate, fill=hoodBg, font=\sffamily\tiny, align=center] at (8.2, -0.8) {Offset 8192 $\to$ Pos 131072};
 \end{tikzpicture}
 \caption{Kafka Segmented Commit Log and Sparse Memory-Mapped Index}
-\label{fig:kafka-segments}
+\label{fig:v4-ch05-kafka-segments}
 \end{figure}
 
+Rather than indexing every single message, Kafka writes an entry to \texttt{.index} roughly every $4\text{ KB}$ (\texttt{index.interval.bytes}). To fetch offset $4{,}120$, Kafka binary-searches the memory-mapped \texttt{.index} to find the nearest entry $\le 4{,}120$ (offset $4{,}096$ at byte $65{,}536$) and scans forward sequentially a few kilobytes inside the \texttt{.log} file.
+
+\subsection{Replication Topology: ISR, High Watermark, and KRaft}
+
+Every partition has one \textbf{Leader} broker handling reads/writes and zero or more \textbf{Follower} brokers pulling updates:
 \begin{itemize}[leftmargin=18pt]
-  \item \textbf{Segment Files}: Logs are divided into segments (default max size $1\text{ GB}$). When a segment reaches capacity, it is rolled to read-only, and a new active segment is created. This allows historical segments to be deleted or compacted efficiently without locking active writes.
-  \item \textbf{Sparse Index}: Kafka does not index every record. It maintains an index entry every $4\text{ KB}$ of log data (configurable via \texttt{index.interval.bytes}). To look up offset 500, Kafka executes a binary search over the memory-mapped \texttt{.index} file to find the nearest physical file position $\le 500$, then scans forward sequentially through the \texttt{.log} file.
-\end{itemize}
-
-\subsection{Kernel I/O Performance: Linux Page Cache and Zero-Copy}
-
-A prevalent misconception is that Kafka achieves its multi-gigabyte throughput by storing data entirely in memory. Kafka stores every message directly on the filesystem. Its high performance stems from two OS-level optimizations:
-
-\begin{enumerate}[leftmargin=18pt]
-  \item \textbf{Sequential Disk I/O}: Random disk I/O on magnetic HDDs takes $\sim 10\text{ ms}$ per seek; on NVMe SSDs it takes tens of microseconds. Sequential disk access achieves bandwidths comparable to main memory bus throughput ($500\text{ MB/s}$ on HDD, $>3\text{ GB/s}$ on NVMe). Kafka writes logs strictly via append-only writes.
-  \item \textbf{OS Page Cache Utilization}: Kafka runs on the JVM. Rather than caching messages in Java heap memory (which incurs massive garbage collection pauses and doubles memory footprint due to object packaging), Kafka delegates all caching to the Linux kernel Page Cache.
-  \item \textbf{Zero-Copy Data Transfer via \texttt{sendfile(2)}}: When a consumer reads data, traditional servers perform four context switches and three memory copies. Kafka issues the Linux \texttt{sendfile()} system call:
-\end{enumerate}
-
-\begin{figure}[htbp]
-\centering
-\begin{tikzpicture}[
-  scale=0.85,
-  box/.style={rectangle, draw=headingblue, fill=codebg, thick, rounded corners=2pt, minimum width=2.6cm, minimum height=1.0cm, align=center, font=\sffamily\footnotesize}
-]
-  \node[box] (disk) at (0, 0) {Disk Storage};
-  \node[box, fill=exampleBg] (page) at (4, 0) {OS Page Cache\\(Kernel Space)};
-  \node[box, fill=intuitionBg] (nic) at (8, 0) {Socket Buffer\\(Kernel Space)};
-  \node[box] (net) at (12, 0) {NIC / Network};
-
-  \draw[-{Stealth[scale=1.0]}, thick] (disk) -- node[above, font=\sffamily\tiny] {DMA Copy} (page);
-  \draw[-{Stealth[scale=1.0]}, thick, color=linkblue] (page) -- node[above, font=\sffamily\tiny] {Zero-Copy Descriptor} (nic);
-  \draw[-{Stealth[scale=1.0]}, thick] (nic) -- node[above, font=\sffamily\tiny] {DMA Copy} (net);
-
-  \node[anchor=north, font=\sffamily\footnotesize, color=warningRed] at (6, -1.2) {\textbf{Zero CPU memory copies into user space!} Data never touches JVM heap.};
-\end{tikzpicture}
-\caption{Linux Zero-Copy \texttt{sendfile(2)} Execution Path in Kafka}
-\label{fig:zero-copy}
-\end{figure}
-
-\subsection{Replication Topology: ISR and High Watermark}
-
-Each partition has one designated \textbf{Leader} broker and zero or more \textbf{Follower} brokers.
-
-\begin{itemize}[leftmargin=18pt]
-  \item \textbf{In-Sync Replicas (ISR)}: The set of replicas that are actively caught up with the leader. If a follower fails to fetch messages within \texttt{replica.lag.time.max.ms} (default 30 seconds), the leader ejects it from the ISR.
-  \item \textbf{Log End Offset (LEO)}: The offset of the next record to be written in a broker's partition log.
-  \item \textbf{High Watermark (HW)}: The highest offset replicated across \textbf{all} brokers in the ISR. Consumers can only read messages up to the High Watermark.
+  \item \textbf{In-Sync Replicas (ISR)}: Followers caught up within \texttt{replica.lag.time.max.ms} (default $30\text{ s}$).
+  \item \textbf{Log End Offset (LEO)}: Offset of the next record to be appended on a replica.
+  \item \textbf{High Watermark (HW)}: The minimum LEO across all brokers in the ISR. Consumers are only allowed to read up to the High Watermark so they never observe uncommitted records that could vanish on leader failover.
 \end{itemize}
 
 \begin{figure}[htbp]
@@ -131,30 +154,92 @@ Each partition has one designated \textbf{Leader} broker and zero or more \textb
   \node[anchor=west, font=\sffamily\footnotesize, color=headingblue] at (8.5, 0) {High Watermark = $\min(\text{LEO}_{\text{ISR}}) = 8$};
 \end{tikzpicture}
 \caption{Kafka ISR Replication and High Watermark Calculation}
-\label{fig:kafka-hw}
+\label{fig:v4-ch05-kafka-hw}
 \end{figure}
 
-\begin{productionwarningbox}[The Danger of acks=1 vs. acks=all]
-In Kafka producer configuration:
-\begin{itemize}[leftmargin=12pt]
-  \item \texttt{acks=1}: The leader acknowledges the write as soon as it writes to its local log, without waiting for followers. If the leader crashes before followers fetch the record, the message is permanently lost.
-  \item \texttt{acks=all} (or \texttt{-1}) combined with \texttt{min.insync.replicas=2}: The write is only acknowledged once committed by both the leader and at least one follower in the ISR. This prevents silent data loss during leader failover.
+Historically, Kafka stored cluster topology and partition leaders in Apache ZooKeeper, capping clusters around $\sim 200{,}000$ partitions due to ZooKeeper memory reload times on failover. Under \textbf{KRaft} (Kafka Raft Metadata Mode, KIP-500), ZooKeeper is removed entirely: dedicated controller nodes run Raft consensus over an internal replicated log topic named \textbf{\texttt{\_\_cluster\_metadata}}, enabling millions of partitions and sub-second controller failovers.
+
+\subsection{Producer Batching and Kafka 3.0+ Idempotent Defaults}
+
+Sending one network packet per $200\text{-byte}$ JSON event wastes TCP overhead. Instead, Kafka producers accumulate records in RAM (\texttt{buffer.memory}, default $32\text{ MB}$) into per-partition batches. A sender thread dispatches a batch as soon as \emph{either}:
+\begin{enumerate}[leftmargin=18pt]
+  \item The batch reaches \texttt{batch.size} (default $16{,}384$ bytes), \textbf{or}
+  \item \texttt{linger.ms} expires (default $0\text{ ms}$; setting $10\text{--}20\text{ ms}$ lets batches fill cleanly under load).
+\end{enumerate}
+If records sit in the accumulator longer than \texttt{delivery.timeout.ms} (default $120{,}000\text{ ms}$) due to downstream slowness or uncompressed payloads saturating bandwidth, the producer raises \texttt{TimeoutException}.
+
+Since Kafka~3.0, producers enable \texttt{acks=all}, \texttt{enable.idempotence=true}, and \texttt{max.in.flight.requests.per.connection=5} by default. Why is \texttt{5} safe? Without idempotence, allowing 5 unacknowledged requests on the wire risks reordering if batch~1 fails and retries behind batch~2. With idempotence enabled, the producer stamps each batch with a monotonically increasing sequence number; the broker rejects out-of-order or duplicate sequences, giving both high pipelined throughput and strict per-partition ordering!
+
+\subsection{Consumer Groups and Rebalance Strategies}
+
+Within a single \textbf{Consumer Group}, Kafka guarantees that each partition is assigned to \textbf{at most one} consumer instance at a time (if you have 3 partitions and 4 workers, the 4th worker stays idle). When a worker joins, crashes, or misses its heartbeat, the group coordinator runs a partition reassignment (\textbf{rebalance}):
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{\texttt{RangeAssignor}} (eager): Assigns contiguous partition slices per topic (e.g., Topic~A partitions 0--1 to C1, 2 to C2). On rebalance, every consumer revokes all partitions and stops reading until reassignment completes (a stop-the-world stall).
+  \item \textbf{\texttt{RoundRobinAssignor}} (eager): Stripes partitions across consumers evenly across all subscribed topics, preventing skew when topics have few partitions, but still halts all consumers during rebalance.
+  \item \textbf{\texttt{CooperativeStickyAssignor}} (incremental): Keeps existing assignments intact and revokes \emph{only} the specific partitions that need to move to a new or surviving consumer. Unaffected partitions keep streaming with zero downtime.
 \end{itemize}
-\end{productionwarningbox}
 
-\subsection{KRaft: Consensus-Based Metadata (KIP-500)}
+\begin{lstlisting}[language=Python, caption={Kafka Idempotent Producer and Cooperative Consumer in Python (\texttt{confluent\_kafka})}]
+import json
+from confluent_kafka import Producer, Consumer
 
-Historically, Kafka relied on Apache ZooKeeper to store cluster metadata, elect partition leaders, and detect broker failures. ZooKeeper suffered from scaling bottlenecks: clusters were limited to $\sim 200{,}000$ partitions because failover required reloading massive ZNode trees into memory.
+# 1. Producer with batching, LZ4 compression, and Kafka 3.0+ safety defaults
+producer = Producer({
+    "bootstrap.servers": "kafka-1:9092,kafka-2:9092",
+    "acks": "all",
+    "enable.idempotence": True,
+    "max.in.flight.requests.per.connection": 5,
+    "compression.type": "lz4",
+    "batch.size": 65536,   # 64 KB batches
+    "linger.ms": 15,       # Wait up to 15ms to fill batch
+})
 
-Under \textbf{KRaft} (Kafka Raft Metadata Mode), ZooKeeper is entirely removed. Metadata is stored in an internal, high-throughput replicated Raft topic named \texttt{@metadata}. Dedicated controller nodes execute the Raft consensus protocol, enabling clusters to scale to millions of partitions with near-instantaneous leader election failovers.
+order = {"order_id": "ord-501", "account_id": "acct-9", "amount": 120.0}
+producer.produce(
+    topic="orders",
+    key=order["account_id"].encode("utf-8"),
+    value=json.dumps(order).encode("utf-8"),
+)
+producer.flush(timeout=5.0)
+
+# 2. Consumer with CooperativeStickyAssignor and manual offset commit
+consumer = Consumer({
+    "bootstrap.servers": "kafka-1:9092,kafka-2:9092",
+    "group.id": "billing-workers",
+    "auto.offset.reset": "earliest",
+    "enable.auto.commit": False,
+    "partition.assignment.strategy": "cooperative-sticky",
+})
+consumer.subscribe(["orders"])
+
+msg = consumer.poll(timeout=1.0)
+if msg is not None and not msg.error():
+    payload = json.loads(msg.value().decode("utf-8"))
+    # Process payload idempotently in DB first, then commit offset
+    consumer.commit(message=msg, asynchronous=False)
+\end{lstlisting}
+
+\textbf{Step-by-step walkthrough:}
+\begin{enumerate}[leftmargin=18pt]
+  \item Lines~5--13 configure the producer to require ISR quorum confirmation (\texttt{acks="all"}), prevent retry duplicates/reordering (\texttt{enable.idempotence=True} with \texttt{max.in.flight=5}), compress batches with LZ4, and buffer up to $64\text{ KB}$ or $15\text{ ms}$.
+  \item Lines~15--21 key the message by \texttt{"acct-9"}. Kafka hashes the key (\texttt{murmur2(key) \% num\_partitions}) so all events for \texttt{acct-9} always land on the same partition in strict chronological order; \texttt{flush()} blocks until the broker ISR acknowledges.
+  \item Lines~24--32 create a consumer in group \texttt{"billing-workers"} disabling auto-commit (so offsets never advance before DB writes succeed) and enabling \texttt{"cooperative-sticky"} incremental rebalancing.
+  \item Lines~34--38 poll one record, decode the JSON order, and call synchronous \texttt{commit(message=msg)} only \emph{after} processing completes, enforcing at-least-once semantics.
+\end{enumerate}
 
 \section{RabbitMQ Internals}
 
-Developed by Rabbit Technologies (now VMware), RabbitMQ is an implementation of the Advanced Message Queuing Protocol (AMQP 0-9-1) written in Erlang.
+Written in Erlang/OTP and implementing the \textbf{AMQP 0-9-1} protocol, RabbitMQ excels at smart routing, task prioritization, and per-message acknowledgments rather than multi-day log retention.
 
-\subsection{AMQP 0-9-1 Messaging Model}
+\subsection{AMQP 0-9-1 Exchanges and Bindings}
 
-Unlike Kafka, where producers write directly to partitioned logs, RabbitMQ producers never write directly to queues. Producers publish messages to an \textbf{Exchange}. The exchange routes messages to bound \textbf{Queues} based on routing keys and exchange types:
+In RabbitMQ, producers never publish directly to queues. They publish to an \textbf{Exchange}, which evaluates rules called \textbf{Bindings} to route copies into one or more \textbf{Queues}:
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Direct}: Routes when the message's routing key equals the binding key exactly.
+  \item \textbf{Fanout}: Ignores routing keys; broadcasts copies to every bound queue.
+  \item \textbf{Topic}: Matches dot-separated words using \texttt{*} (exactly one word) and \texttt{\#} (zero or more words).
+  \item \textbf{Headers}: Routes using arbitrary key-value attributes in message headers.
+\end{enumerate}
 
 \begin{figure}[htbp]
 \centering
@@ -162,125 +247,150 @@ Unlike Kafka, where producers write directly to partitioned logs, RabbitMQ produ
   scale=0.85,
   p/.style={rectangle, draw=headingblue, fill=codebg, thick, rounded corners=2pt, minimum width=2.0cm, minimum height=1.0cm, align=center, font=\sffamily\footnotesize},
   ex/.style={circle, draw=exampleBlue, fill=exampleBg, thick, minimum size=1.8cm, align=center, font=\sffamily\footnotesize},
-  q/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, thick, rounded corners=2pt, minimum width=2.2cm, minimum height=0.9cm, align=center, font=\sffamily\footnotesize}
+  q/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, thick, rounded corners=2pt, minimum width=2.4cm, minimum height=0.9cm, align=center, font=\sffamily\footnotesize}
 ]
   \node[p] (prod) at (0, 0) {Producer};
   \node[ex] (exch) at (4, 0) {\textbf{Topic}\\Exchange};
-  \node[q] (q1) at (9, 1.5) {Queue A\\(\texttt{order.*})};
-  \node[q] (q2) at (9, -1.5) {Queue B\\(\texttt{*.eu})};
+  \node[q] (q1) at (9.2, 1.5) {Queue A\\(\texttt{order.*})};
+  \node[q] (q2) at (9.2, -1.5) {Queue B\\(\texttt{*.eu})};
 
   \draw[-{Stealth[scale=1.0]}, thick] (prod) -- node[above, font=\sffamily\tiny] {publish(\texttt{order.eu})} (exch);
-  \draw[-{Stealth[scale=1.0]}, thick, color=intuitionTeal] (exch) -- node[above, sloped, font=\sffamily\tiny] {Binding: \texttt{order.*}} (q1);
-  \draw[-{Stealth[scale=1.0]}, thick, color=intuitionTeal] (exch) -- node[below, sloped, font=\sffamily\tiny] {Binding: \texttt{*.eu}} (q2);
+  \draw[-{Stealth[scale=1.0]}, thick, color=intuitionTeal] (exch) -- node[above, sloped, font=\sffamily\tiny] {Matches \texttt{order.*}} (q1);
+  \draw[-{Stealth[scale=1.0]}, thick, color=intuitionTeal] (exch) -- node[below, sloped, font=\sffamily\tiny] {Matches \texttt{*.eu}} (q2);
 \end{tikzpicture}
 \caption{RabbitMQ AMQP 0-9-1 Topic Exchange Routing Topology}
-\label{fig:amqp-routing}
+\label{fig:v4-ch05-amqp-routing}
 \end{figure}
 
+\begin{lstlisting}[language=Python, caption={RabbitMQ Topic Exchange, Prefetch, and Manual Ack in Python (\texttt{pika})}]
+import json
+import pika
+
+conn = pika.BlockingConnection(pika.ConnectionParameters("rabbitmq-1"))
+ch = conn.channel()
+
+# Declare a durable topic exchange and queue, then bind with wildcard pattern
+ch.exchange_declare(exchange="orders_ex", exchange_type="topic", durable=True)
+ch.queue_declare(queue="eu_orders", durable=True, arguments={"x-queue-type": "quorum"})
+ch.queue_bind(queue="eu_orders", exchange="orders_ex", routing_key="order.*.eu")
+
+# Publish a persistent message matching "order.created.eu"
+ch.basic_publish(
+    exchange="orders_ex",
+    routing_key="order.created.eu",
+    body=json.dumps({"order_id": "ord-501"}).encode("utf-8"),
+    properties=pika.BasicProperties(delivery_mode=2),  # Persist to disk
+)
+
+# Consume safely with bounded prefetch backpressure
+ch.basic_qos(prefetch_count=50)
+method, props, body = ch.basic_get(queue="eu_orders", auto_ack=False)
+if method is not None:
+    data = json.loads(body.decode("utf-8"))
+    ch.basic_ack(delivery_tag=method.delivery_tag)
+conn.close()
+\end{lstlisting}
+
+\textbf{Step-by-step walkthrough:}
 \begin{enumerate}[leftmargin=18pt]
-  \item \textbf{Direct Exchange}: Routes messages to queues whose binding key exactly matches the message routing key.
-  \item \textbf{Fanout Exchange}: Ignores routing keys; clones and routes the message to every bound queue (Pub/Sub broadcast).
-  \item \textbf{Topic Exchange}: Performs wildcard routing using dot-delimited routing keys: \texttt{*} matches exactly one word; \texttt{\#} matches zero or more words.
-  \item \textbf{Headers Exchange}: Routes messages based on arbitrary key-value pairs in the message header rather than routing keys.
+  \item Lines~8--10 declare a durable topic exchange \texttt{orders\_ex}, a Raft-backed \texttt{quorum} queue \texttt{eu\_orders}, and a binding \texttt{order.*.eu} (note \texttt{*} matches one word, \texttt{created}).
+  \item Lines~13--18 publish \texttt{\{"order\_id": "ord-501"\}} with routing key \texttt{order.created.eu} and \texttt{delivery\_mode=2} (persistent on disk). The exchange matches \texttt{order.*.eu} and routes the message into \texttt{eu\_orders}.
+  \item Lines~21--25 bound unacked deliveries to 50 (\texttt{basic\_qos}), fetch the message with \texttt{auto\_ack=False}, parse the JSON, and send \texttt{basic\_ack(delivery\_tag)} so the queue deletes the message only after completion.
 \end{enumerate}
 
-\subsection{Erlang/OTP Actor Model and BEAM Scheduler}
+\subsection{Erlang BEAM Reductions, Mnesia, and Quorum Queues}
 
-RabbitMQ executes inside the Erlang BEAM virtual machine. In Erlang, every connection, channel, and queue is an isolated, lightweight \textbf{actor process}:
+RabbitMQ runs on the Erlang **BEAM** virtual machine, where every TCP connection, AMQP channel, and queue is an isolated lightweight **actor process** ($\sim 2.5\text{ KB}$ memory, sharing no state and communicating via async messages).
 \begin{itemize}[leftmargin=18pt]
-  \item Erlang processes share no memory; they communicate strictly by asynchronous message passing.
-  \item A single process requires only 309 words of memory ($\sim 2.5\text{ KB}$), allowing a single RabbitMQ node to run hundreds of thousands of concurrent queue and connection processes.
-  \item The BEAM scheduler runs preemptively: if a single queue process experiences high computational load (such as regex pattern matching on topic routes), the scheduler preempts it after 4,000 reductions, preventing CPU starvation for other queues.
+  \item \textbf{BEAM Reductions}: Rather than letting one busy queue monopolize a CPU core, the BEAM scheduler tracks work using \textbf{reductions} (an abstract counter roughly equal to one function call or built-in operation). After **4,000 reductions**, BEAM preempts the actor and schedules the next waiting actor---ensuring smooth tail latency across hundreds of thousands of queues.
+  \item \textbf{Mnesia}: Erlang's built-in distributed database stores cluster metadata (users, vhosts, exchanges, queue definitions, and binding rules) in RAM and on disk across broker nodes.
+  \item \textbf{Classic Mirrored Queues vs. Quorum Queues}: Legacy Classic Mirrored Queues used primary/mirror replication that silently dropped un-synced messages on crash and froze traffic during resynchronization. Modern **Quorum Queues** (RabbitMQ 3.8+, set via \texttt{x-queue-type: quorum}) implement **Raft consensus** per queue across an odd number of brokers ($3$ or $5$), surviving crashes with zero message loss and non-blocking catch-up.
 \end{itemize}
 
-\subsection{High Availability: Classic Mirrored Queues vs. Quorum Queues}
+\begin{realworldbox}[Diagnosing a Kafka Consumer Rebalance Storm]
+\textbf{Symptom:} A \texttt{billing-workers} deployment repeatedly logs \texttt{CommitFailedException} and consumer lag climbs to 500,000 messages while CPU sits below 20\%.\\
+\textbf{Sample Broker / Client Logs:}
+\begin{verbatim}
+[Consumer group=billing-workers] Member consumer-3-a81f exceeded max.poll.interval.ms
+(300000 ms) and was kicked out of the group. Triggering rebalance (generation 47 -> 48).
+CommitFailedException: Commit cannot be completed since the group has already rebalanced.
+\end{verbatim}
+\textbf{Root Cause \& Fix:} A slow downstream API call stalled a worker's loop for $>5\text{ minutes}$ between \texttt{poll()} calls, causing the coordinator to evict the worker and trigger an eager rebalance storm across the whole group. Lower \texttt{max.poll.records} (e.g., from 500 to 50) so each batch finishes well inside \texttt{max.poll.interval.ms}, switch to \texttt{CooperativeStickyAssignor}, and offload slow calls or set strict HTTP timeouts.
+\end{realworldbox}
 
-Historically, RabbitMQ provided high availability through \textbf{Classic Mirrored Queues}:
-\begin{itemize}[leftmargin=18pt]
-  \item A queue consisted of a primary master process and mirror processes on other cluster nodes.
-  \item When the primary crashed, an unsynchronized mirror was promoted, leading to silent message drops.
-  \item If a node rejoined, synchronizing the mirror blocked the queue, causing total traffic stalls.
-\end{itemize}
+\begin{tryityourselfbox}[Trace Partition Assignment and AMQP Wildcards]
+\begin{enumerate}[leftmargin=18pt]
+  \item Suppose Topic~T1 has 4 partitions ($P_0..P_3$) and Topic~T2 has 4 partitions ($P_0..P_3$). A consumer group has 2 workers ($C_1, C_2$) subscribed to both topics. List the exact partition assignment under \texttt{RangeAssignor} vs. \texttt{RoundRobinAssignor}. What happens if a 3rd worker $C_3$ joins under \texttt{RangeAssignor}?
+  \item Which of the following AMQP routing keys match a binding of \texttt{payments.\#.failed}: (a) \texttt{payments.failed}, (b) \texttt{payments.eu.card.failed}, (c) \texttt{payments.card.succeeded}?
+\end{enumerate}
+\end{tryityourselfbox}
 
-\textbf{Quorum Queues (RabbitMQ 3.8+)}:
-Quorum queues completely replace legacy mirroring with an implementation of the \textbf{Raft Consensus Algorithm}:
+\section{Summary \protect\& Key Takeaways}
 \begin{itemize}[leftmargin=18pt]
-  \item Every quorum queue forms an independent Raft consensus group across an odd number of brokers (e.g., 3 or 5).
-  \item Writes are acknowledged only after replication to a majority quorum of disks.
-  \item Leader election is automatic, non-blocking, and guarantees zero message loss.
-\end{itemize}
-
-\section{Summary \& Key Takeaways}
-\begin{itemize}[leftmargin=18pt]
-  \item Kafka is an append-only distributed commit log using sequential disk I/O, sparse indices, the Linux page cache, and \texttt{sendfile(2)} zero-copy memory transfers.
-  \item Kafka guarantees durability via In-Sync Replicas (ISR) and High Watermark (HW) bounds. Modern Kafka replaces ZooKeeper with KRaft (internal Raft consensus).
-  \item RabbitMQ implements the AMQP 0-9-1 standard, routing messages dynamically from Exchanges to Queues via Direct, Fanout, Topic, or Headers algorithms.
-  \item RabbitMQ leverages Erlang's lightweight actor model to support hundreds of thousands of concurrent queues with preemptive CPU scheduling.
-  \item Modern RabbitMQ HA relies on Raft-backed Quorum Queues, replacing legacy blocking Mirrored Queues.
+  \item Kafka pairs sequential disk appends, sparse \texttt{.index} binary search, the Linux OS Page Cache, and \texttt{sendfile(2)} zero-copy (2 DMA copies, 0 CPU copies) to deliver multi-GB/s throughput without JVM heap bloat.
+  \item Consumers only read up to the High Watermark ($\min(\text{LEO}_{\text{ISR}})$); KRaft replaces ZooKeeper with an internal Raft topic named \texttt{\_\_cluster\_metadata}.
+  \item Kafka 3.0+ defaults (\texttt{acks=all}, \texttt{enable.idempotence=true}, \texttt{max.in.flight=5}) plus \texttt{CooperativeStickyAssignor} maximize throughput without sacrificing order or triggering stop-the-world rebalances.
+  \item RabbitMQ routes messages through AMQP Exchanges (Direct, Fanout, Topic, Headers), stores topology in Mnesia, schedules actors preemptively via BEAM reductions (4,000 per slice), and achieves Raft-backed HA via Quorum Queues.
 \end{itemize}
 
 \section{Exercises}
 
-\subsection{Mechanics}
-Given a Kafka topic with 3 partitions and a consumer group consisting of 4 active worker instances:
+\subsection*{Exercise~\thechapter.1 (Mechanics): Partition Count vs. Consumer Scaling}
+Given a Kafka topic with 3 partitions and a consumer group with 4 active workers:
 \begin{enumerate}[leftmargin=18pt]
-  \item How many workers will actively consume data under the default \texttt{RangeAssignor}?
-  \item What happens to partition assignments if one active consumer crashes?
-  \item What is the purpose of the \texttt{CooperativeStickyAssignor}?
+  \item How many workers actively consume records under \texttt{RangeAssignor}?
+  \item What happens if one active worker crashes?
+  \item Why does \texttt{CooperativeStickyAssignor} prevent full-group processing stalls during that failover?
 \end{enumerate}
 
-\subsection{Debugging}
-A high-throughput telemetry service publishes sensor data to Kafka using Java \texttt{KafkaProducer}. Under peak traffic, the application throws:
+\subsection*{Exercise~\thechapter.2 (Debugging): Kafka Producer \texttt{TimeoutException}}
+A telemetry producer throws:
 \begin{lstlisting}[language=Java]
-org.apache.kafka.common.errors.TimeoutException: Expiring 48 record(s) for sensors-2:120000 ms has passed since batch creation
+org.apache.kafka.common.errors.TimeoutException: Expiring 48 record(s) for sensors-2: 120000 ms has passed since batch creation
 \end{lstlisting}
-The network is healthy and broker CPU is 15\%. Investigate \texttt{linger.ms}, \texttt{batch.size}, and \texttt{buffer.memory} to resolve the issue.
+Network links are healthy and broker CPU is 15\%. Explain how \texttt{buffer.memory}, \texttt{batch.size}, \texttt{linger.ms}, \texttt{compression.type}, and \texttt{delivery.timeout.ms} interact to cause and fix this error.
 
-\subsection{Architecture}
-You are tasked with choosing between Apache Kafka and RabbitMQ for two distinct enterprise requirements:
+\subsection*{Exercise~\thechapter.3 (Architecture): Selecting Kafka vs. RabbitMQ}
+Justify choosing Kafka or RabbitMQ for:
 \begin{enumerate}[leftmargin=18pt]
-  \item A core banking transaction event backbone requiring 7-year event sourcing retention, strict account partition ordering, and real-time fraud detection stream processing.
-  \item A complex multi-step document rendering pipeline requiring priority task dispatch, individual task retries, routing to GPU vs. CPU rendering worker pools, and instant deletion upon delivery.
+  \item A core ledger event backbone needing 7-year replayable audit history, strict per-account ordering, and fraud-detection stream joins.
+  \item A multi-step PDF/video rendering dispatcher needing VIP priority queues, wildcard routing to GPU/CPU pools, and immediate deletion upon task completion.
 \end{enumerate}
-Justify the architectural selection for each workload.
+
+\subsection*{Exercise~\thechapter.4 (Try-It-Yourself Lab): Assignor Trace & AMQP Topic Matching}
+Solve both parts of the \emph{Try It Yourself} box above.
 
 \section{Detailed Solutions}
 
-\subsection{Solution to Mechanics Exercise}
+\subsection*{Solution to Exercise~\thechapter.1}
 \begin{enumerate}[leftmargin=18pt]
-  \item Because a partition can be consumed by at most one consumer instance within the same group at any given time, only \textbf{3 workers} will be assigned partitions. The 4th worker remains completely idle as an active standby.
-  \item If an active consumer crashes, the group coordinator detects the missing heartbeat, triggers a rebalance, and assigns the orphaned partition to the idle 4th worker.
-  \item In legacy eager rebalancing (\texttt{RangeAssignor}), all consumers revoke all assigned partitions and stop processing during the rebalance window (a stop-the-world stall). The \texttt{CooperativeStickyAssignor} performs incremental cooperative rebalances: consumers continue processing unaffected partitions, reassigning only the specific migrated partition.
+  \item At most one worker per partition in a group means \textbf{3 workers} consume partitions ($P_0, P_1, P_2$) while the 4th worker remains idle standby.
+  \item On crash, the coordinator detects missed heartbeats and reassigns the orphaned partition to the idle 4th worker.
+  \item Eager assignors revoke \emph{all} partitions from all workers before reassigning. \texttt{CooperativeStickyAssignor} keeps unaffected partitions running continuously and migrates only the single orphaned partition.
 \end{enumerate}
 
-\subsection{Solution to Debugging Exercise}
-\textbf{The Root Cause of Record Batch Expiration:}
-In the Kafka producer architecture, records are not sent immediately; they are accumulated into record batches in memory buffers (\texttt{buffer.memory}). A batch is dispatched when it either reaches \texttt{batch.size} (default $16\text{ KB}$) or when \texttt{linger.ms} expires.
-If producers generate messages faster than the I/O sender thread can drain them (e.g., uncompressed JSON payloads filling \texttt{buffer.memory}), records sit in accumulator queues waiting to be sent. If the time spent waiting in the queue exceeds \texttt{delivery.timeout.ms} (default $120\text{ seconds}$), the producer aborts the batch with a \texttt{TimeoutException}.
-\textbf{The Fix:}
-1. Enable producer compression: \texttt{compression.type=lz4} (reduces network payload size by 60--80\%).
-2. Increase batch size: \texttt{batch.size=65536} ($64\text{ KB}$) to maximize I/O throughput.
-3. Set \texttt{linger.ms=20} to allow batches to fill efficiently.
-4. If broker socket backpressure exists, increase \texttt{max.in.flight.requests.per.connection=5}.
+\subsection*{Solution to Exercise~\thechapter.2}
+Uncompressed JSON telemetry fills \texttt{buffer.memory} faster than the sender thread can drain tiny $16\text{ KB}$ batches, leaving queued batches waiting past \texttt{delivery.timeout.ms} ($120\text{ s}$). Fix by enabling \texttt{compression.type=lz4} (shrinking payloads 60--80\%), raising \texttt{batch.size=65536}, setting \texttt{linger.ms=20}, and keeping \texttt{max.in.flight.requests.per.connection=5} with \texttt{enable.idempotence=true}.
 
-\subsection{Solution to Architecture Exercise}
-\textbf{Workload 1: Core Banking Transaction Backbone $\to$ Apache Kafka}
+\subsection*{Solution to Exercise~\thechapter.3}
 \begin{itemize}[leftmargin=18pt]
-  \item \textbf{Append-Only Immutable Log}: Kafka can store transactions indefinitely across tiered storage (S3/NVMe), meeting the 7-year legal audit retention requirement.
-  \item \textbf{Strict Ordering}: By using the \texttt{account\_id} as the partition key, Kafka guarantees that all credits, debits, and transfers for that account land on the same partition in exact chronological order.
-  \item \textbf{Stream Processing}: Kafka integrates natively with Kafka Streams and Apache Flink for real-time stateful fraud detection sliding-window aggregations.
+  \item \textbf{Core Ledger $\to$ Apache Kafka}: Tiered append-only storage retains 7 years of immutable events; partitioning by \texttt{account\_id} guarantees strict per-account order; Kafka Streams/Flink processes sliding fraud windows natively.
+  \item \textbf{Rendering Dispatcher $\to$ RabbitMQ}: AMQP Topic exchanges route \texttt{render.gpu.*} vs. \texttt{render.cpu.*}; native priority queues (\texttt{x-max-priority}) let VIP jobs jump queues; destructive ACKs purge finished jobs immediately.
 \end{itemize}
 
-\textbf{Workload 2: Complex Document Rendering Pipeline $\to$ RabbitMQ}
-\begin{itemize}[leftmargin=18pt]
-  \item \textbf{Dynamic Routing}: AMQP Topic exchanges can route render requests to different queues based on routing keys (e.g., \texttt{render.gpu.pdf} vs \texttt{render.cpu.thumbnail}).
-  \item \textbf{Priority Queues}: RabbitMQ natively supports priority queues (\texttt{x-max-priority}), allowing VIP user documents to jump ahead of bulk batch jobs.
-  \item \textbf{Destructive Ephemeral Delivery}: Once a document is rendered, the job is ACKed and immediately purged from RAM, avoiding wasted disk storage.
-\end{itemize}
+\subsection*{Solution to Exercise~\thechapter.4}
+\begin{enumerate}[leftmargin=18pt]
+  \item Under \texttt{RangeAssignor} (assigned per topic): $C_1$ gets \texttt{T1-0, T1-1, T2-0, T2-1}; $C_2$ gets \texttt{T1-2, T1-3, T2-2, T2-3}. Under \texttt{RoundRobinAssignor}: identical 4/4 split here, though on 3 consumers ($C_1, C_2, C_3$) \texttt{RangeAssignor} skews heavily: $C_1$ gets 2 partitions per topic (\texttt{T1-0, T1-1, T2-0, T2-1} = 4 total) while $C_2$ and $C_3$ get only 2 total each! \texttt{RoundRobinAssignor} gives a balanced 3/3/2 split.
+  \item Since \texttt{\#} matches zero or more words: (a) \texttt{payments.failed} matches (0 words between), (b) \texttt{payments.eu.card.failed} matches (2 words between), (c) \texttt{payments.card.succeeded} does \emph{not} match.
+\end{enumerate}
 
-\section{Further Reading \& Citations}
+\begin{labbridgebox}[Event-Driven Outbox & Full Stack Broker Integration]
+Explore Kafka-style partitioned log delivery in \texttt{projects/p11-event-driven-microservices}, and inspect live RabbitMQ exchanges, queues, and worker consumption in \texttt{projects/p12-end-to-end-platform} (ports 5672/15672).
+\end{labbridgebox}
+
+\section{Further Reading \protect\& Citations}
 \begin{itemize}[leftmargin=18pt]
-  \item Kreps, J., Narkhede, N., \& Rao, J. (2011). \emph{Kafka: A distributed messaging system for log processing}. In Proceedings of the NetDB Workshop, 1--7.
+  \item Kreps, J., Narkhede, N., \& Rao, J. (2011). \emph{Kafka: A distributed messaging system for log processing}. NetDB Workshop, 1--7.
   \item Videla, A., \& Williams, J. (2012). \emph{RabbitMQ in Action: Distributed messaging for everyone}. Manning Publications.
   \item Armstrong, J. (2010). \emph{Erlang}. Communications of the ACM, 53(9), 68--75.
 \end{itemize}

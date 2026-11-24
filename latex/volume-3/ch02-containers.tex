@@ -1,0 +1,298 @@
+\chapter{Linux Kernel Primitives and Container Runtimes}
+\label{chap:containers}
+
+\begin{chaptergoalsbox}
+\textbf{What You Will Learn:}
+\begin{itemize}[leftmargin=12pt]
+  \item Operating system kernel foundations: processes, virtual memory (RSS vs.\ page cache), file descriptors, and system calls.
+  \item All eight Linux namespaces (\texttt{pid}, \texttt{net}, \texttt{mnt}, \texttt{ipc}, \texttt{uts}, \texttt{user}, \texttt{cgroup}, and \texttt{time}) and the syscalls (\texttt{clone}, \texttt{unshare}, \texttt{setns}) that create them.
+  \item Resource ceilings via \texttt{cgroups v2} (\texttt{cpu.max}, \texttt{memory.max}, \texttt{memory.high}) and Linux OOM killer scoring.
+  \item Union filesystems with \texttt{overlay2}: layer stacking, Copy-on-Write copy-up, and character-device deletion whiteouts.
+  \item Open Container Initiative (OCI) standards and the runtime chain: \texttt{containerd}, \texttt{containerd-shim}, and \texttt{runc}.
+\end{itemize}
+
+\textbf{What You Should Already Understand:}
+\begin{itemize}[leftmargin=12pt]
+  \item Basic experience building or running a container (\texttt{docker build}, \texttt{docker run}, or a \texttt{Dockerfile}).
+  \item No prior operating systems coursework is assumed; Section~\ref{sec:v3-ch02-kernel-primer} teaches processes, virtual memory, file descriptors, and syscalls from scratch.
+\end{itemize}
+
+\textbf{Why This Topic Exists:}
+Engineers who think of a container as a ``tiny virtual machine'' get blindsided in production: a container running a single process gets killed with exit code 137 even though \texttt{free -h} inside the container shows plenty of host RAM, or writing a large log file silently consumes disk space in an ephemeral layer. Every one of those behaviors comes straight from standard Linux kernel mechanics.
+
+\textbf{Motivating Practical Problem:}
+During an image-processing batch job, a containerized Python worker writes 900\,MB of temporary thumbnails to \texttt{/tmp} and immediately dies with exit code 137 (\texttt{OOMKilled}), even though the Python process itself only allocated 120\,MB of heap variables. Meanwhile, running \texttt{ps aux} inside a second container shows only PID~1, yet the host sees PID~29481. How does the Linux kernel isolate what a process sees, meter the memory it touches, and keep containers running even if the container daemon restarts?
+\end{chaptergoalsbox}
+
+\section{OS Kernel Primer: Processes, Memory, File Descriptors, and Syscalls}
+\label{sec:v3-ch02-kernel-primer}
+
+Before we unpack containers, we need a clear mental model of how Linux runs *any* program. 	extbf{There is no ``container'' object inside the Linux kernel.} A container is just a normal Linux process with blinders on and budgets attached.
+
+\subsection{User Space, Kernel Space, and System Calls}
+Linux splits memory and CPU privilege into two rings:
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{User Space:} Where your application code (Python, PHP, Go, Node.js) runs. User-space code cannot directly touch hardware disks, network cards, or other processes' memory.
+  \item \textbf{Kernel Space:} The privileged OS core that owns hardware, process tables, filesystems, and network stacks.
+\end{itemize}
+Whenever your program wants to read a file, open a network socket, or start a child process, it executes a \textbf{system call (syscall)}---a controlled trap into the kernel (e.g., \texttt{open()}, \texttt{read()}, \texttt{fork()}, \texttt{execve()}, \texttt{socket()}).
+
+\subsection{Processes and Virtual Memory: RSS vs.\ Page Cache}
+A \textbf{process} is a running instance of a program, tracked by a unique integer Process ID (PID) in the kernel's process table. The kernel gives every process its own 	extbf{virtual address space} so one process cannot read another process's variables. Physical RAM pages are mapped into that virtual space on demand in two distinct ways that matter enormously for containers:
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{RSS (Resident Set Size):} Anonymous RAM pages allocated directly by your application's heap and stack (for example, a Python \texttt{list} or a Java object array).
+  \item \textbf{Page Cache:} Whenever a process reads or writes a file on disk (such as our worker writing 900\,MB of thumbnails to \texttt{/tmp}), the Linux kernel caches those file blocks in RAM so future reads are fast. Crucially, \textbf{both RSS and kernel page cache allocated by a container count toward that container's memory budget!}
+\end{itemize}
+
+\subsection{File Descriptors (FDs)}
+In Unix and Linux, open files, network sockets, and terminal I/O streams are all represented by small non-negative integers called \textbf{file descriptors (FDs)}. Every new process inherits three standard FDs: \texttt{0} (\texttt{stdin}), \texttt{1} (\texttt{stdout}), and \texttt{2} (\texttt{stderr}). Understanding that \texttt{stdout}/\texttt{stderr} are just open pipe FDs explains why a background daemon holding those pipes is needed if we ever want to restart the container manager without killing running containers.
+
+\section{Linux Namespaces: Controlling What a Process Can See}
+
+If you launch two Python web servers on the same Linux host, both might try to bind TCP port 8080, read \texttt{/app/config.json}, or see each other in \texttt{ps aux}. \textbf{Linux namespaces} solve this by wrapping global kernel tables so each process group sees a private, isolated slice.
+
+\subsection{All Eight Linux Namespaces}
+Modern Linux (kernel 5.6+) provides exactly 	extbf{eight} namespaces:
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{llp{7.4cm}}
+\toprule
+\textbf{Namespace} & \textbf{Syscall Flag} & \textbf{Global Resource Isolated} \\
+\midrule
+\textbf{PID} & \texttt{CLONE\_NEWPID} & Process IDs. Inside the container, the entrypoint sees itself as PID~1; on the host, it holds a normal PID (e.g., 29481). \\
+\textbf{NET} & \texttt{CLONE\_NEWNET} & Network interfaces, IP addresses, routing tables, firewall rules, and TCP/UDP port tables. \\
+\textbf{MNT} & \texttt{CLONE\_NEWNS} & Filesystem mount points, isolating the container's root directory (\texttt{/}) via \texttt{pivot\_root}. \\
+\textbf{IPC} & \texttt{CLONE\_NEWIPC} & Inter-Process Communication: System V shared memory and POSIX message queues. \\
+\textbf{UTS} & \texttt{CLONE\_NEWUTS} & Hostname and NIS domain name (\texttt{hostname} inside differs from host). \\
+\textbf{USER} & \texttt{CLONE\_NEWUSER} & User and group IDs. Maps UID~0 (root) inside the container to an unprivileged UID (e.g., 100000) on the host. \\
+\textbf{CGROUP} & \texttt{CLONE\_NEWCGROUP} & Virtualized view of \texttt{/proc/self/cgroup} hiding the host's full cgroup tree. \\
+\textbf{TIME} & \texttt{CLONE\_NEWTIME} & Per-namespace offsets for \texttt{CLOCK\_MONOTONIC} and \texttt{CLOCK\_BOOTTIME} (Linux 5.6+), useful for container restore/testing. \\
+\bottomrule
+\end{tabular}
+\caption{The Eight Linux Kernel Namespaces}
+\label{tab:v3-ch02-namespaces}
+\end{table}
+
+\begin{intuitionbox}[Namespaces as One-Way Mirrors]
+Think of namespaces like one-way mirrors in a building. Inside the room (the PID namespace), the process sees only PID~1 and its own children. Outside the room (the host's root PID namespace), a system administrator can still see every single process inside the container under its real host PID (such as 29481) using standard \texttt{ps aux}.
+\end{intuitionbox}
+
+\subsection{The Three Namespace Syscalls: \texttt{clone}, \texttt{unshare}, and \texttt{setns}}
+Containers create and join namespaces through three syscalls:
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{\texttt{clone(fn, stack, flags, arg)}:} Creates a new child process while simultaneously minting fresh namespaces specified by bitwise flags (e.g., \texttt{CLONE\_NEWPID | CLONE\_NEWNET}).
+  \item \textbf{\texttt{unshare(flags)}:} Detaches an *already running* process from selected host namespaces into new ones.
+  \item \textbf{\texttt{setns(fd, nstype)}:} Joins an existing namespace by opening its kernel reference file under \texttt{/proc/<pid>/ns/<type>} (for instance, \texttt{/proc/29481/ns/net}). This is literally how \texttt{docker exec} and \texttt{kubectl exec} step inside a running container.
+\end{enumerate}
+
+\section{Resource Quotas and Limits: \texttt{cgroups v2}}
+
+Namespaces hide resources, but they do \emph{not} restrict consumption: a process inside a PID namespace can still burn 100\% of every CPU core or consume all physical RAM on the machine. 	extbf{Control Groups (cgroups)} enforce resource budgets.
+
+Modern Linux distributions (Ubuntu 22.04+, RHEL 9+, Debian 12+) use \textbf{\texttt{cgroups v2}}, a unified single-directory tree mounted at \texttt{/sys/fs/cgroup}. Every container receives its own directory—for example, \texttt{/sys/fs/cgroup/system.slice/docker-a91f.scope/}—containing plain-text control files that the kernel enforces directly.
+
+\subsection{Mapping a Concrete Container to \texttt{cgroups v2} Files}
+Suppose we launch a container \texttt{thumb-worker} with 2.0 CPUs and a 1\,GiB memory cap. The container runtime writes these exact strings into \texttt{thumb-worker}'s cgroup directory:
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{\texttt{cpu.max} = \texttt{"200000 100000"}:} Governs the Linux \textbf{Completely Fair Scheduler (CFS)} bandwidth quota in microseconds (\texttt{\$QUOTA \$PERIOD}). Every $100{,}000\,\mu\text{s}$ ($100\text{ms}$), all threads in this cgroup combined may run for at most $200{,}000\,\mu\text{s}$ ($200\text{ms}$), which equals $200{,}000 / 100{,}000 = \mathbf{2.0\text{ CPU cores}}$. If 4 threads burn CPU concurrently, they exhaust the $200\text{ms}$ budget in $50\text{ms}$ of wall time and are \emph{throttled} (paused, not killed) until the next $100\text{ms}$ window opens.
+  \item \textbf{\texttt{memory.max} = \texttt{"1073741824"}:} Hard ceiling of $1{,}073{,}741{,}824$ bytes ($1\text{ GiB}$). Remember our OS primer: the kernel compares \texttt{memory.current} (which sums 	extbf{RSS + file page cache}) against \texttt{memory.max}. If writing 900\,MB of thumbnails plus 150\,MB of RSS pushes past 1\,GiB and the kernel cannot flush/reclaim page cache fast enough, the 	extbf{cgroup OOM Killer} kills the process with \texttt{SIGKILL} (signal 9 $\implies$ exit code $128 + 9 = \mathbf{137}$).
+  \item \textbf{\texttt{memory.high} = \texttt{"858993459"}:} Soft memory throttle (here 80\% of 1\,GiB). Crossing \texttt{memory.high} slows allocations and triggers gentle background page reclaim before hitting the fatal \texttt{memory.max} wall.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.9, every node/.style={scale=0.9},
+  node distance=1.0cm and 1.4cm,
+  proc/.style={rectangle, draw=exampleBlue, fill=exampleBg, rounded corners=2pt, text width=3.6cm, minimum height=1.1cm, align=center, font=\sffamily\scriptsize\bfseries},
+  ns/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, text width=3.8cm, minimum height=1.1cm, align=center, font=\sffamily\scriptsize\bfseries},
+  cg/.style={rectangle, draw=warningRed, fill=warningBg, rounded corners=2pt, text width=4.2cm, minimum height=1.1cm, align=center, font=\sffamily\scriptsize\bfseries},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=headingblue}
+]
+\node[proc] (p_host) {Host Process Table\\PID 29481 (\texttt{python3})\\PID 29482 (worker thread)};
+\node[ns, right=1.4cm of p_host] (ns_pid) {PID Namespace\\Inside sees PID 1, PID 2\\(One-way visibility wall)};
+\node[cg, below=1.0cm of ns_pid] (cg_mem) {\texttt{cgroups v2} Budgets\\\texttt{cpu.max: 200000 100000}\\\texttt{memory.max: 1073741824}};
+
+\draw[arrow] (p_host) -- node[above, font=\tiny\sffamily]{\texttt{CLONE\_NEWPID}} (ns_pid);
+\draw[arrow] (ns_pid) -- node[left, font=\tiny\sffamily]{Metered by} (cg_mem);
+\end{tikzpicture}
+\caption{Container Isolation = Linux Namespaces (Visibility) + \texttt{cgroups v2} (Quotas)}
+\label{fig:v3-ch02-ns-cgroups}
+\end{figure}
+
+\subsection{OOM Killer Scoring and JVM Container Awareness}
+When the kernel must free memory (either inside a cgroup hitting \texttt{memory.max} or across the whole host node), it ranks candidate processes using an \texttt{oom\_score} adjusted by \texttt{/proc/<pid>/oom\_score\_adj} ($-1000$ to $+1000$). Processes with $+1000$ are killed first; $-997$ is nearly immune.
+
+\begin{realworldbox}[Why Omitting \texttt{limits.memory} Still Breaks Java 17]
+\textbf{Symptom:} A securities service running OpenJDK 17 in a container is suddenly killed by the \emph{host} kernel OOM killer (\texttt{dmesg}: \texttt{Out of memory: Killed process 41822 (java), score 1000}) even though the 256\,GiB worker node has no cgroup limit set on the pod.
+
+\textbf{Root Cause (Pre-Java-10 vs.\ Java 17):}
+\begin{itemize}[leftmargin=12pt]
+  \item \emph{Pre-Java-10 (early Java 8):} The JVM ignored cgroup limits completely and always read host \texttt{/proc/meminfo}, so it over-allocated even \emph{when} \texttt{memory.max} was set.
+  \item \emph{Java 10 through Java 17+:} The JVM enables \texttt{-XX:+UseContainerSupport} by default and reads \texttt{/sys/fs/cgroup/memory.max}, sizing its max heap to ~25\% of that limit. However, when engineers \textbf{omit} \texttt{resources.limits.memory} in Kubernetes, \texttt{memory.max} is literally \texttt{"max"} (unlimited). Java 17 therefore falls back to the \emph{node's physical RAM} (256\,GiB $\to$ 64\,GiB heap ceiling!). Combined with native off-heap buffers and an unset limit giving the pod \texttt{BestEffort} status (\texttt{oom\_score\_adj = 1000}), the first memory spike makes the host OOM killer terminate Java mid-request.
+\end{itemize}
+\textbf{Fix:} Always set explicit container memory limits matching your runtime's heap budget (e.g., \texttt{limits.memory: 4Gi} with \texttt{-XX:MaxRAMPercentage=75.0}).
+\end{realworldbox}
+
+\section{Union Filesystems: The \texttt{overlay2} Storage Driver}
+
+Every container image shares a base operating system (such as Alpine or Debian). Rather than copying a 500\,MB root filesystem on disk for every container start, Linux stacks read-only image layers beneath one tiny writable layer using \textbf{\texttt{overlay2}}.
+
+\subsection{Layer Stacking and Copy-on-Write (CoW)}
+OverlayFS combines four directories (Figure~\ref{fig:v3-ch02-overlay2}):
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{\texttt{lowerdir}:} Immutable, read-only image layers shared across all containers using the same image.
+  \item \textbf{\texttt{upperdir}:} A private, empty read-write directory created for each individual container.
+  \item \textbf{\texttt{workdir}:} A scratch directory used by the kernel for atomic filesystem renames.
+  \item \textbf{\texttt{merged}:} The unified view mounted as the container's \texttt{/}.
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=0.8cm,
+  layer/.style={rectangle, draw=headingblue, fill=headingblue!5, rounded corners=2pt, text width=9.5cm, minimum height=0.7cm, align=center, font=\sffamily\footnotesize},
+  merged/.style={rectangle, draw=exampleBlue, fill=exampleBg, rounded corners=2pt, text width=9.5cm, minimum height=0.8cm, align=center, font=\sffamily\footnotesize\bfseries},
+  rw/.style={rectangle, draw=warningRed, fill=warningBg, rounded corners=2pt, text width=9.5cm, minimum height=0.7cm, align=center, font=\sffamily\footnotesize\bfseries},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=headingblue}
+]
+\node[merged] (m) {\texttt{merged} View: Unified Container \texttt{/} (\texttt{/bin}, \texttt{/app}, \texttt{/tmp})};
+\node[rw, below=0.55cm of m] (u) {\texttt{upperdir} (Read-Write): Copy-up edits, new files, and \texttt{0,0} whiteouts};
+\node[layer, below=0.55cm of u] (l2) {\texttt{lowerdir} Layer 2 (Read-Only): Application Code (\texttt{/app/worker.py})};
+\node[layer, below=0.35cm of l2] (l1) {\texttt{lowerdir} Layer 1 (Read-Only): Python Runtime (\texttt{/usr/local/bin/python3})};
+\node[layer, below=0.35cm of l1] (l0) {\texttt{lowerdir} Layer 0 (Read-Only): Base OS (Debian Slim)};
+
+\draw[arrow] (u) -- (m);
+\draw[arrow] (l2) -- (u);
+\draw[arrow] (l1) -- (l2);
+\draw[arrow] (l0) -- (l1);
+\end{tikzpicture}
+\caption{OverlayFS Layer Stacking Architecture in \texttt{overlay2}}
+\label{fig:v3-ch02-overlay2}
+\end{figure}
+
+Trace two concrete file operations inside \texttt{thumb-worker}:
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{Editing an existing file (Copy-up):} If the worker appends one line to \texttt{/etc/app.conf} (which lives in read-only \texttt{lowerdir}), the kernel pauses the \texttt{open(O\_WRONLY)} call, copies the \emph{entire} file up into \texttt{upperdir}, and edits the copy. Thus, appending 10 bytes to a 200\,MB SQLite file in a lower layer copies all 200\,MB into \texttt{upperdir}!
+  \item \textbf{Deleting an image file (Whiteout):} If the worker runs \texttt{rm /tmp/seed.dat} where \texttt{seed.dat} is in \texttt{lowerdir}, OverlayFS cannot modify the read-only layer. Instead, it creates a special zero-byte 	extbf{character device with major/minor numbers \texttt{0,0}} named \texttt{/tmp/seed.dat} inside \texttt{upperdir}. When OverlayFS renders \texttt{merged}, that \texttt{0,0} whiteout hides the lower file.
+\end{itemize}
+
+\section{OCI Standards and the Container Runtime Stack}
+
+The \textbf{Open Container Initiative (OCI)} defines two portable specifications: the \textbf{OCI Image Spec} (content-addressed SHA-256 layer tarballs + JSON manifest) and the \textbf{OCI Runtime Spec} (\texttt{config.json} describing namespaces, cgroup limits, mounts, and the entrypoint binary).
+
+\subsection{Why \texttt{containerd-shim} Sits Between \texttt{containerd} and \texttt{runc}}
+When an orchestrator asks to start a container, execution passes down a clean chain (Figure~\ref{fig:v3-ch02-runtime-stack}):
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{\texttt{containerd}:} Long-lived daemon that pulls OCI image layers over HTTPS, unpacks them into \texttt{overlay2} snapshots, and manages container lifecycle.
+  \item \textbf{\texttt{containerd-shim}:} A tiny per-container supervisor process spawned by \texttt{containerd}.
+  \item \textbf{\texttt{runc}:} The low-level OCI runtime CLI. \texttt{runc} reads \texttt{config.json}, calls \texttt{clone()} to build the 8 namespaces, writes \texttt{cgroups v2} limits, executes \texttt{pivot\_root} into \texttt{merged}, starts your application entrypoint, and \textbf{immediately exits}.
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=0.8cm,
+  comp/.style={rectangle, draw=headingblue, fill=headingblue!5, rounded corners=2pt, text width=10.2cm, minimum height=0.75cm, align=left, inner sep=6pt, font=\sffamily\footnotesize},
+  highlight/.style={rectangle, draw=exampleBlue, fill=exampleBg, rounded corners=2pt, text width=10.2cm, minimum height=0.75cm, align=left, inner sep=6pt, font=\sffamily\footnotesize},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=headingblue}
+]
+\node[comp] (cd) {\textbf{\texttt{containerd}}: High-level daemon pulling OCI images and managing snapshots.};
+\node[highlight, below=0.5cm of cd] (shim) {\textbf{\texttt{containerd-shim}}: Per-container lightweight parent; holds \texttt{stdin}/\texttt{stdout}/\texttt{stderr} FDs open.};
+\node[comp, below=0.5cm of shim] (runc) {\textbf{\texttt{runc}}: Short-lived CLI; sets namespaces, \texttt{cgroups v2}, \texttt{pivot\_root}, starts PID~1, then exits.};
+\node[highlight, below=0.5cm of runc] (proc) {\textbf{Container Process (PID~1 inside NS)}: Reparented to \texttt{containerd-shim}; survives \texttt{containerd} restarts.};
+
+\draw[arrow] (cd) -- (shim);
+\draw[arrow] (shim) -- (runc);
+\draw[arrow] (runc) -- (proc);
+\end{tikzpicture}
+\caption{OCI Container Runtime Execution Chain}
+\label{fig:v3-ch02-runtime-stack}
+\end{figure}
+
+Because \texttt{runc} exits right after launching your application, the application is reparented to \texttt{containerd-shim}. Holding the container's open file descriptors (\texttt{0/1/2}) and capturing its exit code inside the shim allows platform engineers to upgrade or restart \texttt{containerd} on a live server with zero running-container downtime.
+
+\begin{underthehoodbox}[Inspecting Live Namespaces and OCI \texttt{config.json}]
+On any Linux host running containers, you can verify both layers directly:
+\begin{lstlisting}[language=bash]
+# 1. Inspect the kernel namespace IDs of host PID 29481
+sudo ls -l /proc/29481/ns/
+# Output shows inode links like pid:[4026532814], net:[4026532817]
+
+# 2. Compare against host PID 1 (different inode numbers = isolated!)
+sudo ls -l /proc/1/ns/
+\end{lstlisting}
+Two processes share a namespace if and only if their \texttt{/proc/<pid>/ns/<type>} symlinks point to the exact same inode number.
+\end{underthehoodbox}
+
+\begin{tryityourselfbox}[Tracing Namespaces and Page Cache Limits]
+Complete these two diagnostic tasks before checking the solutions:
+\begin{enumerate}[leftmargin=12pt]
+  \item On a Linux machine (or VM), run \texttt{sudo unshare --uts --pid --mount --fork /bin/sh} and inside that shell run \texttt{echo \$\$} and \texttt{ls -l /proc/\$\$/ns/pid}. Compare the PID and namespace inode number against a second host terminal. Why does \texttt{ps aux} inside the new shell still show host processes unless you remount \texttt{/proc}?
+  \item Suppose a container has \texttt{memory.max = 536870912} (512\,MiB) and no disk swap. Its Python process uses 80\,MiB of RSS and writes a 480\,MiB file into an \texttt{overlay2} \texttt{upperdir} (which stays cached in page cache under heavy write pressure) or into a \texttt{tmpfs} RAM mount. Predict what happens to \texttt{memory.current} and why.
+\end{enumerate}
+\end{tryityourselfbox}
+
+\begin{labbridgebox}[Hardened Container Image in Project 8]
+Examine \texttt{projects/p08-azure-secure-app/Dockerfile} to see how multi-stage builds reduce \texttt{lowerdir} image bloat and configure an unprivileged runtime user (\texttt{appuser}, UID 10001) so the container never runs as root inside its user namespace. In Chapter~\ref{chap:kubernetes}, we deploy and orchestrate these containers across a cluster with Kubernetes.
+\end{labbridgebox}
+
+\section{Chapter Summary \protect\& Key Takeaways}
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{Kernel Reality:} Containers are standard Linux processes bounded by namespaces (visibility) and \texttt{cgroups v2} (resource budgets).
+  \item \textbf{Eight Namespaces:} \texttt{pid}, \texttt{net}, \texttt{mnt}, \texttt{ipc}, \texttt{uts}, \texttt{user}, \texttt{cgroup}, and \texttt{time} (\texttt{CLONE\_NEWTIME}), managed via \texttt{clone}, \texttt{unshare}, and \texttt{setns}.
+  \item \textbf{\texttt{cgroups v2}:} Unified tree at \texttt{/sys/fs/cgroup}. \texttt{cpu.max} controls CFS CPU throttling; \texttt{memory.max} caps RSS + page cache and triggers OOM kill (exit 137) when breached.
+  \item \textbf{\texttt{overlay2}:} Stacks immutable \texttt{lowerdir} image layers under a per-container \texttt{upperdir}; edits trigger whole-file copy-up and deletions create \texttt{0,0} whiteout files.
+  \item \textbf{OCI Stack:} \texttt{containerd} $\to$ \texttt{containerd-shim} (FD/exit-code holder) $\to$ \texttt{runc} (setup + exit).
+\end{itemize}
+
+\section{Exercises}
+
+\subsection{Mechanics}
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Exercise~\thechapter.1:} A container's \texttt{cpu.max} file contains \texttt{350000 100000}. Calculate the equivalent CPU limit in Kubernetes millicores. If three CPU-bound threads inside this cgroup compete concurrently, how many cores does each receive?
+  \item \textbf{Exercise~\thechapter.2:} An image layer (\texttt{lowerdir}) contains a 400\,MB dataset file \texttt{/data/seed.bin} and a 10\,MB config \texttt{/etc/seed.conf}. Inside a running container, a script appends 1 byte to \texttt{/data/seed.bin} and runs \texttt{rm /etc/seed.conf}. How much new space/metadata is created inside \texttt{upperdir}, and what appears in \texttt{upperdir} for \texttt{seed.conf}?
+\end{enumerate}
+
+\subsection{Debugging}
+\begin{enumerate}[leftmargin=18pt]
+  \setcounter{enumi}{2}
+  \item \textbf{Exercise~\thechapter.3:} A Java 17 microservice runs inside a container on a 128\,GiB Linux host with \emph{no} \texttt{memory.max} cgroup limit configured. Under load, the process grows to 40\,GiB and is killed with exit code 137 even though \texttt{dmesg} shows no cgroup limit breach. Explain why Java 17's cgroup awareness did not save it, and how \texttt{oom\_score\_adj} factored into the kernel's target selection.
+\end{enumerate}
+
+\subsection{Architecture}
+\begin{enumerate}[leftmargin=18pt]
+  \setcounter{enumi}{3}
+  \item \textbf{Exercise~\thechapter.4:} Design a multi-stage container build and runtime cgroup policy for a memory-sensitive Go API service that processes 50\,MB file uploads. Specify how you prevent \texttt{upperdir} disk bloat, prevent page-cache write spikes from triggering unexpected OOM kills, and run the entrypoint without root privileges.
+\end{enumerate}
+
+\section{Detailed Solutions}
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Solution~\thechapter.1 (Mechanics):}\\
+  \texttt{350000 100000} allows $350{,}000\,\mu\text{s}$ per $100{,}000\,\mu\text{s}$ period:
+  \begin{equation*}
+  \frac{350{,}000}{100{,}000} = 3.5\text{ CPU cores} = \mathbf{3{,}500\text{ millicores (3500m)}}.
+  \end{equation*}
+  CFS splits bandwidth equally among the three active threads: $3.5 / 3 \approx \mathbf{1.167\text{ cores}}$ ($33.3\%$ of the cgroup's quota) each.
+
+  \item \textbf{Solution~\thechapter.2 (Mechanics):}\\
+  Appending 1 byte to \texttt{/data/seed.bin} triggers an OverlayFS 	extbf{copy-up}: the kernel copies the entire 400\,MB file from \texttt{lowerdir} into \texttt{upperdir} before writing the 1 byte ($\sim 400\text{ MB}$ consumed in \texttt{upperdir}). Deleting \texttt{/etc/seed.conf} creates a zero-byte character-device 	extbf{whiteout} file (\texttt{0,0}) in \texttt{upperdir} that hides the lower-layer file in the \texttt{merged} view.
+
+  \item \textbf{Solution~\thechapter.3 (Debugging):}\\
+  Java 17's \texttt{UseContainerSupport} reads \texttt{/sys/fs/cgroup/memory.max}. Because no memory limit was configured, \texttt{memory.max} equals \texttt{max}, causing Java 17 to inspect the host's 128\,GiB physical RAM and set a ~32\,GiB default heap ceiling (plus native/metaspace allocations pushing total RSS past 40\,GiB). When total host memory came under pressure, the global Linux OOM killer selected the process with the highest \texttt{oom\_score} (large RSS combined with an unprivileged/BestEffort \texttt{oom\_score\_adj} near $+1000$) and terminated it with \texttt{SIGKILL} (exit code $128+9 = 137$).
+
+  \item \textbf{Solution~\thechapter.4 (Architecture):}\\
+  Use a multi-stage \texttt{Dockerfile} compiling the static Go binary in a builder stage and copying only the binary into a minimal \texttt{distroless} or non-root image running as UID 10001. Mount a dedicated volume (or bounded \texttt{emptyDir} with a size limit) at \texttt{/tmp/uploads} so temporary uploads never write into \texttt{overlay2} \texttt{upperdir}. Set explicit \texttt{memory.high} (e.g., 80\% of \texttt{memory.max}) and \texttt{memory.max} (e.g., 512\,MiB) along with Go's \texttt{GOMEMLIMIT=384MiB} so garbage collection runs aggressively before RSS + page cache can breach \texttt{memory.max}.
+
+  \item \textbf{Try-It-Yourself Verification:}\\
+  (1) Inside the new shell, \texttt{echo \$\$} prints \texttt{1} (isolated PID namespace) and \texttt{/proc/\$\$/ns/pid} shows a different inode from the host's \texttt{/proc/1/ns/pid}. However, \texttt{ps aux} reads \texttt{/proc}, which is still mounted from the host's PID namespace unless you pass \texttt{--mount-proc} (or run \texttt{mount -t proc proc /proc} inside the isolated mount namespace).\\
+  (2) If the 480\,MiB file lives in a \texttt{tmpfs} mount (or dirty page cache cannot be reclaimed fast enough under memory pressure), $80\text{ MiB} + 480\text{ MiB} = 560\text{ MiB} > 512\text{ MiB}$, driving \texttt{memory.current} above \texttt{memory.max} and triggering an immediate cgroup OOM kill (exit 137).
+\end{enumerate}
+
+\section{Further Reading \protect\& Citations}
+\begin{itemize}[leftmargin=15pt]
+  \item Kerrisk, M. \emph{The Linux Programming Interface}. No Starch Press, 2010.
+  \item Linux Kernel Documentation. \emph{Control Group v2} and \emph{Overlay Filesystem}, \texttt{kernel.org/doc}.
+  \item Open Container Initiative. \emph{OCI Runtime and Image Specifications}, \texttt{opencontainers.org}.
+\end{itemize}

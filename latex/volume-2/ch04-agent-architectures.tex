@@ -1,0 +1,448 @@
+\chapter{Agent Architectures and Orchestration: ReAct, Planning, and Multi-Agent Systems}
+\label{chap:agents}
+
+\begin{chaptergoalsbox}
+\textbf{What You Will Learn:}
+\begin{itemize}[leftmargin=15pt]
+  \item Cognitive agent patterns starting from a concrete multi-turn ReAct trace: ReAct, Plan-and-Solve, and Reflexion.
+  \item Tool-calling wire protocols: JSON Schema (Draft 2020-12), Pydantic validation, and exception feedback loops.
+  \item Deterministic execution guards: canonical JSON loop detection, step/token ceilings, and output truncation.
+  \item Expression sandboxing with Python's Abstract Syntax Tree (\texttt{ast}) and why \texttt{eval()} is never safe.
+  \item Multi-agent topologies: Supervisor-Worker context isolation and peer-review validation.
+\end{itemize}
+
+\textbf{What You Should Already Understand:}
+\begin{itemize}[leftmargin=15pt]
+  \item Python functions, dictionaries, exceptions, and JSON strings.
+  \item Basic HTTP request/response concepts and status codes.
+\end{itemize}
+
+\textbf{Why This Topic Exists:}
+A standalone LLM prompt can draft text, but it cannot check a database, inspect pod logs, or open a pull request. Turning an LLM into an \textbf{agent} means wiring it into a loop where it calls external tools and reacts to real outputs. Without strict input validation, loop detection, sandboxing, and token budgets, autonomous agents hallucinate arguments, spin in infinite retry loops, or execute unsafe expressions.
+
+\textbf{Motivating Practical Problem:}
+A DevOps remediation agent is asked to diagnose a crashing Kubernetes service. It must inspect pod logs, confirm an Out-Of-Memory (OOM) exit code, read current Helm memory limits, propose a safe memory bump, and recover gracefully if the metrics API times out---all without burning \$500 in an accidental retry loop.
+\end{chaptergoalsbox}
+
+\section{Inside a Real ReAct Trace: Reason + Act}
+
+An AI \textbf{agent} is a loop that lets an LLM perceive its environment through \emph{tool outputs} and act upon that environment through \emph{tool calls}. Earlier prompt techniques either reasoned in isolation (Chain-of-Thought, which invents fake facts if it lacks live data) or fired tools blindly without checking intermediate errors.
+
+\textbf{ReAct} (Yao et al., 2022) interleaves internal reasoning (\textbf{Thought}), external invocation (\textbf{Action}), and real tool feedback (\textbf{Observation}):
+\begin{equation}
+\text{Thought}_t \longrightarrow \text{Action}_t \longrightarrow \text{Observation}_t \longrightarrow \text{Thought}_{t+1} \longrightarrow \dots
+\end{equation}
+
+Before inspecting any code, read an actual 3-turn ReAct transcript for our crashing Kubernetes service:
+\begin{quote}\small
+\textbf{User:} Why is \texttt{payments-api} restarting in \texttt{prod}, and how should we fix it?\\[4pt]
+\textbf{Thought 1:} I should inspect the pod termination status and recent logs in namespace \texttt{prod}.\\
+\textbf{Action 1:} \texttt{get\_pod\_status(namespace="prod", pod\_prefix="payments-api")}\\
+\textbf{Observation 1:} \texttt{\{"pod": "payments-api-7f9b", "restarts": 14, "last\_exit\_code": 137, "reason": "OOMKilled"\}}\\[4pt]
+\textbf{Thought 2:} Exit code 137 means the Linux kernel killed the container for exceeding its memory limit. I need to check the current Helm memory limit before suggesting a bump.\\
+\textbf{Action 2:} \texttt{read\_helm\_values(service="payments-api", key="resources.limits.memory")}\\
+\textbf{Observation 2:} \texttt{\{"resources.limits.memory": "512Mi", "peak\_observed\_rss": "508Mi"\}}\\[4pt]
+\textbf{Thought 3:} The service hit its 512Mi ceiling. Doubling the limit to 1024Mi provides headroom. No further tool calls are needed.\\
+\textbf{Final Answer:} \texttt{payments-api} is being \texttt{OOMKilled} (exit code 137) against a 512Mi limit. Recommend raising \texttt{resources.limits.memory} to \texttt{1024Mi}.
+\end{quote}
+
+Figure~\ref{fig:v2-ch04-react} shows this cyclic flow. Each \textbf{Observation} anchors the next \textbf{Thought} in ground-truth system state rather than guesswork.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node/.style={draw=headingblue, fill=codebg, rounded corners=2pt, font=\sffamily\scriptsize\bfseries, minimum width=3.3cm, minimum height=1.0cm, align=center},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=linkblue}
+]
+
+\node[node, fill=intuitionBg] (thought) at (0, 2) {1. Thought\\Reason about goal \& plan};
+\node[node, fill=exampleBg] (action) at (5.2, 2) {2. Action\\Emit JSON tool call};
+\node[node, fill=warningBg] (env) at (5.2, -0.2) {3. Environment\\Validate \& execute tool};
+\node[node, fill=gray!10] (obs) at (0, -0.2) {4. Observation\\Append result or error};
+
+\draw[arrow] (thought) -- (action);
+\draw[arrow] (action) -- (env);
+\draw[arrow] (env) -- (obs);
+\draw[arrow] (obs) -- (thought);
+
+\end{tikzpicture}
+\caption{The Cyclic ReAct (Reason + Act) Execution Loop.}
+\label{fig:v2-ch04-react}
+\end{figure}
+
+\subsection{Plan-and-Solve and Reflexion}
+ReAct is flexible, but over 15--20 steps an agent can suffer \emph{myopic drift}—forgetting its original objective while chasing a side error. Two complementary patterns address this:
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Plan-and-Solve} (Wang et al., 2023): Splits work into a \textbf{Planner} (which writes a numbered task DAG upfront) and an \textbf{Executor} (which completes each sub-task in order and re-plans only if an assumption breaks).
+  \item \textbf{Reflexion} (Shinn et al., 2023): When an attempt fails a test or API check (Figure~\ref{fig:v2-ch04-reflexion}), a separate reflection step writes a brief post-mortem into an episodic memory buffer (e.g., \emph{``I passed an ISO date string instead of an integer UNIX timestamp''}) so the next trial avoids repeating the same mistake.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw=headingblue, fill=codebg, rounded corners=2pt, font=\sffamily\scriptsize, minimum width=2.9cm, minimum height=0.95cm, align=center},
+  arrow/.style={-{Stealth[scale=0.8]}, thick, color=headingblue}
+]
+
+\node[box] (actor) at (0, 1.5) {Actor\\Generates trajectory};
+\node[box, fill=exampleBg] (eval) at (4.0, 1.5) {Evaluator\\Checks outcome};
+\node[box, fill=warningBg] (self) at (8.0, 1.5) {Self-Reflection\\Diagnoses error};
+\node[box, fill=intuitionBg] (mem) at (4.0, -0.45) {Episodic Memory\\Stores verbal lesson};
+
+\draw[arrow] (actor) -- (eval);
+\draw[arrow] (eval) -- (self);
+\draw[arrow] (self) |- (mem);
+\draw[arrow] (mem) -| (actor);
+
+\end{tikzpicture}
+\caption{Reflexion Architecture: Failed executions trigger verbal self-critiques stored in short-term episodic memory.}
+\label{fig:v2-ch04-reflexion}
+\end{figure}
+
+\section{Tool Calling Protocols and Validation Self-Correction}
+
+How does an LLM know what arguments a Python tool expects? A \textbf{JSON Schema} is a standard JSON document describing an object's allowed field names, types (\texttt{"string"}, \texttt{"integer"}), bounds (\texttt{minimum}, \texttt{maximum}), and \texttt{required} keys. Rather than hand-writing schemas, Pydantic v2 generates them automatically via \texttt{model\_json\_schema()}, which conforms to \textbf{JSON Schema Draft 2020-12} (Listing~\ref{lst:v2-ch04-schema}).
+
+\begin{lstlisting}[language=Python, label={lst:v2-ch04-schema}, caption={Declaring Tool Schemas with Pydantic v2 (JSON Schema Draft 2020-12)}]
+from pydantic import BaseModel, Field
+
+class RestartPodInput(BaseModel):
+    namespace: str = Field(
+        ...,
+        description="Kubernetes namespace containing the target pod, e.g. 'prod'."
+    )
+    pod_name: str = Field(
+        ...,
+        description="Exact pod name to restart."
+    )
+    grace_period_seconds: int = Field(
+        default=30, ge=0, le=300,
+        description="Grace period in seconds (0..300) before SIGKILL."
+    )
+    force: bool = Field(
+        default=False,
+        description="Set true only if graceful deletion stalls."
+    )
+
+# Pydantic v2 model_json_schema() emits JSON Schema Draft 2020-12
+tool_definition = {
+    "type": "function",
+    "function": {
+        "name": "restart_kubernetes_pod",
+        "description": "Restarts a pod by issuing a Kubernetes delete call.",
+        "parameters": RestartPodInput.model_json_schema()
+    }
+}
+\end{lstlisting}
+
+When the model decides to call \texttt{restart\_kubernetes\_pod}, the API returns a \texttt{tool\_call} object carrying \texttt{name} and a raw JSON string \texttt{arguments}. Never pass raw parsed JSON straight to an internal handler—validate it first (Listing~\ref{lst:v2-ch04-dispatch}). Note that \texttt{async def} / \texttt{await} allows our dispatcher to run I/O-bound tool calls concurrently on Python's event loop without blocking other requests.
+
+\begin{lstlisting}[language=Python, label={lst:v2-ch04-dispatch}, caption={Safe Tool Dispatch and Schema Validation Loop}]
+import json
+from pydantic import ValidationError
+
+async def dispatch_tool_call(tool_call, registered_tools: dict) -> dict:
+    func_name = tool_call.name
+    raw_args = tool_call.arguments
+
+    if func_name not in registered_tools:
+        return {
+            "is_error": True,
+            "error": f"Unknown tool '{func_name}'. Available: {list(registered_tools.keys())}"
+        }
+
+    tool_meta = registered_tools[func_name]
+    schema_model = tool_meta["schema"]
+    callable_func = tool_meta["handler"]
+
+    # 1. Parse JSON string safely
+    try:
+        args_dict = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+    except json.JSONDecodeError as e:
+        return {"is_error": True, "error": f"Invalid JSON syntax: {e}"}
+
+    # 2. Validate types and constraints against Pydantic schema
+    try:
+        validated_args = schema_model(**args_dict)
+    except ValidationError as ve:
+        return {
+            "is_error": True,
+            "error": f"Parameter validation failed: {ve.json()}. Fix arguments."
+        }
+
+    # 3. Execute tool and catch runtime exceptions as Observations
+    try:
+        result = await callable_func(validated_args)
+        return {"is_error": False, "result": result}
+    except Exception as exc:
+        return {
+            "is_error": True,
+            "error": f"Execution error in '{func_name}': {type(exc).__name__}: {exc}"
+        }
+\end{lstlisting}
+
+\begin{intuitionbox}[Tracing One Self-Correction Iteration on \texttt{ValidationError}]
+Suppose the LLM emits an out-of-range argument:
+\begin{center}\small\ttfamily
+tool\_call(id="call\_91", name="restart\_kubernetes\_pod", arguments='\{"namespace":"prod","pod\_name":"payments-api-7f9b","grace\_period\_seconds":900\}')
+\end{center}
+\begin{enumerate}
+  \item Line 20 parses the JSON cleanly into a Python \texttt{dict}.
+  \item Line 26 runs \texttt{RestartPodInput(**args\_dict)}, which raises \texttt{ValidationError}: \texttt{grace\_period\_seconds: Input should be less than or equal to 300}.
+  \item Instead of crashing, lines 28--31 return \texttt{\{"is\_error": True, "error": "Parameter validation failed: ..."\}}.
+  \item The agent loop appends a \texttt{tool} message tagged with \texttt{tool\_call\_id="call\_91"} containing that error. On the next turn, the LLM reads the \texttt{<= 300} constraint and re-emits \texttt{"grace\_period\_seconds": 120}, which passes validation and executes!
+\end{enumerate}
+\end{intuitionbox}
+
+\section{Deterministic Runtimes and Canonical Loop Detection}
+
+An unguarded \texttt{while} loop around an LLM can burn thousands of dollars in minutes if a tool keeps failing or returning 20,000-character logs. Production runtimes enforce three tripwires (Listing~\ref{lst:v2-ch04-loop}):
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Canonical Loop Detection}: If an LLM invokes \texttt{search(\{"a": 1, "b": 2\})} and then \texttt{search(\{"b": 2, "a": 1\})} with whitespace or key order changed, naive string comparison misses the duplicate! Normalizing arguments via \texttt{json.dumps(parsed, sort\_keys=True, separators=(",", ":"))} ensures identical calls always produce the exact same signature.
+  \item \textbf{Step \& Token Budgets}: Cap both reasoning turns (\texttt{max\_steps}) and cumulative tokens (\texttt{max\_tokens}).
+  \item \textbf{Observation Truncation}: Truncate oversized tool outputs before appending them to conversation history.
+\end{enumerate}
+
+\begin{lstlisting}[language=Python, label={lst:v2-ch04-loop}, caption={Production Execution Loop with Canonical Loop Detection and Tripwires}]
+import json
+
+def _canonical_call_sig(name: str, raw_args: str | dict) -> tuple[str, str]:
+    try:
+        parsed = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+        return (name, json.dumps(parsed, sort_keys=True, separators=(",", ":")))
+    except (json.JSONDecodeError, TypeError):
+        return (name, str(raw_args))
+
+class ProductionAgentLoop:
+    def __init__(self, llm_client, tools: dict, max_steps: int = 10, max_tokens: int = 15000):
+        self.llm = llm_client
+        self.tools = tools
+        self.max_steps = max_steps
+        self.max_tokens = max_tokens
+
+    async def run(self, user_prompt: str) -> str:
+        messages = [{"role": "user", "content": user_prompt}]
+        total_tokens_consumed = 0
+        call_history: list[tuple[str, str]] = []
+
+        for step_count in range(1, self.max_steps + 1):
+            response = await self.llm.invoke(messages, tools=list(self.tools.values()))
+            total_tokens_consumed += response.usage.total_tokens
+            if total_tokens_consumed > self.max_tokens:
+                raise RuntimeError("Token budget exceeded safety limit. Aborting.")
+
+            messages.append(response.message)
+            if not response.tool_calls:
+                return response.content
+
+            for tool_call in response.tool_calls:
+                call_sig = _canonical_call_sig(tool_call.name, tool_call.arguments)
+                if call_history.count(call_sig) >= 2:
+                    tool_result = {
+                        "is_error": True,
+                        "error": "CRITICAL: Identical tool call repeated twice. Change strategy."
+                    }
+                else:
+                    call_history.append(call_sig)
+                    tool_result = await dispatch_tool_call(tool_call, self.tools)
+
+                str_res = str(
+                    tool_result["result"] if not tool_result["is_error"] else tool_result["error"]
+                )
+                if len(str_res) > 2000:
+                    str_res = str_res[:2000] + "... [TRUNCATED]"
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": str_res
+                })
+
+        return "Task could not be completed within maximum allowed reasoning steps."
+\end{lstlisting}
+
+\section{Safe Tool Execution: \texttt{ast} Expression Sandboxing}
+
+Suppose an LLM needs a calculator tool to compute \texttt{"2 + 3 * 4"}. The worst mistake in Python is calling \texttt{eval(expression)}: if a prompt-injected document tricks the model into sending \texttt{"\_\_import\_\_('os').system('id')"}, \texttt{eval()} executes arbitrary shell commands on your server! Regex blocklists also fail because Python offers dozens of sneaky attribute-lookup tricks.
+
+The safe engineering solution uses Python's \textbf{Abstract Syntax Tree (\texttt{ast})} module. How does Python turn source text into execution, and why does stopping at the AST keep us safe?
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Tokenization}: The lexer breaks raw characters \texttt{"2 + 3 * 4"} into tokens (\texttt{2}, \texttt{+}, \texttt{3}, \texttt{*}, \texttt{4}).
+  \item \textbf{Parsing into an AST}: \texttt{ast.parse(expr, mode="eval")} builds an inert tree of syntax nodes honoring operator precedence—\emph{without executing anything}:
+  \[
+  \texttt{Expression(BinOp(left=Constant(2), op=Add(), right=BinOp(Constant(3), Mult(), Constant(4))))}
+  \]
+  \item \textbf{Whitelisted Tree Evaluation}: Our code walks the tree recursively and allows \emph{only} numeric constants and safe arithmetic operators (\texttt{Add}, \texttt{Sub}, \texttt{Mult}, \texttt{Div}, \texttt{Pow} with bounded exponents).
+\end{enumerate}
+If an attacker sends \texttt{"\_\_import\_\_('os').system('id')"}, \texttt{ast.parse} builds a \texttt{Call} node; our evaluator sees \texttt{Call} is not in the whitelist and immediately raises \texttt{ValueError("Unsupported AST node: Call")} before a single function is ever invoked!
+
+\section{Multi-Agent Topologies: Supervisor-Worker Isolation}
+
+When a single agent manages 15 tools and reads huge logs, its prompt fills with noisy intermediate traces. \textbf{Supervisor-Worker} architectures (Figure~\ref{fig:v2-ch04-supervisor}) split work across specialized sub-agents.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  supervisor/.style={draw=headingblue, fill=codebg, rounded corners=3pt, font=\sffamily\small\bfseries, minimum width=4.6cm, minimum height=1.1cm, align=center},
+  worker/.style={draw=exampleBlue, fill=exampleBg, rounded corners=2pt, font=\sffamily\scriptsize, minimum width=3.3cm, minimum height=1.0cm, align=center},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=headingblue}
+]
+
+\node[supervisor] (sup) at (0, 2.5) {Supervisor / Router Agent\\(Global Plan \& User Reply)};
+\node[worker] (w1) at (-4.1, 0) {Research Worker\\(Doc / Web Search)};
+\node[worker] (w2) at (0, 0) {SQL Worker\\(Read-Only Queries)};
+\node[worker] (w3) at (4.1, 0) {Code Sandbox Worker\\(AST / Isolated REPL)};
+
+\draw[arrow] (sup) -- (w1) node[midway, left, font=\tiny\sffamily] {Task};
+\draw[arrow] (w1) -- (sup) node[midway, right, font=\tiny\sffamily] {Summary};
+\draw[arrow] (sup) -- (w2);
+\draw[arrow] (w2) -- (sup);
+\draw[arrow] (sup) -- (w3);
+\draw[arrow] (w3) -- (sup);
+
+\end{tikzpicture}
+\caption{Supervisor-Worker Topology: Workers run in isolated context windows and return compact summaries to the Supervisor.}
+\label{fig:v2-ch04-supervisor}
+\end{figure}
+
+\begin{underthehoodbox}[Context Isolation as the Primary Payoff]
+Suppose the SQL Worker runs 12 exploratory schema queries generating 8,000 tokens of column dumps and failed SQL syntax corrections. Because the SQL Worker runs inside its own private message list, it returns only a 150-token summary to the Supervisor. The Supervisor's prompt stays clean, avoiding both token bloat and ``Lost in the Middle'' attention degradation.
+\end{underthehoodbox}
+
+\begin{realworldbox}[Multi-Agent Security Review \& Canonical Loop Incident]
+A platform team deployed two patterns: (1) a Terraform Coder + Security Auditor pair, and (2) an incident triage agent. During IaC review, the Coder drafted an S3 bucket without public access blocks; the Auditor flagged \texttt{CIS-AWS-2.1.4} (S3 Block Public Access), prompting an automatic patch before any PR was opened. Meanwhile, the triage agent produced an unexpected \$420 overnight bill:
+\begin{lstlisting}[basicstyle=\ttfamily\scriptsize]
+step=3  tool=query_metrics args='{"service":"auth","window":"5m"}'
+step=4  tool=query_metrics args='{"window":"5m","service":"auth"}'  # bypassed string check!
+step=5  tool=query_metrics args='{"service": "auth", "window": "5m"}'
+\end{lstlisting}
+Because the old loop detector compared raw unparsed argument strings, flipped JSON key ordering bypassed loop detection. Switching to \texttt{\_canonical\_call\_sig} (Listing~\ref{lst:v2-ch04-loop}) caught the duplicate on step 5 and halted the spin.
+\end{realworldbox}
+
+\begin{tryityourselfbox}[Build a Safe AST Calculator Tool]
+Build a tool \texttt{safe\_calculate} that evaluates mathematical expressions sent by an LLM:
+\begin{enumerate}
+  \item Define a Pydantic model \texttt{MathExpression} with field \texttt{expression: str}.
+  \item Parse with \texttt{ast.parse(expr, mode="eval")} and evaluate \emph{only} numeric constants, unary negation (\texttt{USub}), and binary operators (\texttt{Add, Sub, Mult, Div, Pow} with bounded exponent \texttt{<= 100}).
+  \item Verify that \texttt{"2 + 3 * 4"} returns \texttt{14.0} while \texttt{"\_\_import\_\_('os').system('id')"} fails safely with an error JSON object.
+\end{enumerate}
+(Complete worked solution in Section~4.9.)
+\end{tryityourselfbox}
+
+\section{Chapter Summary \protect\& Key Takeaways}
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Cognitive Loops}: ReAct grounds reasoning in tool Observations; Plan-and-Solve curbs multi-step drift; Reflexion stores verbal failure lessons.
+  \item \textbf{Validation \& Recovery}: Pydantic v2 emits JSON Schema Draft 2020-12; serializing \texttt{ValidationError} back as a \texttt{tool} message lets frontier LLMs self-correct invalid arguments.
+  \item \textbf{Deterministic Guards}: Canonicalize JSON arguments before counting repeats, cap steps and tokens, and truncate huge tool outputs.
+  \item \textbf{AST Sandboxing}: Never run \texttt{eval()} on LLM strings; parse to an AST and evaluate only whitelisted arithmetic nodes.
+  \item \textbf{Context Isolation}: Supervisor-Worker systems keep messy intermediate tool traces out of the main orchestrator's prompt.
+\end{itemize}
+
+\section{Exercises}
+
+\subsection*{Mechanics}
+\textbf{Exercise \thechapter.1}: Write the JSON Schema Draft 2020-12 tool definition for:
+\begin{lstlisting}[language=Python]
+def transfer_funds(
+    source_account: str, destination_account: str, amount_cents: int, currency: str = "USD"
+) -> bool:
+    """Transfers funds between corporate ledger accounts."""
+\end{lstlisting}
+
+\textbf{Exercise \thechapter.2}: In step 1 of a ReAct loop, the LLM calls \texttt{search\_database("user\_id=12")} with \texttt{id="call\_abc123"}. The database returns \texttt{InvalidColumnError: Table 'users' has no column 'user\_id'}. Write the exact \texttt{tool} message dictionary appended to \texttt{messages} so the LLM can self-correct.
+
+\subsection*{Debugging}
+\textbf{Exercise \thechapter.3}: Two Slack support bots talk to each other overnight and burn \$4,000 in API fees repeating \emph{``Thank you, let me know if you need anything else!''}. Identify two missing termination guards and write the Python check to stop the loop.
+
+\subsection*{Architecture}
+\textbf{Exercise \thechapter.4}: Design a customer-service multi-agent system for an airline with a Triage Supervisor, Flight Booking Worker, Baggage Tracking Worker, and Compensation Claims Worker. Specify state isolation, authentication gating, and human-approval thresholds.
+
+\section{Detailed Solutions}
+
+\subsection*{Solution \thechapter.1}
+\begin{lstlisting}[language=Python]
+tool_schema = {
+    "type": "function",
+    "function": {
+        "name": "transfer_funds",
+        "description": "Transfers funds between corporate ledger accounts.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "source_account": {"type": "string", "description": "Source ledger ID."},
+                "destination_account": {"type": "string", "description": "Target ledger ID."},
+                "amount_cents": {"type": "integer", "minimum": 1, "description": "Cents to transfer."},
+                "currency": {"type": "string", "enum": ["USD", "EUR", "GBP"], "default": "USD"}
+            },
+            "required": ["source_account", "destination_account", "amount_cents"]
+        }
+    }
+}
+\end{lstlisting}
+
+\subsection*{Solution \thechapter.2}
+\begin{lstlisting}[language=Python]
+tool_message = {
+    "role": "tool",
+    "tool_call_id": "call_abc123",
+    "name": "search_database",
+    "content": json.dumps({
+        "status": "error",
+        "error_type": "InvalidColumnError",
+        "message": "Table 'users' has no column 'user_id'. Available: ['id', 'email', 'created_at']"
+    })
+}
+\end{lstlisting}
+
+\subsection*{Solution \thechapter.3}
+The bot lacked: (1) a monotonic turn counter across agent-to-agent replies, and (2) an explicit termination sentinel such as \texttt{[TASK\_COMPLETE]} in the system prompt. Fix:
+\begin{lstlisting}[language=Python]
+if "[TASK_COMPLETE]" in response.content or step_count >= 6:
+    return response.content.replace("[TASK_COMPLETE]", "").strip()
+\end{lstlisting}
+
+\subsection*{Solution \thechapter.4}
+1. \textbf{Shared State \& Isolation}: Store only \texttt{user\_id}, \texttt{verified\_identity: bool}, \texttt{pnr}, and \texttt{messages} in shared orchestrator state; keep worker SQL/API scratchpads private inside each worker context. 2. \textbf{Auth Gate}: Before routing to Booking or Compensation workers, verify \texttt{verified\_identity == True}; otherwise route to an identity-verification node. 3. \textbf{Human Escalation Gate}: Any payout exceeding \$200 pauses via an explicit interrupt (Chapter~5) for human sign-off.
+
+\subsection*{Solution (Try It Yourself)}
+\begin{lstlisting}[language=Python]
+import ast, json, operator
+from pydantic import BaseModel
+
+class MathExpression(BaseModel):
+    expression: str
+
+OPS = {ast.Add: operator.add, ast.Sub: operator.sub,
+       ast.Mult: operator.mul, ast.Div: operator.truediv, ast.Pow: operator.pow}
+
+def safe_calculate(payload: MathExpression) -> str:
+    def _eval(node: ast.AST) -> float:
+        if isinstance(node, ast.Expression):
+            return _eval(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return float(node.value)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            return -_eval(node.operand)
+        if isinstance(node, ast.BinOp) and type(node.op) in OPS:
+            left, right = _eval(node.left), _eval(node.right)
+            if isinstance(node.op, ast.Pow) and abs(right) > 100:
+                raise ValueError("Exponent exceeds safety cap of 100.")
+            return float(OPS[type(node.op)](left, right))
+        raise ValueError(f"Unsupported AST node: {type(node).__name__}")
+    try:
+        tree = ast.parse(payload.expression, mode="eval")
+        return json.dumps({"ok": True, "result": _eval(tree)})
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": str(exc)})
+\end{lstlisting}
+
+\begin{labbridgebox}[Project Bridge]
+Inspect how read-only tools and privileged side-effect tools are separated and dispatched in \texttt{projects/p05-langgraph-agent-state/agent/tools.py} and \texttt{projects/p05-langgraph-agent-state/agent/research\_agent.py}.
+\end{labbridgebox}
+
+\section{Further Reading \protect\& Citations}
+\begin{itemize}[leftmargin=18pt]
+  \item Yao, S., et al. (2022). \emph{ReAct: Synergizing Reasoning and Acting in Language Models}. ICLR.
+  \item Wang, L., et al. (2023). \emph{Plan-and-Solve Prompting}. ACL.
+  \item Shinn, N., et al. (2023). \emph{Reflexion: Language Agents with Verbal Reinforcement Learning}. NeurIPS.
+\end{itemize}

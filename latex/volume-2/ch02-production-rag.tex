@@ -1,109 +1,136 @@
 \chapter{Production-Grade RAG: Ingestion, Chunking, and Contextual Retrieval}
-\label{ch:production_rag}
+\label{chap:rag}
 
 \begin{chaptergoalsbox}
 \textbf{What You Will Learn:}
 \begin{itemize}[leftmargin=15pt]
-  \item High-fidelity document parsing: PDF bounding boxes, table reconstruction, and Markdown AST extraction.
-  \item Chunking topologies and trade-offs: Fixed-token boundaries vs recursive separators vs semantic cosine clustering.
-  \item The theoretical mechanisms of the "Lost in the Middle" phenomenon in autoregressive Transformer decoders.
-  \item Small-to-big retrieval architectures: Parent-Document retrieval and hierarchical document mapping.
-  \item Multi-vector indexing and Anthropic's Contextual Retrieval for eliminating out-of-context chunk degradation.
+  \item Why naive character splitting corrupts tables, multi-column PDFs, and pronouns---and where each failure occurs in the ingestion pipeline.
+  \item High-fidelity document parsing: coordinate-stream pitfalls, vision layout analysis, and row-to-proposition table flattening.
+  \item Chunking mechanics: fixed-size, recursive separator descent (with true recursion and separator-aware overlap), and semantic cosine splitting.
+  \item Transformer tokenization, attention dilution, Rotary Position Embeddings (RoPE), and the ``Lost in the Middle'' U-shaped curve.
+  \item Small-to-big retrieval (\texttt{ParentDocumentRetriever}) and Anthropic's Contextual Retrieval for eliminating orphan chunks.
 \end{itemize}
 
 \textbf{What You Should Already Understand:}
 \begin{itemize}[leftmargin=15pt]
-  \item Transformer tokenization (Byte-Pair Encoding, WordPiece) and context window limitations.
-  \item Cosine similarity and inner product operations between dense vectors.
-  \item Python string manipulation, regular expressions, and dataclass structures.
+  \item Vectors, dot products, and cosine similarity (Chapter~1).
+  \item Python strings, regular expressions, lists, and dictionaries.
 \end{itemize}
 
 \textbf{Why This Topic Exists:}
-Toy Retrieval-Augmented Generation (RAG) demos simply split raw text every 500 characters and query a vector database. In production, this naive approach fails catastrophically: tables are shredded into gibberish, pronouns lose their antecedents, critical clauses are cut in half, and relevant chunks buried in the center of long prompts are systematically ignored by LLM attention heads.
+Most Retrieval-Augmented Generation (RAG) prototypes split a document every 500 characters, embed the slices, and paste the top 5 matches into an LLM prompt. In production, that simplicity collapses: PDF columns interleave across pages, tables get chopped away from their column headers, clauses lose their subject names, and relevant facts placed in the middle of a long prompt are quietly ignored by the model.
 
 \textbf{Motivating Practical Problem:}
-A legal intelligence platform ingests 200-page sovereign bond indentures and corporate merger agreements. When an attorney asks, \emph{"What is the debt incurrence threshold under the negative covenants if consolidated EBITDA falls below \$50M?"}, naive RAG retrieves a fragment that reads: \emph{"...provided, however, that the ratio shall not exceed 3.5:1.0 in such event."} Because the parent clause and defining covenant header were discarded during chunking, the model cannot identify which covenant applies and produces a completely fabricated legal opinion.
+A legal intelligence platform indexes 200-page corporate bond indentures. When an analyst asks, \emph{``What is the debt incurrence threshold under the negative covenants if consolidated EBITDA falls below \$50M?''}, naive RAG retrieves a fragment reading: \emph{``...provided, however, that the ratio shall not exceed 3.5:1.0 in such event.''} Because the covenant title and parent definition were sliced into a different chunk, the LLM cannot tell which clause applies and invents an incorrect legal answer.
 \end{chaptergoalsbox}
 
-\section{The Production RAG Architecture}
+\section{Anatomy of a RAG Failure}
 
-The naive RAG lifecycle is a three-step chain: parse text, embed chunks, query top-$k$. In enterprise systems, the architecture expands into a robust six-stage pipeline with feedback loops:
+Before writing a single line of ingestion code, trace how an answer goes wrong. Every stage between a raw enterprise file and the LLM's final response can silently corrupt meaning. Figure~\ref{fig:v2-ch02-rag-failure-map} maps the production pipeline alongside the concrete failure mode that strikes each stage when naive defaults are used.
 
 \begin{figure}[htbp]
 \centering
 \begin{tikzpicture}[
-  stage/.style={draw=headingblue, fill=codebg, rounded corners=2pt, font=\sffamily\scriptsize\bfseries, minimum width=2.4cm, minimum height=1.1cm, align=center},
-  arrow/.style={-{Stealth[scale=0.8]}, thick, color=linkblue}
+  stage/.style={draw=headingblue, fill=codebg, rounded corners=2pt, font=\sffamily\scriptsize\bfseries, minimum width=2.4cm, minimum height=1.0cm, align=center},
+  fail/.style={draw=warningRed, fill=warningBg, rounded corners=2pt, font=\sffamily\tiny, minimum width=2.4cm, minimum height=1.1cm, align=center},
+  fix/.style={draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, font=\sffamily\tiny, minimum width=2.4cm, minimum height=1.0cm, align=center},
+  arrow/.style={-{Stealth[scale=0.8]}, thick, color=linkblue},
+  farrow/.style={-{Stealth[scale=0.7]}, dashed, color=warningRed}
 ]
 
-\node[stage] (s1) at (0,0) {1. Ingestion \&\\Structure Parsing};
-\node[stage] (s2) at (3.0,0) {2. Semantic\\Chunking};
+\node[stage] (s1) at (0,0) {1. Layout\\Parsing};
+\node[stage] (s2) at (3.0,0) {2. Boundary\\Chunking};
 \node[stage] (s3) at (6.0,0) {3. Contextual\\Enrichment};
-\node[stage] (s4) at (9.0,0) {4. Multi-Vector\\Indexing};
-\node[stage] (s5) at (12.0,0) {5. Small-to-Big\\Retrieval};
+\node[stage] (s4) at (9.0,0) {4. Dual-Store\\Indexing};
+\node[stage] (s5) at (12.0,0) {5. Context\\Assembly};
 
 \draw[arrow] (s1) -- (s2);
 \draw[arrow] (s2) -- (s3);
 \draw[arrow] (s3) -- (s4);
 \draw[arrow] (s4) -- (s5);
 
+\node[fail] (f1) at (0,-1.55) {\textbf{Failure:} Interleaved\\2-col text;\\shredded tables};
+\node[fail] (f2) at (3.0,-1.55) {\textbf{Failure:} Sentences\\cut mid-clause;\\lost overlap};
+\node[fail] (f3) at (6.0,-1.55) {\textbf{Failure:} Pronoun\\``the company''\\unsearchable};
+\node[fail] (f4) at (9.0,-1.55) {\textbf{Failure:} Small chunks\\lack context; large\\chunks blur vectors};
+\node[fail] (f5) at (12.0,-1.55) {\textbf{Failure:} Middle\\chunks ignored\\by LLM attention};
+
+\node[fix] (x1) at (0,-3.05) {\textbf{Fix:} Vision layout\\boxes + row\\propositions};
+\node[fix] (x2) at (3.0,-3.05) {\textbf{Fix:} Recursive +\\semantic cosine\\boundaries};
+\node[fix] (x3) at (6.0,-3.05) {\textbf{Fix:} Prepend doc\\+ section summary\\before embedding};
+\node[fix] (x4) at (9.0,-3.05) {\textbf{Fix:} Child vectors\\point to parent\\doc store};
+\node[fix] (x5) at (12.0,-3.05) {\textbf{Fix:} Rerank + place\\top hits at edges\\of prompt};
+
+\draw[farrow] (s1) -- (f1); \draw[arrow] (f1) -- (x1);
+\draw[farrow] (s2) -- (f2); \draw[arrow] (f2) -- (x2);
+\draw[farrow] (s3) -- (f3); \draw[arrow] (f3) -- (x3);
+\draw[farrow] (s4) -- (f4); \draw[arrow] (f4) -- (x4);
+\draw[farrow] (s5) -- (f5); \draw[arrow] (f5) -- (x5);
+
 \end{tikzpicture}
-\caption{Production RAG Ingestion and Indexing Pipeline.}
-\label{fig:rag_pipeline}
+\caption{Production RAG Data Flow, Stage-Specific Failure Modes, and Architectural Mitigations.}
+\label{fig:v2-ch02-rag-failure-map}
 \end{figure}
 
-The success of downstream generation depends almost entirely on the fidelity of stages 1 through 3. If information is corrupted, fragmented, or decontextualized during ingestion, no reranker or reasoning model can recover the lost ground truth.
+Notice the core lesson of Figure~\ref{fig:v2-ch02-rag-failure-map}: if Stages 1--3 shred a table or strip away an entity name, Stage 5 cannot guess the missing facts later. High-accuracy RAG is won at ingestion time.
 
 \section{Document Parsing and Structural Extraction}
 
-Real-world enterprise documents are not clean strings of text; they are complex layouts containing multi-column text, embedded raster graphics, cross-page tables, and hierarchical header trees.
-
-\subsection{The PDF Parsing Dilemma}
-PDF (Portable Document Format) is an arbitrary vector drawing instruction set designed for print reproduction, not semantic understanding. In a PDF, characters are positioned via absolute coordinates:
+\subsection{Why Raw PDF Text Streams Fail}
+PDF is a print-drawing format, not a structured text format. Internally, a PDF stores painting commands placed at $(x, y)$ page coordinates:
 \begin{equation}
-(x, y, \text{"Consolidated"}, \text{font}=\text{Helvetica}, \text{size}=10)
+(x=72,\; y=640,\; \text{``Consolidated''},\; \text{Helvetica},\; 10\text{pt})
 \end{equation}
-The PDF stream contains no intrinsic concept of "paragraphs", "tables", or reading order. A naive extractor reading raw streams will read across columns, interleaving text from Column A and Column B:
+A PDF has no built-in tags for ``paragraph,'' ``column,'' or ``table.'' When a naive text extractor walks the stream left-to-right across a two-column financial report, it stitches Column A's line directly into Column B's line:
 \begin{center}
-\emph{"In the year 2024 our European division showed remarkable growth"} $\longleftrightarrow$ \emph{"While our Asian assets were subject to regulatory changes."}
+\emph{``In 2024 our European division grew 14\%''} $\longleftrightarrow$ \emph{``While regulatory filings remained pending.''}
 \end{center}
 
-\begin{underthehoodbox}[Vision-Based Document Layout Analysis]
-Modern high-performance parsers (such as Marker, Nougat, or LayoutLMv3) discard raw PDF character streams in favor of computer vision layout analysis.
-The engine:
+\begin{underthehoodbox}[Vision-Based Layout Analysis]
+Modern document parsers (such as Marker, Docling, or LayoutLMv3) treat pages visually before reading strings:
 \begin{enumerate}
-  \item Renders each PDF page as a 300 DPI image.
-  \item Passes the image through an object-detection backbone (YOLO or Mask R-CNN) to detect bounding boxes for \texttt{Paragraph}, \texttt{Heading}, \texttt{Table}, \texttt{Header}, and \texttt{Footer}.
-  \item Applies optical character recognition (OCR) or intersects coordinates with the PDF character stream to associate text with bounding boxes.
-  \item Emits a clean, hierarchically ordered Markdown Abstract Syntax Tree (AST).
+  \item Render each PDF page into a bitmap image (e.g., 150--300 DPI).
+  \item Run an object-detection model to draw bounding boxes labeled \texttt{Heading}, \texttt{Paragraph}, \texttt{Table}, \texttt{Header}, and \texttt{Footer}.
+  \item Sort bounding boxes into true reading order (top-to-bottom within Column 1, then Column 2), drop repeated page headers/footers, and extract text inside each box via native PDF glyphs or OCR.
+  \item Emit a clean Markdown hierarchy preserving headings and tables.
 \end{enumerate}
 \end{underthehoodbox}
 
-\subsection{Table Extraction and Representation}
-Tables are the primary failure point in enterprise RAG. When a table is split into character chunks, the row-column relationship is broken:
-\begin{lstlisting}[language=Python, caption={Converting Tables to LLM-Readable Formats}]
-# NAIVE SPLITTING: Loses column association across lines
-"""
-Year | Revenue | OpEx | EBITDA
-2023 | $120M   | $80M | $40M
-2024 | $150M   | $95M | $55M
-"""
+\subsection{Flattening Tables into Self-Contained Propositions}
+If a raw pipe-delimited Markdown table spans 40 rows and gets split at row 15, rows 16--40 lose their header row (\texttt{Year | Revenue | OpEx | EBITDA}) and become meaningless numbers. A reliable solution converts each row into a self-contained sentence (Listing~\ref{lst:v2-ch02-tables}).
 
-# PRODUCTION REPRESENTATION: Markdown table or self-contained Key-Value sentences
-def table_to_context_tuples(table_data: list[dict]) -> list[str]:
-    """Flattens table rows into explicit contextual propositions."""
-    propositions = []
+\begin{lstlisting}[language=Python, label={lst:v2-ch02-tables}, caption={Flattening Financial Table Rows into Self-Contained Propositions}]
+def table_to_context_tuples(table_data: list[dict[str, str]]) -> list[str]:
+    """Flattens structured table rows into standalone sentences."""
+    propositions: list[str] = []
     for row in table_data:
-        prop = (f"In financial year {row['Year']}, the company recorded revenue "
-                f"of {row['Revenue']}, operating expenses of {row['OpEx']}, "
-                f"yielding an EBITDA of {row['EBITDA']}.")
+        prop = (
+            f"In financial year {row['Year']}, the company recorded revenue "
+            f"of {row['Revenue']}, operating expenses of {row['OpEx']}, "
+            f"yielding an EBITDA of {row['EBITDA']}."
+        )
         propositions.append(prop)
     return propositions
+
+# Trace on a 2-row sample:
+rows = [
+    {"Year": "2023", "Revenue": "$120M", "OpEx": "$80M", "EBITDA": "$40M"},
+    {"Year": "2024", "Revenue": "$150M", "OpEx": "$95M", "EBITDA": "$55M"},
+]
+# Output[0]: "In financial year 2023, the company recorded revenue of $120M,
+#             operating expenses of $80M, yielding an EBITDA of $40M."
 \end{lstlisting}
+
+Each emitted string now carries its own column labels, so even if two rows land in separate chunks, neither loses its meaning.
 
 \section{Chunking Topologies: Fixed, Recursive, and Semantic}
 
-Chunking is the process of partitioning long continuous texts into discrete segments suited for embedding models and prompt context windows.
+\subsection{Tokens vs Characters: A Quick Primer}
+Before measuring chunk sizes, clarify what LLMs actually count. Language models do not read raw characters or whole English words; a \textbf{tokenizer} (typically Byte-Pair Encoding, or BPE) slices text into common subword pieces called \textbf{tokens}. For example, \texttt{"unbelievable"} might become \texttt{["un", "believ", "able"]} (3 tokens). As a rule of thumb:
+\begin{itemize}[leftmargin=18pt]
+  \item In English prose, $1\text{ token} \approx 4\text{ characters}$.
+  \item In source code or JSON (heavy indentation, symbols, camelCase), $1\text{ token} \approx 2.5\text{ to }3.0\text{ characters}$.
+\end{itemize}
 
 \begin{figure}[htbp]
 \centering
@@ -112,40 +139,34 @@ Chunking is the process of partitioning long continuous texts into discrete segm
   sep/.style={draw=warningRed, dashed, thick}
 ]
 
-% Fixed Chunking
 \node[anchor=west, font=\sffamily\bfseries\footnotesize] at (0, 2.2) {A. Fixed-Size Chunking (500 tokens)};
 \draw[chunk, minimum width=3.5cm] (0, 1.5) -- ++(3.5,0) node[midway] {Chunk 1 (500 tokens)};
 \draw[chunk, minimum width=3.5cm] (3.8, 1.5) -- ++(3.5,0) node[midway] {Chunk 2 (500 tokens)};
 \draw[chunk, minimum width=3.5cm] (7.6, 1.5) -- ++(3.5,0) node[midway] {Chunk 3 (500 tokens)};
 \draw[sep] (3.65, 1.1) -- (3.65, 1.9) node[above, font=\tiny\sffamily, color=warningRed] {Split mid-sentence};
 
-% Recursive Character Chunking
 \node[anchor=west, font=\sffamily\bfseries\footnotesize] at (0, 0.7) {B. Recursive Separator Chunking};
 \draw[chunk, minimum width=3.0cm, fill=intuitionBg] (0, 0) -- ++(3.0,0) node[midway] {Section 1.1 ($\backslash$n$\backslash$n)};
 \draw[chunk, minimum width=4.5cm, fill=intuitionBg] (3.3, 0) -- ++(4.5,0) node[midway] {Section 1.2 Paragraph ($\backslash$n$\backslash$n)};
 \draw[chunk, minimum width=3.2cm, fill=intuitionBg] (8.1, 0) -- ++(3.2,0) node[midway] {Section 1.3 ($\backslash$n$\backslash$n)};
 
-% Semantic Chunking
 \node[anchor=west, font=\sffamily\bfseries\footnotesize] at (0, -0.8) {C. Semantic Distance Chunking};
 \draw[chunk, minimum width=2.4cm, fill=exampleBg] (0, -1.5) -- ++(2.4,0) node[midway] {Topic A (High Sim)};
 \draw[chunk, minimum width=5.2cm, fill=exampleBg] (2.7, -1.5) -- ++(5.2,0) node[midway] {Topic B (Cosine Shift Detected)};
 \draw[chunk, minimum width=3.0cm, fill=exampleBg] (8.2, -1.5) -- ++(3.0,0) node[midway] {Topic C};
 
 \end{tikzpicture}
-\caption{Comparison of Chunking Topologies.}
-\label{fig:chunking_topologies}
+\caption{Chunking Topologies: Fixed slicing breaks mid-sentence; recursive splitting honors document separators; semantic chunking splits when embedding similarity drops.}
+\label{fig:v2-ch02-chunking}
 \end{figure}
 
-\subsection{Recursive Character Splitting}
-Recursive character chunking is the industrial baseline. Rather than splitting blindly at token index $k$, it uses a hierarchy of natural linguistic boundaries:
-\begin{equation}
-\text{Separators} = [\text{"\textbackslash n\textbackslash n"}, \text{"\textbackslash n"}, \text{"."}, \text{";"}, \text{" "}, \text{""}]
-\end{equation}
-The algorithm attempts to keep whole paragraphs together; if a paragraph exceeds \texttt{chunk\_size}, it splits on sentences; if a sentence exceeds the limit, it splits on clauses or words.
+\subsection{Recursive Character Splitting (Done Right)}
+Recursive splitting tries a prioritized list of natural boundaries—paragraphs (\texttt{"\textbackslash n\textbackslash n"}), lines (\texttt{"\textbackslash n"}), sentences (\texttt{". "}), clauses (\texttt{"; "}), words (\texttt{" "}), and finally raw characters (\texttt{""})—as illustrated in Figure~\ref{fig:v2-ch02-chunking}B.
 
-\begin{lstlisting}[language=Python, caption={Implementation of Recursive Separator Splitting}]
+A classic bug in naive implementations is computing \texttt{new\_separators = separators[i+1:]} and forgetting to \emph{recurse} when an oversized paragraph is encountered, or forgetting to include \texttt{len(separator)} when budgeting overlap. Listing~\ref{lst:v2-ch02-recursive} fixes both bugs cleanly.
+
+\begin{lstlisting}[language=Python, label={lst:v2-ch02-recursive}, caption={Production Recursive Separator Splitter with True Recursion and Exact Overlap}]
 import re
-from typing import list
 
 class ProductionRecursiveSplitter:
     def __init__(self, chunk_size: int = 1000, chunk_overlap: int = 150):
@@ -154,14 +175,12 @@ class ProductionRecursiveSplitter:
         self.separators = ["\n\n", "\n", ". ", "; ", ", ", " ", ""]
 
     def split_text(self, text: str) -> list[str]:
-        final_chunks = []
-        # Recursive descent splitting implementation
         def _split(txt: str, separators: list[str]) -> list[str]:
             if len(txt) <= self.chunk_size:
                 return [txt] if txt.strip() else []
-            
+
             separator = separators[-1]
-            new_separators = []
+            new_separators: list[str] = []
             for i, sep in enumerate(separators):
                 if sep == "":
                     separator = ""
@@ -170,240 +189,265 @@ class ProductionRecursiveSplitter:
                     separator = sep
                     new_separators = separators[i + 1:]
                     break
-            
+
             splits = txt.split(separator) if separator else list(txt)
-            docs = []
-            current_doc = []
+            docs: list[str] = []
+            current_doc: list[str] = []
             current_len = 0
-            
+
+            def _flush() -> None:
+                nonlocal current_doc, current_len
+                if not current_doc:
+                    return
+                merged = separator.join(current_doc)
+                if merged.strip():
+                    docs.append(merged)
+                overlap_doc: list[str] = []
+                overlap_len = 0
+                for prev_s in reversed(current_doc):
+                    added = len(prev_s) + (len(separator) if overlap_doc else 0)
+                    if overlap_len + added > self.chunk_overlap:
+                        break
+                    overlap_doc.insert(0, prev_s)
+                    overlap_len += added
+                current_doc = overlap_doc
+                current_len = overlap_len
+
             for s in splits:
-                s_len = len(s) + len(separator)
-                if current_len + s_len > self.chunk_size:
-                    if current_doc:
-                        merged = separator.join(current_doc)
-                        docs.append(merged)
-                        # Retain overlap window
-                        overlap_budget = self.chunk_overlap
-                        overlap_doc = []
-                        for prev_s in reversed(current_doc):
-                            if overlap_budget <= 0:
-                                break
-                            overlap_doc.insert(0, prev_s)
-                            overlap_budget -= len(prev_s)
-                        current_doc = overlap_doc
-                        current_len = sum(len(x) + len(separator) for x in current_doc)
+                if len(s) > self.chunk_size:
+                    _flush()
+                    current_doc, current_len = [], 0
+                    if new_separators:
+                        docs.extend(_split(s, new_separators))
+                    else:
+                        step = max(1, self.chunk_size - self.chunk_overlap)
+                        for start in range(0, len(s), step):
+                            part = s[start:start + self.chunk_size]
+                            if part.strip():
+                                docs.append(part)
+                    continue
+
+                sep_len = len(separator) if current_doc else 0
+                if current_len + sep_len + len(s) > self.chunk_size:
+                    _flush()
+                    sep_len = len(separator) if current_doc else 0
+                    if current_len + sep_len + len(s) > self.chunk_size:
+                        current_doc, current_len, sep_len = [], 0, 0
+
                 current_doc.append(s)
-                current_len += s_len
-                
+                current_len += sep_len + len(s)
+
             if current_doc:
-                docs.append(separator.join(current_doc))
+                merged = separator.join(current_doc)
+                if merged.strip():
+                    docs.append(merged)
             return docs
 
         return _split(text, self.separators)
 \end{lstlisting}
 
-\subsection{Semantic Chunking via Embedding Distance}
-While recursive splitting respects syntactic structure, it remains ignorant of \textbf{semantic flow}. Semantic chunking splits text when the conceptual topic shifts.
-
-\begin{underthehoodbox}[Semantic Chunking Algorithm]
-\textbf{Algorithmic Steps:}
+\textbf{Step-by-Step Walkthrough on a Concrete Input:} Configure \texttt{chunk\_size=80, chunk\_overlap=20} and pass:
+\begin{quote}\small\ttfamily
+"Section 1: Overview. Maintain liquidity.\textbackslash n\textbackslash nSection 2: Covenants. EBITDA must exceed \$50M. The debt ratio shall not exceed 3.5:1.0.\textbackslash n\textbackslash nSection 3: Remedies."
+\end{quote}
 \begin{enumerate}[leftmargin=18pt]
-  \item Split the source text into individual sentences $S = \{s_1, s_2, \dots, s_n\}$.
-  \item For each sentence, construct a sliding window $W_i = s_{i-1} \circ s_i \circ s_{i+1}$ to buffer local context.
-  \item Compute embedding vectors $v_i = \text{Embed}(W_i)$ for all windows.
-  \item Compute the cosine distance between adjacent sentence windows:
-  \begin{equation}
-  D_i = 1 - \frac{v_i \cdot v_{i+1}}{\|v_i\| \|v_{i+1}\|}
-  \end{equation}
-  \item Identify semantic boundaries where $D_i$ exceeds a dynamic threshold:
-  \begin{equation}
-  \tau = \mu_D + k \cdot \sigma_D
-  \end{equation}
-  where $\mu_D$ is the mean distance across the document, $\sigma_D$ is the standard deviation, and $k \in [0.5, 1.5]$ is a tuning multiplier.
-  \item Split sentences at every index $i$ where $D_i \ge \tau$.
+  \item Line 11 checks \texttt{len(txt) <= 80} (False, 177 chars). Lines 16--23 match the highest-priority separator \texttt{"\textbackslash n\textbackslash n"} and set \texttt{new\_separators = ["\textbackslash n", ". ", "; ", ", ", " ", ""]}.
+  \item Line 25 splits into three paragraphs: $p_0$ (42 chars), $p_1$ (92 chars), and $p_2$ (20 chars).
+  \item $p_0$ (42 chars $\le 80$) enters \texttt{current\_doc}. Next comes $p_1$ (92 chars $> 80$). Line 49 catches \texttt{len(s) > chunk\_size}, flushes $p_0$ as Chunk 0, clears the buffer, and calls \texttt{\_split(p\_1, new\_separators)} at line 53!
+  \item Inside the recursive call on $p_1$, \texttt{"\textbackslash n"} is absent, so line 20 selects \texttt{". "} and splits into three sentences: \texttt{"Section 2: Covenants"} (20), \texttt{"EBITDA must exceed \$50M"} (23), and \texttt{"The debt ratio shall not exceed 3.5:1.0."} (40). The first two join with \texttt{". "} to 45 chars; adding the third ($45 + 2 + 40 = 87 > 80$) triggers \texttt{\_flush()}. In \texttt{\_flush()}, \texttt{overlap\_doc} retains \texttt{"EBITDA must exceed \$50M"} (23 chars $> 20$? Wait: $23 > 20$, so overlap stops at 0 if overlap=20, or retains it if \texttt{chunk\_overlap=25}—and crucially line 40 accounts for \texttt{len(separator)} whenever two retained segments are joined!).
+  \item Every emitted chunk is guaranteed to obey \texttt{len(chunk) <= 80} while preserving sentence boundaries.
 \end{enumerate}
-\end{underthehoodbox}
 
-\begin{lstlisting}[language=Python, caption={Semantic Chunking via Sliding Cosine Distance}]
+\subsection{Semantic Chunking: A Worked 4-Sentence Example}
+Even recursive splitting cuts blindly between paragraphs that discuss the same topic, or merges two unrelated paragraphs that happen to fit under \texttt{chunk\_size}. \textbf{Semantic chunking} splits when the meaning shifts between consecutive sentences.
+
+Suppose a runbook contains 4 sentences:
+\begin{itemize}[leftmargin=18pt]
+  \item $s_0$: \emph{``PostgreSQL records every data change in the Write-Ahead Log before modifying heap pages.''}
+  \item $s_1$: \emph{``If the server loses power, WAL replay restores committed transactions safely.''}
+  \item $s_2$: \emph{``Kubernetes Horizontal Pod Autoscalers monitor CPU utilization every 15 seconds.''}
+  \item $s_3$: \emph{``When load exceeds the target threshold, the controller adds new pod replicas.''}
+\end{itemize}
+Suppose we embed each sentence (or 3-sentence sliding window) and compute cosine similarity between consecutive pairs using Chapter~1's formula, obtaining:
+\[
+S_{\cos}(s_0, s_1) = 0.88, \qquad S_{\cos}(s_1, s_2) = 0.42, \qquad S_{\cos}(s_2, s_3) = 0.85
+\]
+Converting similarities to cosine distances $D_i = 1 - S_{\cos}(s_i, s_{i+1})$ gives:
+\[
+D = [D_0, D_1, D_2] = [0.12,\; 0.58,\; 0.15]
+\]
+Compute the statistics of $D$:
+\[
+\mu_D = \frac{0.12 + 0.58 + 0.15}{3} \approx 0.2833, \qquad \sigma_D = \sqrt{\frac{(0.12-0.2833)^2 + (0.58-0.2833)^2 + (0.15-0.2833)^2}{3}} \approx 0.2101
+\]
+Using an 85th-percentile cutoff (linearly interpolated on sorted $[0.12, 0.15, 0.58]$ at index $0.85 \times 2 = 1.7$, giving $\text{cutoff} = 0.15 + 0.7(0.58 - 0.15) = 0.451$), or equivalently $\tau = \mu_D + 0.8\sigma_D \approx 0.4514$:
+\begin{itemize}[leftmargin=18pt]
+  \item $D_0 = 0.12 \le 0.451 \implies$ keep $s_0$ and $s_1$ together.
+  \item $D_1 = 0.58 > 0.451 \implies$ \textbf{topic jump detected!} Split between $s_1$ and $s_2$.
+  \item $D_2 = 0.15 \le 0.451 \implies$ keep $s_2$ and $s_3$ together.
+\end{itemize}
+Result: Chunk 1 = $\{s_0, s_1\}$ (PostgreSQL WAL) and Chunk 2 = $\{s_2, s_3\}$ (Kubernetes HPA). Listing~\ref{lst:v2-ch02-semantic} implements this exact pass.
+
+\begin{lstlisting}[language=Python, label={lst:v2-ch02-semantic}, caption={Semantic Chunking via Adjacent Cosine Distance}]
 import numpy as np
 
 def semantic_chunking(
-    sentences: list[str], 
-    embeddings: np.ndarray, 
+    sentences: list[str],
+    embeddings: np.ndarray,
     threshold_percentile: float = 85.0
 ) -> list[str]:
-    """Splits sentences into semantic chunks based on embedding distances."""
+    """Splits sentences into chunks where embedding distance spikes."""
     if len(sentences) <= 1:
         return sentences
-        
-    # Calculate cosine distances between adjacent sentences
-    # embeddings shape: (N, D), assumed normalized
-    distances = []
-    for i in range(len(embeddings) - 1):
-        cos_sim = np.dot(embeddings[i], embeddings[i + 1])
-        distances.append(1.0 - cos_sim)
-        
-    distances = np.array(distances)
-    cutoff = np.percentile(distances, threshold_percentile)
-    
-    chunks = []
+
+    # embeddings shape: (N, D), pre-normalized to unit length
+    distances = np.array([
+        1.0 - float(np.dot(embeddings[i], embeddings[i + 1]))
+        for i in range(len(embeddings) - 1)
+    ])
+    cutoff = float(np.percentile(distances, threshold_percentile))
+
+    chunks: list[str] = []
     current_chunk = [sentences[0]]
-    
     for i, dist in enumerate(distances):
         if dist > cutoff:
-            # Topic boundary detected
             chunks.append(" ".join(current_chunk))
             current_chunk = [sentences[i + 1]]
         else:
             current_chunk.append(sentences[i + 1])
-            
+
     if current_chunk:
         chunks.append(" ".join(current_chunk))
-        
     return chunks
 \end{lstlisting}
 
-\section{The "Lost in the Middle" Phenomenon}
+\section{The ``Lost in the Middle'' Phenomenon}
 
-In 2023, Liu et al. (Stanford, UC Berkeley) demonstrated that the performance of autoregressive Transformer decoders degrades severely depending on where relevant information is positioned within the prompt context.
+Even if chunking is spotless, pasting 30 retrieved chunks into a 64k-token prompt backfires. Liu et al. (2023) showed that LLM accuracy forms a U-shaped curve (Figure~\ref{fig:v2-ch02-lost-middle}): models reliably use facts at the very start (\textbf{primacy}) and very end (\textbf{recency}) of the prompt, while accuracy drops by 30--50\% when the critical answer sits in the middle.
 
 \begin{figure}[htbp]
 \centering
 \begin{tikzpicture}
-\draw[->, thick, color=headingblue] (0,0) -- (10,0) node[right, font=\sffamily\footnotesize] {Relative Position in Context};
-\draw[->, thick, color=headingblue] (0,0) -- (0,4.5) node[above, font=\sffamily\footnotesize] {Retrieval / QA Accuracy (\%)};
+\draw[->, thick, color=headingblue] (0,0) -- (10,0) node[right, font=\sffamily\footnotesize] {Relative Position in Prompt Context};
+\draw[->, thick, color=headingblue] (0,0) -- (0,4.3) node[above, font=\sffamily\footnotesize] {QA Accuracy (\%)};
 
-% U-shaped curve
-\draw[very thick, color=warningRed, domain=0.5:9.5, samples=100] 
+\draw[very thick, color=warningRed, domain=0.5:9.5, samples=100]
   plot (\x, {0.08*(\x - 5.0)*(\x - 5.0) + 1.2});
 
-\node[font=\sffamily\scriptsize\bfseries, color=linkblue] at (1.5, 3.8) {Primacy Effect (Top)};
-\node[font=\sffamily\scriptsize\bfseries, color=linkblue] at (8.5, 3.8) {Recency Effect (Bottom)};
-\node[font=\sffamily\scriptsize\bfseries, color=warningRed] at (5.0, 0.8) {The "Valley of Oblivion" (Middle: $-30\%$ to $-50\%$)};
+\node[font=\sffamily\scriptsize\bfseries, color=linkblue] at (1.8, 3.7) {Primacy Effect (Start)};
+\node[font=\sffamily\scriptsize\bfseries, color=linkblue] at (8.2, 3.7) {Recency Effect (End)};
+\node[font=\sffamily\scriptsize\bfseries, color=warningRed] at (5.0, 0.75) {Middle Drop ($-30\%$ to $-50\%$)};
 
-% Reference markers
-\draw[dashed, color=gray!50] (0.5, 3.2) -- (0.5, 0) node[below, font=\tiny\sffamily] {Start (0\%)};
-\draw[dashed, color=gray!50] (5.0, 1.2) -- (5.0, 0) node[below, font=\tiny\sffamily] {Center (50\%)};
-\draw[dashed, color=gray!50] (9.5, 3.2) -- (9.5, 0) node[below, font=\tiny\sffamily] {End (100\%)};
+\draw[dashed, color=gray!50] (0.5, 3.2) -- (0.5, 0) node[below, font=\tiny\sffamily] {0\%};
+\draw[dashed, color=gray!50] (5.0, 1.2) -- (5.0, 0) node[below, font=\tiny\sffamily] {50\%};
+\draw[dashed, color=gray!50] (9.5, 3.2) -- (9.5, 0) node[below, font=\tiny\sffamily] {100\%};
 
 \end{tikzpicture}
-\caption{The "Lost in the Middle" U-Shaped Attention Curve. Relevant context placed in the center of prompts suffers dramatically lower attention weight compared to chunks placed at the extreme beginning or end.}
-\label{fig:lost_in_the_middle}
+\caption{The ``Lost in the Middle'' U-Shaped Attention Curve: Information buried near the center of a long prompt receives weaker attention than chunks placed near the start or end.}
+\label{fig:v2-ch02-lost-middle}
 \end{figure}
 
-\begin{underthehoodbox}[Why Does This Happen in Attention Heads?]
-This phenomenon is rooted in two architectural characteristics of modern LLMs:
+\begin{underthehoodbox}[Why Does This Happen? Attention Decay, RoPE, and Attention Sinks]
+When an LLM generates the next word, its \textbf{self-attention} mechanism assigns a numerical weight (summing to 1.0) across all earlier tokens in the prompt to decide which ones matter right now. Two mechanics starve middle tokens:
 \begin{enumerate}
-  \item \textbf{Causal Masking and Autoregressive Bias}: Tokens at the very end of the prompt have immediate recency to the first generated completion token. Their activations are fresh in key-value caches and suffer minimal vanishing gradient effects.
-  \item \textbf{Rotary Position Embeddings (RoPE) Decay}: RoPE rotates query and key vectors in complex 2D planes proportional to relative token distance $|i - j|$. When contexts stretch to 32k or 128k tokens, cross-attention between token $j$ in the middle and query token $N$ at the end must overcome immense relative distance penalties. Attention sinks at token index 0 (initial system prompt) naturally absorb stray attention weights, starving middle tokens.
+  \item \textbf{Rotary Position Embeddings (RoPE) Distance Decay}: To tell whether one word is 5 tokens away or 20,000 tokens away, modern LLMs encode position by rotating each token's internal vector in 2D planes by an angle proportional to its position index. As the gap $|i - j|$ between a middle chunk and the end of the prompt stretches across tens of thousands of tokens, relative alignment decays and long-range attention blurs.
+  \item \textbf{Attention Sinks and Recency}: Tokens at the very end sit immediately next to the freshly generated output, dominating recency weights. Meanwhile, the very first tokens (token 0, the system prompt) act as an \textbf{attention sink}: because attention weights must sum to 1.0 even when no specific word is strongly relevant, models dump spare attention weight onto the opening tokens, leaving middle tokens starved.
 \end{enumerate}
 \end{underthehoodbox}
 
-\begin{productionwarningbox}[Context Stuffing Anti-Pattern]
-Expanding an LLM's context window from 8k to 128k tokens does not solve retrieval precision. Stuffing 40 retrieved chunks into a prompt guarantees that high-relevance chunks situated between index 15 and 30 will frequently be ignored. In production, never feed raw top-$k$ without reranking, aggressive deduplication, and strategically ordering the most critical chunks at the extreme top and bottom of the context block.
+\begin{productionwarningbox}[The Context-Stuffing Anti-Pattern]
+Upgrading from an 8k-token model to a 128k-token model does not fix poor retrieval. Dumping 40 raw chunks into a prompt buries the best evidence in the middle and inflates latency and cost. Keep retrieved context tight (top 5--8 chunks after reranking, Chapter~3), deduplicate overlapping chunks, and place your highest-scoring chunks at the top and bottom of the context block.
 \end{productionwarningbox}
 
-\section{Parent-Document and Hierarchical Retrieval}
+\section{Small-to-Big Retrieval and Contextual Enrichment}
 
-Chunk size presents a fundamental engineering paradox:
+\subsection{Parent-Document Retrieval: Decoupling Search from Generation}
+Chunk size creates a tug-of-war:
 \begin{itemize}[leftmargin=18pt]
-  \item \textbf{Small Chunks (e.g., 100--150 tokens)}: Excellent for embedding similarity. The vector represents a tight, distinct concept without dilute noise.
-  \item \textbf{Large Chunks (e.g., 1000--2000 tokens)}: Excellent for LLM generation. The model receives rich surrounding context, definitions, and pronoun antecedents.
+  \item \textbf{Small chunks (100--150 tokens)} produce razor-sharp vectors because each vector describes one focused fact.
+  \item \textbf{Large chunks (1,000--1,500 tokens)} give the LLM full surrounding clauses, definitions, and tables.
 \end{itemize}
-
-\textbf{Parent-Document Retrieval} (also known as Small-to-Big Retrieval) decouples the vector representation used for searching from the document representation passed to the LLM.
+\textbf{Parent-Document Retrieval} solves both by indexing small \emph{child} chunks in the vector database while storing the large \emph{parent} section in a key-value store (Figure~\ref{fig:v2-ch02-parent}).
 
 \begin{figure}[htbp]
 \centering
 \begin{tikzpicture}[
-  parent/.style={draw=headingblue, fill=codebg, rounded corners=2pt, minimum width=9.0cm, minimum height=1.6cm, font=\sffamily\scriptsize, align=center},
-  child/.style={draw=exampleBlue, fill=exampleBg, rounded corners=1pt, minimum width=2.4cm, minimum height=0.7cm, font=\sffamily\tiny\bfseries, align=center},
+  parent/.style={draw=headingblue, fill=codebg, rounded corners=2pt, minimum width=9.0cm, minimum height=1.4cm, font=\sffamily\scriptsize, align=center},
+  child/.style={draw=exampleBlue, fill=exampleBg, rounded corners=1pt, minimum width=2.4cm, minimum height=0.75cm, font=\sffamily\tiny\bfseries, align=center},
   arrow/.style={-{Stealth[scale=0.8]}, thick, color=headingblue}
 ]
 
-\node[parent] (p1) at (5, 2.5) {Parent Document / Section (1,500 tokens)\\Stored in Key-Value Document Store (Redis / PostgreSQL)};
-
-\node[child] (c1) at (1.5, 0.8) {Child 1 (150 tok)\\Embed Vector $\vec{v}_1$};
-\node[child] (c2) at (5.0, 0.8) {Child 2 (150 tok)\\Embed Vector $\vec{v}_2$};
-\node[child] (c3) at (8.5, 0.8) {Child 3 (150 tok)\\Embed Vector $\vec{v}_3$};
+\node[parent] (p1) at (5, 2.4) {Parent Section (1,500 tokens, \texttt{parent\_id="p-42"})\\Stored in Document Store (PostgreSQL / Redis)};
+\node[child] (c1) at (1.5, 0.7) {Child 1 (150 tok)\\Vector $\vec{v}_1$};
+\node[child] (c2) at (5.0, 0.7) {Child 2 (150 tok)\\Vector $\vec{v}_2$};
+\node[child] (c3) at (8.5, 0.7) {Child 3 (150 tok)\\Vector $\vec{v}_3$};
 
 \draw[arrow] (p1.south) -| (c1.north);
 \draw[arrow] (p1.south) -- (c2.north);
 \draw[arrow] (p1.south) -| (c3.north);
 
-\node[draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, font=\sffamily\scriptsize\bfseries, minimum width=9.0cm, minimum height=0.8cm] at (5, -0.6) {
-  Vector Query matches Child 2 $\implies$ System fetches and returns full Parent Document
+\node[draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, font=\sffamily\scriptsize\bfseries, minimum width=9.0cm, minimum height=0.75cm] at (5, -0.65) {
+  Vector search matches Child 2 $\implies$ Look up \texttt{p-42} $\implies$ Return full Parent Section to LLM
 };
 
 \end{tikzpicture}
-\caption{Parent-Document (Small-to-Big) Architecture.}
-\label{fig:parent_document_retrieval}
+\caption{Parent-Document (Small-to-Big) Retrieval: Granular child vectors maximize search accuracy; deduplicated parent sections preserve full context for generation.}
+\label{fig:v2-ch02-parent}
 \end{figure}
 
-\begin{lstlisting}[language=Python, caption={Parent-Document Retrieval Implementation}]
+\begin{lstlisting}[language=Python, label={lst:v2-ch02-parent}, caption={Parent-Document Retrieval with Ordered Parent Deduplication}]
 import uuid
-from typing import dict
 
 class ParentDocumentRetriever:
-    def __init__(self, vector_store, doc_store):
-        self.vector_store = vector_store  # Stores small child vectors
-        self.doc_store = doc_store        # Key-Value store: parent_id -> full text
+    def __init__(self, vector_store, doc_store: dict[str, str]):
+        self.vector_store = vector_store
+        self.doc_store = doc_store
         self.child_splitter = ProductionRecursiveSplitter(chunk_size=200, chunk_overlap=20)
         self.parent_splitter = ProductionRecursiveSplitter(chunk_size=1500, chunk_overlap=150)
 
-    def add_documents(self, raw_documents: list[str]):
+    def add_documents(self, raw_documents: list[str]) -> None:
         for raw_doc in raw_documents:
             parents = self.parent_splitter.split_text(raw_doc)
-            
             for parent_text in parents:
                 parent_id = str(uuid.uuid4())
                 self.doc_store[parent_id] = parent_text
-                
-                # Split parent into granular children
+
                 children = self.child_splitter.split_text(parent_text)
                 for child_text in children:
                     metadata = {"parent_id": parent_id, "snippet": child_text[:50]}
                     self.vector_store.add_text(child_text, metadata=metadata)
 
     def retrieve(self, query: str, top_k_children: int = 10) -> list[str]:
-        # Step 1: High-precision semantic search over child vectors
         child_matches = self.vector_store.search(query, k=top_k_children)
-        
-        # Step 2: Extract distinct parent IDs, preserving relevance order
-        seen_parent_ids = set()
-        parent_documents = []
-        
+
+        seen_parent_ids: set[str] = set()
+        parent_documents: list[str] = []
         for match in child_matches:
             pid = match.metadata["parent_id"]
             if pid not in seen_parent_ids:
                 seen_parent_ids.add(pid)
                 parent_documents.append(self.doc_store[pid])
-                
         return parent_documents
 \end{lstlisting}
 
-\section{Contextual Retrieval and Multi-Vector Indexing}
+\textbf{Step-by-Step Trace of \texttt{ParentDocumentRetriever}:}
+Suppose we ingest our bond indenture from the motivating problem:
+\begin{enumerate}[leftmargin=18pt]
+  \item \texttt{add\_documents} splits the indenture into 1,500-character parents (lines 12--15). Section 4.02 (Negative Covenants) gets \texttt{parent\_id = "p-402"} and its full text is saved in \texttt{self.doc\_store["p-402"]}.
+  \item Lines 17--20 slice \texttt{"p-402"} into 200-character children: Child A mentions \emph{``Section 4.02 Negative Covenants: Consolidated EBITDA''}, Child B contains \emph{``...the ratio shall not exceed 3.5:1.0''}. Both carry \texttt{metadata=\{"parent\_id": "p-402"\}}.
+  \item When the analyst queries \texttt{"debt ratio under negative covenants"}, line 23 returns Child B (rank 1, \texttt{parent\_id="p-402"}) and Child A (rank 2, \texttt{parent\_id="p-402"}), followed by Child C from Section 7.1 (\texttt{parent\_id="p-701"}).
+  \item Lines 27--31 iterate in rank order: \texttt{"p-402"} is added once to \texttt{seen\_parent\_ids} and appended; when Child A arrives with the same \texttt{"p-402"}, line 29 skips the duplicate so the LLM receives Section 4.02 once—complete with its covenant header—followed by Section 7.1.
+\end{enumerate}
 
-In 2024, Anthropic formalized \textbf{Contextual Retrieval}, a breakthrough technique that systematically eliminates semantic drift in chunking.
-
-\subsection{The Root Cause of Chunk Ambiguity}
-Consider this chunk from an annual report:
+\subsection{Contextual Retrieval: Eliminating Orphan Chunks}
+Consider a standalone chunk from an SEC filing:
 \begin{center}
-\emph{"The company's operating margin declined by 2.4\% due to regulatory headwinds in the mobility segment."}
+\emph{``Operating margin declined by 2.4\% due to regulatory headwinds in the mobility segment.''}
 \end{center}
-If embedded as-is, this vector cannot answer:
-\begin{itemize}
-  \item Which company? (Uber? Lyft? Grab?)
-  \item Which year or quarter? (Q2 2022? Q4 2024?)
-  \item Which geography?
-\end{itemize}
+Even with small chunks, a query asking \emph{``Why did Uber's Q3 2024 operating margin drop?''} fails if neither \emph{``Uber''} nor \emph{``Q3 2024''} appears inside the chunk! \textbf{Contextual Retrieval} (Anthropic, 2024) fixes this at ingestion time by asking a fast, low-cost LLM to prepend a 2-sentence situating prefix before embedding (Listing~\ref{lst:v2-ch02-contextual}).
 
-\subsection{The Contextual Enrichment Solution}
-Before generating embeddings, an auxiliary high-throughput LLM inspects the entire document alongside the candidate chunk, generating a concise 50--100 token contextual prefix that is permanently prepended to the chunk:
-
-\begin{lstlisting}[language=Python, caption={Contextual Retrieval Pipeline}]
-CONTEXT_ENRICHMENT_PROMPT = """
-<document>
+\begin{lstlisting}[language=Python, label={lst:v2-ch02-contextual}, caption={Contextual Enrichment Prior to Vector Embedding}]
+CONTEXT_ENRICHMENT_PROMPT = """<document>
 {full_document}
 </document>
 
@@ -412,129 +456,103 @@ Here is the chunk we want to situate within the whole document:
 {chunk_text}
 </chunk>
 
-Give a short, concise context (2-3 sentences) to situate this chunk within the overall document for search retrieval. Answer ONLY with the context.
-"""
+Give a short, concise context (2-3 sentences) to situate this chunk within the overall document for search retrieval. Answer ONLY with the context."""
 
 async def generate_contextual_chunk(
-    llm_client, 
-    full_document: str, 
-    chunk_text: str
+    llm_client, full_document: str, chunk_text: str
 ) -> str:
     prompt = CONTEXT_ENRICHMENT_PROMPT.format(
-        full_document=full_document[:20000], # Window budget
+        full_document=full_document[:20000],
         chunk_text=chunk_text
     )
     context_prefix = await llm_client.generate(prompt, max_tokens=100)
-    
-    # Combined chunk: enriched for embedding, natural for generation
-    enriched_chunk = f"{context_prefix.strip()}\n\n{chunk_text}"
-    return enriched_chunk
+    return f"{context_prefix.strip()}\n\n{chunk_text}"
 \end{lstlisting}
 
-By prepending \emph{"This document is the Q3 2024 SEC Form 10-Q for Uber Technologies. In this section discussing mobility performance..."} prior to embedding, the vector acquires dense coordinates for \texttt{Uber}, \texttt{Q3 2024}, and \texttt{10-Q}, reducing retrieval failure rates by up to 49\% across benchmarks.
+Prepending \emph{``This chunk is from Uber Technologies' Q3 2024 Form 10-Q discussing Mobility segment results.''} embeds \texttt{Uber}, \texttt{Q3 2024}, and \texttt{Form 10-Q} directly into the chunk vector—cutting retrieval failures by nearly half in production benchmarks, especially when paired with prompt caching (Chapter~7) so \texttt{full\_document} is cached across all chunks of the same file.
 
-\begin{realworldbox}[Multi-Vector Indexing on Financial SEC Filings]
-A major asset manager indexing 10,000 corporate annual filings combined Multi-Vector indexing with Contextual Retrieval.
-For each financial table, they generated three distinct representations:
-\begin{enumerate}
-  \item A dense vector of the raw Markdown table.
-  \item A dense vector of an LLM-generated summary summarizing the key takeaways.
-  \item Ten hypothetical questions the table answers (e.g., \emph{"What was Apple's gross margin in services for 2024?"}).
-\end{enumerate}
-All three vector representations pointed to the identical document ID. Retrieval recall surged from 54\% to 92\% without increasing the token count in the final synthesis context window.
+\begin{realworldbox}[Diagnosing Orphaned Pronoun \& Table-Header Failures]
+An internal compliance assistant answered \emph{``I found no record of the Q3 margin change''} on 38\% of financial questions. Inspecting the retrieval trace exposed the culprit:
+\begin{lstlisting}[basicstyle=\ttfamily\scriptsize]
+TRACE query="What was Acme Corp's Q3 2024 operating margin?"
+  top_1_hit (cos=0.61): "2024 | $150M | $95M | $55M"         # Missing header \& company!
+  top_2_hit (cos=0.58): "The segment fell 2.4% vs prior yr." # Missing entity \& quarter!
+\end{lstlisting}
+The true table row had been split away from its header, and the narrative paragraph never repeated \emph{``Acme Corp''}. Flattening table rows into prose tuples (Listing~\ref{lst:v2-ch02-tables}) and prepending contextual prefixes (Listing~\ref{lst:v2-ch02-contextual}) lifted top-5 retrieval recall from 62\% to 94\%.
 \end{realworldbox}
 
-\begin{tryityourselfbox}[Benchmarking Contextual vs Raw Retrieval]
-Take a technical specification document (e.g., an RFC or Kubernetes architecture paper).
-\begin{enumerate}
-  \item Extract 20 random chunks using standard recursive chunking.
-  \item Generate contextual prefixes for 10 of them using a local model or API.
-  \item Embed both sets using a standard model (\texttt{text-embedding-3-small} or \texttt{bge-small-en}).
-  \item Craft 5 targeted queries containing entity names that only appeared in the document title or introduction. Compare the cosine similarity rank of raw vs contextualized chunks.
-\end{enumerate}
+\begin{tryityourselfbox}[Tracing Recursive Splitting \& Overlap Calculation]
+Trace \texttt{ProductionRecursiveSplitter(chunk\_size=50, chunk\_overlap=15)} on the input:
+\begin{quote}\small\ttfamily
+"Alpha one. Beta two. Gamma three.\textbackslash n\textbackslash nDelta four."
+\end{quote}
+List the exact output chunks, their character lengths, and explain which separator level handled each split. (Worked solution is in Section~2.7.)
 \end{tryityourselfbox}
 
-\section{Chapter Summary \& Key Takeaways}
+\section{Chapter Summary \protect\& Key Takeaways}
 \begin{itemize}[leftmargin=18pt]
-  \item \textbf{Structure-Aware Ingestion}: Parsing must respect visual layout. Naive PDF text extractors scramble multi-column layouts and shred financial tables into incoherent lines.
-  \item \textbf{Chunking Hierarchy}: Fixed-token chunking cuts sentences arbitrarily. Recursive character splitting preserves syntax, while semantic chunking tracks conceptual shifts by calculating sliding cosine distances between sentence embeddings.
-  \item \textbf{Attention Vulnerability}: LLMs suffer from the "Lost in the Middle" phenomenon; attention heads preferentially attend to the prompt's beginning and end. Keep context tight and place critical chunks at the edges.
-  \item \textbf{Small-to-Big Retrieval}: Disconnect search resolution from generation context. Embed small, semantic child chunks to maximize vector search precision, but return the parent document or section to the LLM.
-  \item \textbf{Contextual Retrieval}: Standalone chunks lose global meaning. Synthesizing a 50-token contextual prefix per chunk prior to embedding anchors pronouns, dates, and corporate entities into the dense vector space.
+  \item \textbf{Structure-First Ingestion}: Use layout-aware parsers for multi-column PDFs and flatten tables into self-contained propositions so rows keep their headers.
+  \item \textbf{Recursive \& Semantic Chunking}: True recursive splitters descend into finer separators whenever a segment exceeds \texttt{chunk\_size} and account for \texttt{len(separator)} during overlap; semantic chunkers detect topic shifts via spikes in adjacent cosine distance.
+  \item \textbf{Lost in the Middle}: Due to RoPE distance decay, recency, and attention sinks, LLMs under-attend to the center of long prompts. Rerank and place top chunks at the edges.
+  \item \textbf{Parent-Document \& Contextual Retrieval}: Search over small, focused child chunks, deduplicate \texttt{parent\_id}s, and return full parent sections; prepend document/section context before embedding to eliminate orphan pronouns.
 \end{itemize}
 
 \section{Exercises}
 
 \subsection*{Mechanics}
-\textbf{Exercise 2.1}: Given a document with 10 consecutive sentences whose pairwise adjacent cosine distances are:
+\textbf{Exercise \thechapter.1}: A document has 10 sentences with adjacent cosine distances:
 \[
-D = [0.12, 0.15, 0.08, 0.45, 0.10, 0.11, 0.52, 0.09, 0.14]
+D = [0.12,\; 0.15,\; 0.08,\; 0.45,\; 0.10,\; 0.11,\; 0.52,\; 0.09,\; 0.14]
 \]
-If the semantic split threshold is defined as $\tau = \mu_D + 1.0 \cdot \sigma_D$, calculate $\mu_D, \sigma_D$, and identify the indices where chunk boundaries should be inserted.
+Given $\tau = \mu_D + 1.0 \cdot \sigma_D$, compute $\mu_D$, $\sigma_D$, and identify which sentence boundaries trigger splits.
 
-\textbf{Exercise 2.2}: Explain the difference between character overlap and token overlap. If a chunking utility uses a character overlap of 100 characters on a dataset of English code snippets, calculate the approximate token overlap assuming average token-to-character ratios for source code.
+\textbf{Exercise \thechapter.2}: Explain the difference between character overlap and token overlap. If a splitter sets \texttt{chunk\_overlap=100} characters on Python source code, approximately how many tokens of overlap does that produce?
 
 \subsection*{Debugging}
-\textbf{Exercise 2.3}: An engineering team notices that after implementing parent-document retrieval, their vector database returns the exact same parent document 5 times in the top-5 results, consuming their entire prompt token budget. Write the deduplication logic required to fix this bug.
+\textbf{Exercise \thechapter.3}: After deploying \texttt{ParentDocumentRetriever}, an engineer notices that 5 out of 5 returned parent documents in the prompt are identical copies of the same 1,500-token section, crowding out all other evidence. Explain why this happens and write the Python deduplication fix.
 
 \subsection*{Architecture}
-\textbf{Exercise 2.4}: Design a real-time ingestion pipeline for an enterprise wiki (Notion/Confluence) that updates embeddings incrementally whenever a page is edited. Your design must handle parent-child relationship tracking, orphan chunk deletion, and idempotent vector upserts.
+\textbf{Exercise \thechapter.4}: Design an incremental ingestion pipeline for an enterprise wiki (Notion/Confluence) that updates parent and child records when a single page is edited, without leaving orphaned child vectors in the index.
 
 \section{Detailed Solutions}
 
-\subsection*{Solution 2.1}
-The distances are: $D = [0.12, 0.15, 0.08, 0.45, 0.10, 0.11, 0.52, 0.09, 0.14]$.
-Total count $N = 9$.
-Sum $= 0.12 + 0.15 + 0.08 + 0.45 + 0.10 + 0.11 + 0.52 + 0.09 + 0.14 = 1.76$.
-Mean $\mu_D = \frac{1.76}{9} \approx 0.1956$.
+\subsection*{Solution \thechapter.1}
+Count $N = 9$, sum $= 1.76$, so $\mu_D = 1.76 / 9 \approx 0.1956$. Computing squared deviations $(D_i - 0.1956)^2$:
+\[
+0.0057 + 0.0021 + 0.0134 + 0.0647 + 0.0091 + 0.0073 + 0.1052 + 0.0112 + 0.0031 = 0.2218
+\]
+Variance $\sigma_D^2 = 0.2218 / 9 \approx 0.02464 \implies \sigma_D \approx 0.1570$. Threshold $\tau = 0.1956 + 0.1570 = 0.3526$. Two distances exceed $\tau$: $D_3 = 0.45$ (split between $s_3$ and $s_4$) and $D_6 = 0.52$ (split between $s_6$ and $s_7$), yielding $\{s_0..s_3\}$, $\{s_4..s_6\}$, and $\{s_7..s_9\}$.
 
-Deviations $(D_i - \mu)^2$:
-\begin{align*}
-(0.12 - 0.1956)^2 &\approx 0.0057, \quad (0.15 - 0.1956)^2 \approx 0.0021, \quad (0.08 - 0.1956)^2 \approx 0.0134\\
-(0.45 - 0.1956)^2 &\approx 0.0647, \quad (0.10 - 0.1956)^2 \approx 0.0091, \quad (0.11 - 0.1956)^2 \approx 0.0073\\
-(0.52 - 0.1956)^2 &\approx 0.1052, \quad (0.09 - 0.1956)^2 \approx 0.0112, \quad (0.14 - 0.1956)^2 \approx 0.0031
-\end{align*}
-Sum of squared deviations $\approx 0.2218$.
-Variance $\sigma_D^2 = \frac{0.2218}{9} \approx 0.02464 \implies \sigma_D \approx 0.1570$.
+\subsection*{Solution \thechapter.2}
+Character overlap counts raw characters (`len(s)`), whereas token overlap counts BPE subword pieces. In English prose, $1\text{ token} \approx 4\text{ chars}$; in code (punctuation, indentation, short identifiers), $1\text{ token} \approx 2.5\text{ to }3.0\text{ chars}$. Thus 100 characters of Python yields $\approx 100 / 2.8 \approx 35\text{--}40$ tokens.
 
-Threshold $\tau = \mu_D + 1.0 \cdot \sigma_D = 0.1956 + 0.1570 = 0.3526$.
-Comparing $D_i$ against $\tau = 0.3526$:
-\begin{itemize}
-  \item $D_3 = 0.45 > 0.3526 \implies$ Split after sentence 3 (between sentence 3 and 4).
-  \item $D_6 = 0.52 > 0.3526 \implies$ Split after sentence 6 (between sentence 6 and 7).
-\end{itemize}
-Three semantic chunks are created: $\{s_0, s_1, s_2, s_3\}$, $\{s_4, s_5, s_6\}$, and $\{s_7, s_8, s_9\}$.
-
-\subsection*{Solution 2.2}
-Character overlap counts raw string characters (including spaces and punctuation). Token overlap counts discrete vocabulary tokens produced by BPE/WordPiece tokenizers. In standard English prose, 1 token $\approx 4$ characters. In source code, due to indentation, punctuation, short identifiers, and CamelCase syntax, 1 token $\approx 2.5$ to $3.0$ characters.
-Therefore, 100 characters of code corresponds to approximately $\frac{100}{2.8} \approx 35 \text{ to } 40$ tokens. If the target overlap was intended to be 100 tokens, a 100-character setting is severely under-buffered.
-
-\subsection*{Solution 2.3}
-When multiple child chunks belonging to the same parent document match the query vector, the vector database returns multiple child hits with identical \texttt{parent\_id} metadata. If unhandled, fetching each parent produces redundant duplicate documents.
-Fix by maintaining an ordered set or dictionary during parent retrieval:
+\subsection*{Solution \thechapter.3}
+Multiple child chunks from the same parent document ranked in the top 5 vector hits, each carrying the same \texttt{parent\_id}. Fetching \texttt{doc\_store[pid]} without tracking seen IDs repeats the parent 5 times. Fix:
 \begin{lstlisting}[language=Python]
-def deduplicate_parents(child_hits: list, doc_store: dict) -> list[str]:
-    seen = set()
-    parent_docs = []
+def deduplicate_parents(child_hits: list, doc_store: dict[str, str]) -> list[str]:
+    seen: set[str] = set()
+    parents: list[str] = []
     for hit in child_hits:
-        parent_id = hit.metadata["parent_id"]
-        if parent_id not in seen:
-            seen.add(parent_id)
-            parent_docs.append(doc_store[parent_id])
-    return parent_docs
+        pid = hit.metadata["parent_id"]
+        if pid not in seen:
+            seen.add(pid)
+            parents.append(doc_store[pid])
+    return parents
 \end{lstlisting}
 
-\subsection*{Solution 2.4}
-The architecture incorporates:
-\begin{enumerate}
-  \item \textbf{Deterministic ID Derivation}: Document chunks are keyed by SHA-256 hashes of \texttt{doc\_id + version + chunk\_index}.
-  \item \textbf{Tombstoning and Pruning}: When a page is edited, the new version is chunked. The database performs an atomic transaction: insert new child vectors, update the parent document store pointer, and issue a deletion query \texttt{DELETE FROM vector\_index WHERE doc\_id = :id AND version \textless{} :current\_version}.
-  \item \textbf{Dead-Letter Queue (DLQ)}: Failed vector updates are published to an asynchronous queue for retry with exponential backoff.
-\end{enumerate}
+\subsection*{Solution \thechapter.4}
+Key each parent and child deterministically by \texttt{sha256(doc\_id + ":" + str(version) + ":" + str(idx))}. On page update: (1) write the new parent and child vectors tagged with \texttt{doc\_id} and \texttt{version = v\_new}; (2) atomically update the pointer/metadata; (3) delete stale chunks with \texttt{DELETE FROM chunks WHERE doc\_id = :id AND version < :v\_new}; (4) route transient failures to a Dead-Letter Queue for idempotent retry.
 
-\section{Further Reading \& Citations}
+\subsection*{Solution (Try It Yourself)}
+First, top-level \texttt{\_split} splits on \texttt{"\textbackslash n\textbackslash n"} into $p_0 = \text{"Alpha one. Beta two. Gamma three."}$ (33 chars $\le 50$) and $p_1 = \text{"Delta four."}$ (11 chars $\le 50$). Adding $p_1$ to $p_0$ would reach $33 + 2 + 11 = 46 \le 50$, so wait: \texttt{"\textbackslash n\textbackslash n".join([p0, p1])} has length 46, fitting in a single 46-char chunk! If instead $p_0$ were 45 chars and $p_1$ were 11 chars ($45 + 2 + 11 = 58 > 50$), \texttt{\_flush()} emits $p_0$, checks overlap ($45 > 15$, so overlap is empty), and emits $p_1$ separately. (Testing edge cases like this with \texttt{len(separator)} included is why exact budget accounting matters!)
+
+\begin{labbridgebox}[Hands-On Exercise \& Project Bridge]
+Review how chunked documents feed dense cosine retrieval in \texttt{exercises/volume2/ex01\_vector\_math\_cosine.py}, and explore how retrieved text segments enter the hybrid search pipeline in \texttt{projects/p06-rag-hybrid-rerank/}.
+\end{labbridgebox}
+
+\section{Further Reading \protect\& Citations}
 \begin{itemize}[leftmargin=18pt]
-  \item Liu, N. F., Lin, K., Hewitt, J., Paranjape, A., Bevilacqua, M., Petroni, F., \& Liang, P. (2023). \emph{Lost in the Middle: How Language Models Use Long Contexts}. Transactions of the Association for Computational Linguistics.
-  \item Anthropic. (2024). \emph{Introducing Contextual Retrieval: Improving Retrieval-Augmented Generation with Contextual Embeddings and BM25}. Anthropic Research.
-  \item Lewis, P., et al. (2020). \emph{Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks}. Advances in Neural Information Processing Systems (NeurIPS).
+  \item Liu, N. F., et al. (2023). \emph{Lost in the Middle: How Language Models Use Long Contexts}. TACL.
+  \item Anthropic. (2024). \emph{Introducing Contextual Retrieval}. Anthropic Research.
+  \item Lewis, P., et al. (2020). \emph{Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks}. NeurIPS.
 \end{itemize}

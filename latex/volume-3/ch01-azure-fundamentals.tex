@@ -1,44 +1,87 @@
-\chapter{Azure Fundamentals and Architecture}
-\label{ch:azure-fundamentals}
+\chapter{Azure Fundamentals and Cloud Networking}
+\label{chap:azure-fundamentals}
 
 \begin{chaptergoalsbox}
 \textbf{What You Will Learn:}
 \begin{itemize}[leftmargin=12pt]
-  \item The foundational hierarchy of Azure Resource Manager (ARM), tenant management groups, subscription boundaries, and resource group lifecycles.
-  \item Virtual Network (VNet) topology design, CIDR allocation mathematics, Azure-reserved IP constraints, and VNet peering mechanics.
-  \item Traffic engineering with User-Defined Routes (UDRs), Longest Prefix Match (LPM) routing tables, and forced tunneling.
-  \item Stateful micro-segmentation using Network Security Groups (NSGs) and Application Security Groups (ASGs), including packet evaluation order.
-  \item Enterprise perimeter defense using Azure Firewall (L3--L7 stateful inspection, DNAT, SNAT, FQDN filtering).
-  \item Zero-trust private connectivity via Azure Private Link, Private Endpoints, and split-brain DNS resolution.
-  \item Modern hosting abstractions: Azure App Service VNet integration versus Azure Container Apps (ACA) serverless microservices.
+  \item Networking foundations from first principles: IPv4 binary math and CIDR blocks, OSI Layers 3/4/7, NAT/SNAT/DNAT, and DNS resolution.
+  \item The Azure Resource Manager (ARM) hierarchy (management groups, subscriptions, resource groups) and blast-radius isolation.
+  \item Virtual Network (VNet) topology design, Azure's five reserved IPs per subnet, and non-transitive VNet peering.
+  \item Traffic steering with User-Defined Routes (UDRs), Longest Prefix Match (LPM), and an end-to-end packet trace through a central firewall.
+  \item Stateful micro-segmentation using Network Security Groups (NSGs) and Application Security Groups (ASGs), including inbound vs.\ outbound evaluation order.
+  \item Perimeter inspection with Azure Firewall and zero-exposure PaaS connectivity via Azure Private Link and split-brain DNS.
+  \item Managed compute abstractions: App Service VNet integration vs.\ Azure Container Apps (ACA).
 \end{itemize}
 
 \textbf{What You Should Already Understand:}
 \begin{itemize}[leftmargin=12pt]
-  \item IPv4 subnetting fundamentals, CIDR notation (/16, /24, /28), and RFC 1918 private address ranges.
-  \item The OSI 7-layer model, specifically Layer 3 (IP), Layer 4 (TCP/UDP), and Layer 7 (HTTP/TLS).
-  \item Basic DNS concepts: A records, CNAME records, authoritative resolvers, and recursive forwarders.
+  \item Familiarity with running commands in a Linux or PowerShell terminal and calling an HTTP API or database from application code.
+  \item No prior coursework in computer networking or cloud architecture is assumed; Section~\ref{sec:v3-ch01-net-primer} builds those foundations from scratch.
 \end{itemize}
 
 \textbf{Why This Topic Exists:}
-Public cloud environments operate under a multi-tenant shared responsibility model. Without deliberate architectural boundaries, network segmentation, and identity-driven governance, enterprise systems become vulnerable to lateral movement, data exfiltration, and unconstrained blast radiuses. Mastering Azure's network and governance primitives is mandatory for building resilient, compliant, and auditable cloud platforms.
+When an AI-assisted deployment breaks in the cloud, the error message rarely says ``your route table points to the wrong virtual appliance.'' Instead, the application just hangs with a connection timeout or a TLS hostname mismatch. Understanding how cloud software-defined networks route, filter, translate, and resolve packets turns mysterious timeouts into systematic, minutes-long diagnoses.
 
 \textbf{Motivating Practical Problem:}
-A financial services platform hosting sensitive customer payment data must run a web tier and an internal transaction ledger. Regulations mandate that the ledger database must never expose a public IP, cannot route packets across the public internet, must only accept traffic from verified application containers, and all outbound egress from the infrastructure must undergo deep packet inspection to prevent data exfiltration. How do you design this infrastructure in Azure using native networking, security perimeters, and compute abstractions?
+A regional healthcare provider is deploying a clinical telemedicine portal that stores patient records in a managed Azure SQL database. Compliance rules mandate that the database must have no public IP address, must accept connections only from the clinic's API containers, and all outbound internet calls from those containers (for example, to an external pharmacy lookup API) must pass through a central inspection firewall. How do you design the subnets, routes, firewall rules, and DNS records so every packet lands in the right place?
 \end{chaptergoalsbox}
+
+\section{Networking Foundations for Cloud Engineers}
+\label{sec:v3-ch01-net-primer}
+
+Before touching Azure, we need four building blocks of computer networking. Every cloud outage involving ``unreachable'' services comes down to one of these four mechanisms.
+
+\subsection{IPv4 Addresses and CIDR Binary Math}
+Every machine on an IPv4 network is identified by a \textbf{32-bit integer}, written as four 8-bit numbers (\emph{octets}, each from $0$ to $255$) separated by dots: for example, \texttt{10.0.1.5}. In binary, those four octets are:
+\begin{equation*}
+\texttt{10.0.1.5} = \underbrace{00001010}_{10}.\underbrace{00000000}_{0}.\underbrace{00000001}_{1}.\underbrace{00000101}_{5}
+\end{equation*}
+
+A network needs a way to split those 32 bits into two parts: a \textbf{network prefix} (like a street name) and a \textbf{host identifier} (like a house number). \textbf{CIDR (Classless Inter-Domain Routing)} notation writes a slash followed by the number of leading prefix bits, such as \texttt{10.0.1.0/24}.
+\begin{itemize}[leftmargin=12pt]
+  \item A \texttt{/24} prefix locks the first 24 bits (\texttt{10.0.1}) and leaves $32 - 24 = 8$ bits for hosts. With 8 host bits, there are $2^8 = 256$ total addresses (\texttt{10.0.1.0} through \texttt{10.0.1.255}).
+  \item A \texttt{/27} prefix locks the first 27 bits and leaves $32 - 27 = 5$ host bits, yielding $2^5 = 32$ addresses (\texttt{10.0.1.0} through \texttt{10.0.1.31}).
+  \item A \texttt{/16} prefix locks the first 16 bits (\texttt{10.0}) and leaves $32 - 16 = 16$ host bits, yielding $2^{16} = 65{,}536$ addresses.
+\end{itemize}
+
+\begin{intuitionbox}[Prefix Length Is Inversely Proportional to Size]
+It feels backwards at first, but a \textbf{larger} slash number means a \textbf{smaller} subnet: \texttt{/24} (256 IPs) is much smaller than \texttt{/16} (65,536 IPs) because more bits are frozen in the prefix and fewer bits remain for hosts. Under \textbf{RFC 1918}, three address ranges are reserved for private internal networks and are never routed on the public internet: \texttt{10.0.0.0/8}, \texttt{172.16.0.0/12}, and \texttt{192.168.0.0/16}.
+\end{intuitionbox}
+
+\subsection{The OSI Layers That Matter in Cloud Engineering}
+Network engineers organize protocols into the 7-layer OSI model, but cloud firewalls and load balancers focus on three layers:
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{Layer 3 (Network / IP):} Moves packets from a source IP address to a destination IP address across routers (e.g., \texttt{10.1.1.10} $\to$ \texttt{10.1.2.50}). Layer 3 knows nothing about ports or HTTP URLs.
+  \item \textbf{Layer 4 (Transport / TCP and UDP):} Adds \textbf{ports} (16-bit numbers $0$--$65535$) so one machine can run a web server on port 443 and a database on port 1433 simultaneously. Together, the \textbf{5-tuple} $\langle \text{Src IP}, \text{Src Port}, \text{Dst IP}, \text{Dst Port}, \text{Protocol} \rangle$ uniquely identifies a network flow.
+  \item \textbf{Layer 7 (Application / HTTP and TLS):} Inspects application payloads—such as the HTTP \texttt{Host} header, URL path (\texttt{/api/patients}), or the TLS \textbf{Server Name Indication (SNI)} hostname sent during encryption setup.
+\end{itemize}
+
+\subsection{NAT, SNAT, and DNAT}
+Because private RFC 1918 addresses (like \texttt{10.1.1.10}) cannot travel across the public internet, cloud gateways use \textbf{Network Address Translation (NAT)} to rewrite IP headers in flight:
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{SNAT (Source NAT):} Rewrites the \emph{source} IP (and usually source port) on outbound packets. When container \texttt{10.1.1.10} calls an external pharmacy API, the cloud gateway swaps the source IP to a public IP (say \texttt{20.60.14.8}), remembers the mapping in a connection table, and rewrites the reply back to \texttt{10.1.1.10}.
+  \item \textbf{DNAT (Destination NAT):} Rewrites the \emph{destination} IP (and port) on inbound packets. When a user connects to a firewall's public IP on port 443, DNAT translates the destination to an internal reverse proxy at \texttt{10.1.1.20:8443}.
+\end{itemize}
+
+\subsection{DNS Resolution: A Records, CNAMEs, and Resolvers}
+Humans and TLS certificates use hostnames like \texttt{sql-clinic.database.windows.net}, whereas Layer 3 routers require numeric IP addresses. The \textbf{Domain Name System (DNS)} bridges the two:
+\begin{itemize}[leftmargin=12pt]
+  \item An \textbf{\texttt{A} record} maps a hostname directly to an IPv4 address (e.g., \texttt{10.1.2.50}).
+  \item A \textbf{\texttt{CNAME} record} maps one hostname to another canonical hostname (an alias), telling the client to resolve the target name instead.
+  \item A \textbf{recursive resolver} is the DNS server your application asks first; it walks or forwards queries to \textbf{authoritative nameservers} that own a domain's records and returns the final IP.
+\end{itemize}
 
 \section{Azure Resource Management Hierarchy and Governance}
 
-At the core of Microsoft Azure sits the \textbf{Azure Resource Manager (ARM)}, a unified management layer that enforces authentication, authorization, quota management, and declarative provisioning for every API call across the platform. Whether an engineer interacts through the Azure Portal, Azure CLI, REST APIs, or Infrastructure as Code (Terraform, Bicep), the request routes through ARM.
+At the front door of Microsoft Azure sits \textbf{Azure Resource Manager (ARM)}, the unified control-plane API gateway that handles authentication, authorization, quota enforcement, and resource creation. Whether you click in the Azure Portal, run the Azure CLI (\texttt{az}), or apply Infrastructure as Code (covered in Chapter~\ref{chap:terraform}), every call goes through ARM.
 
 \subsection{The Four-Level Management Hierarchy}
-
-Governance in Azure is organized in a strict top-down tree with four tiers:
+Governance in Azure forms a strict four-tier tree:
 \begin{enumerate}[leftmargin=15pt]
-  \item \textbf{Tenant Root Group / Management Groups:} Containers that provide governance scope above individual subscriptions. Organizations can create a hierarchy of up to six levels of depth to reflect organizational structures (e.g., Business Units, Geographies, Environments such as \texttt{Production} vs. \texttt{Non-Production}).
-  \item \textbf{Subscriptions:} A fundamental unit of billing, identity boundary, and technical quota. Subscriptions hold dedicated limits on resources (e.g., maximum cores per region, maximum VNets).
-  \item \textbf{Resource Groups (RGs):} Logical containers for resources that share the same lifecycle, deployment cadence, and administrative ownership.
-  \item \textbf{Resources:} Individual manageable instances (e.g., Virtual Machines, Virtual Networks, Key Vaults, Storage Accounts).
+  \item \textbf{Tenant Root Group / Management Groups:} Containers above subscriptions (up to six levels deep) mirroring organizational structure (for example, \texttt{Production} vs.\ \texttt{Non-Production}).
+  \item \textbf{Subscriptions:} The primary boundary for billing, technical quotas (such as maximum CPU cores per region), and security blast radius.
+  \item \textbf{Resource Groups (RGs):} Logical folders inside a subscription holding resources that share a deployment lifecycle (for example, all networking components for one region).
+  \item \textbf{Resources:} Individual instances such as Virtual Networks, SQL databases, or firewalls.
 \end{enumerate}
 
 \begin{figure}[htbp]
@@ -51,12 +94,10 @@ Governance in Azure is organized in a strict top-down tree with four tiers:
   res/.style={rectangle, draw=gray!60, fill=gray!10, rounded corners=2pt, text width=4.4cm, minimum height=0.7cm, align=center, font=\sffamily\scriptsize},
   arrow/.style={-{Stealth[scale=0.9]}, thick, color=headingblue!70}
 ]
-
-\node[mgmt] (root) {Tenant Root Management Group (Contoso Global)};
+\node[mgmt] (root) {Tenant Root Management Group (Clinic Global)};
 \node[mgmt, below left=1.0cm and -1.8cm of root] (mg_prod) {Management Group: Production};
 \node[mgmt, below right=1.0cm and -1.8cm of root] (mg_dev) {Management Group: Non-Production};
-
-\node[sub, below=0.8cm of mg_prod] (sub_prod) {Subscription: Core-Banking-Prod\\(Billing \& Quota Boundary)};
+\node[sub, below=0.8cm of mg_prod] (sub_prod) {Subscription: Clinical-Portal-Prod\\(Billing \& Quota Boundary)};
 \node[rg, below=0.8cm of sub_prod] (rg_net) {Resource Group: \texttt{rg-networking-eastus}\\(Shared Lifecycle: VNet, Firewalls)};
 \node[res, below=0.7cm of rg_net] (res1) {VNet: \texttt{vnet-hub-10.0.0.0/16}\\Azure Firewall, Private DNS};
 
@@ -65,145 +106,178 @@ Governance in Azure is organized in a strict top-down tree with four tiers:
 \draw[arrow] (mg_prod) -- (sub_prod);
 \draw[arrow] (sub_prod) -- (rg_net);
 \draw[arrow] (rg_net) -- (res1);
-
 \end{tikzpicture}
 \caption{Azure Resource Manager Management Hierarchy and Scope Inheritance}
-\label{fig:azure-hierarchy}
+\label{fig:v3-ch01-azure-hierarchy}
 \end{figure}
 
 \begin{intuitionbox}[Governance Inheritance as Lexical Scoping]
-Think of the Azure management hierarchy like lexical variable scoping in programming languages. Any policy, compliance guardrail (Azure Policy), or access rule (Azure Role-Based Access Control, or RBAC) assigned at a parent scope is inherited automatically by every child scope down the tree. You cannot ``override'' or ``uninherit'' a Deny rule defined at the Root Management Group from within a child Resource Group.
+Think of the Azure hierarchy like lexical variable scoping in code. Any compliance guardrail (Azure Policy) or access permission (Azure RBAC) assigned at a parent scope flows downward automatically to every child resource. A Resource Group owner cannot bypass a Deny policy inherited from a Management Group.
 \end{intuitionbox}
 
-\subsection{Subscription Boundaries and Blast Radius Isolation}
-Architects frequently mistake Resource Groups for security or isolation boundaries. In production enterprise designs, \textbf{Subscriptions} serve as the primary blast-radius boundary. A compromised credential or misconfigured network policy inside a \texttt{Sandbox-Sub} cannot exceed its subscription quotas, impact the billing alerts of \texttt{Prod-Sub}, or manipulate resources across subscriptions unless explicit cross-subscription RBAC assignments or network peering paths exist.
+\subsection{Subscription Boundaries and Blast-Radius Isolation}
+Engineers often mistake Resource Groups for security boundaries. A Resource Group is only a lifecycle folder: a misconfigured script or runaway autoscaler in one Resource Group can exhaust subscription-wide quotas or billing limits for sibling Resource Groups in the same subscription. Production systems separate \texttt{Sandbox}, \texttt{Staging}, and \texttt{Production} into distinct 	extbf{Subscriptions} so that mistakes in non-production cannot exhaust production quotas or touch production data.
 
 \section{Software-Defined Networking: Virtual Networks and Subnets}
 
-An Azure \textbf{Virtual Network (VNet)} is an isolated, software-defined network overlay construct residing within a single Azure region. A VNet provides complete layer-3 isolation from other networks in Azure and maps to RFC 1918 private address allocations.
+An Azure \textbf{Virtual Network (VNet)} is an isolated Layer-3 software-defined network residing in a single Azure region. Within a VNet, you carve smaller address blocks called \textbf{subnets} for each application tier.
 
-\subsection{CIDR Allocation and Azure-Reserved IP Addresses}
-When carving subnets from a VNet address prefix (such as \texttt{10.0.0.0/16}), network engineers must account for Azure's proprietary reservation model. In standard IPv4 networking, only two addresses are unusable in any given subnet: the network identifier (first IP) and the broadcast address (last IP). 
+\subsection{Azure-Reserved IP Addresses}
+In traditional physical Ethernet networks, two addresses in every subnet are unusable: the first address (network ID) and the last address (broadcast). In Azure, 	extbf{five IP addresses are permanently reserved} in every subnet to run Azure's virtualized infrastructure:
 
-In Microsoft Azure, \textbf{five IP addresses are permanently reserved} in every subnet:
 \begin{table}[htbp]
 \centering\small
-\begin{tabular}{lp{5.5cm}p{6.0cm}}
+\begin{tabular}{lp{4.2cm}p{6.8cm}}
 \toprule
 \textbf{Offset} & \textbf{Example (\texttt{10.0.1.0/24})} & \textbf{Purpose / Reserved Role} \\
 \midrule
-\texttt{x.x.x.0} & \texttt{10.0.1.0} & \textbf{Network Address:} Reserved by RFC rules. \\
-\texttt{x.x.x.1} & \texttt{10.0.1.1} & \textbf{Default Gateway:} Assigned to the virtual router interface. \\
-\texttt{x.x.x.2} & \texttt{10.0.1.2} & \textbf{Azure DNS:} Maps Azure recursive resolver IP to subnet space. \\
-\texttt{x.x.x.3} & \texttt{10.0.1.3} & \textbf{Azure Internal DNS:} Reserved for future Azure DNS routing. \\
-\texttt{x.x.x.255} & \texttt{10.0.1.255} & \textbf{Broadcast Address:} Reserved by RFC rules. \\
+\texttt{+0} & \texttt{10.0.1.0} & \textbf{Network Address:} Identifies the subnet itself. \\
+\texttt{+1} & \texttt{10.0.1.1} & \textbf{Default Gateway:} Virtual router interface for traffic leaving the subnet. \\
+\texttt{+2} & \texttt{10.0.1.2} & \textbf{Azure DNS:} Mapped endpoint for Azure's recursive resolver. \\
+\texttt{+3} & \texttt{10.0.1.3} & \textbf{Azure Internal DNS:} Reserved by platform for future DNS services. \\
+\texttt{last} & \texttt{10.0.1.255} & \textbf{Broadcast Address:} Reserved by IPv4 specification. \\
 \bottomrule
 \end{tabular}
 \caption{Azure Subnet IP Address Reservations}
-\label{tab:azure-reserved-ips}
+\label{tab:v3-ch01-reserved-ips}
 \end{table}
 
 \begin{productionwarningbox}[Minimum Subnet Sizes]
-Because five IPs are consumed before any workload is provisioned, a \texttt{/29} subnet (8 total addresses) yields only $8 - 5 = 3$ usable host IPs. The absolute smallest subnet allowed in Azure is a \texttt{/29}, while many managed PaaS services (such as Azure Application Gateway v2 or Azure Firewall) explicitly mandate a \texttt{/24} or \texttt{/26} subnet to support autoscaling and high-availability health probes.
+Because five IPs are consumed immediately, a \texttt{/29} subnet ($2^3 = 8$ total addresses) leaves only $8 - 5 = 3$ usable host IPs. Azure rejects any subnet smaller than \texttt{/29}, and managed appliances such as Azure Firewall require at least a \texttt{/26} ($64 - 5 = 59$ usable IPs) in a dedicated subnet literally named \texttt{AzureFirewallSubnet}.
 \end{productionwarningbox}
 
 \subsection{VNet Peering Mechanics}
-Virtual Network Peering connects two VNets seamlessly across the Azure software-defined backbone. Once peered:
+\textbf{VNet Peering} links two VNets over Microsoft's private fiber backbone so workloads communicate using private IPs without touching the public internet. Crucially, peering is \textbf{non-transitive}: if VNet~A is peered with VNet~B, and VNet~B is peered with VNet~C, workloads in VNet~A \emph{cannot} reach VNet~C through VNet~B automatically. To route between A and C (a Hub-and-Spoke topology), VNet~B must host a router or firewall (such as Azure Firewall) and you must configure explicit route tables telling A and C to send packets through that appliance.
+
+\section{Traffic Steering: Route Tables and End-to-End Packet Flow}
+
+Every Azure subnet receives a default 	extbf{System Route Table} containing built-in rules:
 \begin{itemize}[leftmargin=12pt]
-  \item Packets travel directly across Microsoft's high-speed private fiber infrastructure without transiting the public internet or passing through physical gateways.
-  \item Latency between peered VNets is equivalent to intra-VNet latency.
-  \item Peering is \textbf{non-transitive}. If VNet A is peered with VNet B, and VNet B is peered with VNet C, workloads in VNet A \textbf{cannot} communicate with VNet C through VNet B by default. To enable transitive routing, VNet B must deploy a Network Virtual Appliance (NVA) or Azure Firewall, accompanied by User-Defined Routes.
+  \item Traffic destined for another address inside the same VNet uses next-hop \texttt{VnetLocal}.
+  \item Traffic destined for a peered VNet uses next-hop \texttt{VNetPeering}.
+  \item Traffic destined for anything else (\texttt{0.0.0.0/0}) goes straight out to the internet via Azure's default SNAT (\texttt{Internet}).
 \end{itemize}
 
-\section{Traffic Steering: Route Tables and User-Defined Routes (UDRs)}
-
-By default, Azure automatically provisions a system route table for every subnet. This system route table establishes default forwarding behaviors:
-\begin{itemize}[leftmargin=12pt]
-  \item \textbf{Intra-VNet traffic:} Forwarded directly via the \texttt{Virtual network} next-hop type.
-  \item \textbf{Inter-peered VNet traffic:} Forwarded directly via the \texttt{Virtual network peering} next-hop type.
-  \item \textbf{Internet outbound:} Directly routed out through Azure default SNAT (\texttt{Internet} next-hop type).
-\end{itemize}
-
-\subsection{Longest Prefix Match and Override Logic}
-When traffic leaves a subnet, Azure's software-defined virtual router selects the route based on the \textbf{Longest Prefix Match (LPM)} algorithm. When prefix lengths match exactly, the priority order is:
+\subsection{Longest Prefix Match and User-Defined Routes (UDRs)}
+When a packet leaves a virtual NIC, Azure's router scans the effective route table and picks the matching route with the 	extbf{most specific (longest) CIDR prefix}—an algorithm called 	extbf{Longest Prefix Match (LPM)}. For example, if a table has both \texttt{0.0.0.0/0} (0 fixed bits) and \texttt{10.1.2.0/24} (24 fixed bits), a packet bound for \texttt{10.1.2.50} matches \texttt{10.1.2.0/24} because $24 > 0$. When two routes have the exact same prefix length, Azure breaks ties by source:
 \begin{equation}
-\text{User-Defined Routes (UDR)} > \text{BGP Routes (ExpressRoute/VPN)} > \text{Default System Routes}
+\text{User-Defined Routes (UDR)} > \text{BGP Routes (VPN/ExpressRoute)} > \text{Default System Routes}
 \end{equation}
 
-To enforce strict security perimeters where no workload can directly touch the internet, engineers deploy a \textbf{Route Table} containing a User-Defined Route that intercepts all outbound traffic:
-\begin{lstlisting}[language=bash, caption={Terraform HCL for Default Forced Tunneling UDR}]
-resource "azurerm_route_table" "spoke_rt" {
-  name                          = "rt-spoke-workload"
-  location                      = "eastus"
-  resource_group_name           = "rg-networking-eastus"
-  disable_bgp_route_propagation = false
+To force all outbound internet traffic—and all spoke-to-spoke traffic—through a central Azure Firewall at \texttt{10.0.100.4}, an engineer creates a Route Table with a UDR via Azure CLI (later in Chapter~\ref{chap:terraform}, we will codify this declaratively with Terraform):
 
-  route {
-    name                   = "ForceAllTrafficToFirewall"
-    address_prefix         = "0.0.0.0/0"
-    next_hop_type          = "VirtualAppliance"
-    next_hop_in_ip_address = "10.0.100.4" # Azure Firewall Private IP
-  }
-}
+\begin{lstlisting}[language=bash, caption={Creating a Forced-Tunneling UDR via Azure CLI}]
+# 1. Create the custom route table in the networking resource group
+az network route-table create \
+  --name rt-spoke-workload \
+  --resource-group rg-networking-eastus \
+  --location eastus
+
+# 2. Override the default 0.0.0.0/0 Internet route -> send to Azure Firewall
+az network route-table route create \
+  --resource-group rg-networking-eastus \
+  --route-table-name rt-spoke-workload \
+  --name ForceAllTrafficToFirewall \
+  --address-prefix 0.0.0.0/0 \
+  --next-hop-type VirtualAppliance \
+  --next-hop-ip-address 10.0.100.4
+
+# 3. Attach the route table to the application subnet
+az network vnet subnet update \
+  --resource-group rg-networking-eastus \
+  --vnet-name vnet-spoke-clinic \
+  --name snet-app \
+  --route-table rt-spoke-workload
 \end{lstlisting}
 
-\begin{underthehoodbox}[How Virtual Routers Process UDRs]
-Azure does not deploy physical router appliances per subnet. Networking is implemented via Azure's virtualized host SDN layer (historically codenamed \emph{Accilio} / \emph{Virtual Filtering Platform (VFP)}). When a virtual NIC transmits an IP packet, the local hypervisor host intercepts the packet at Layer 3, evaluates the effective route table in memory using an optimized trie structure, and encapsulates the payload into an NVGRE or Geneve packet directed to the destination host's physical IP.
+\textbf{Step-by-step trace of Listing 1:} Lines 2--5 allocate an empty route table resource in \texttt{eastus}. Lines 8--14 insert a \texttt{0.0.0.0/0} rule whose next hop is \texttt{VirtualAppliance} (\texttt{10.0.100.4}). Because this UDR has the same \texttt{/0} prefix length as Azure's system \texttt{Internet} route, UDR priority wins and replaces direct internet egress. Lines 17--21 bind the table to \texttt{snet-app} so every NIC in that subnet inherits the rule immediately.
+
+\begin{underthehoodbox}[How Azure VFP Processes UDRs Without Physical Routers]
+Azure does not spin up a virtual router VM for every subnet. Instead, routing and firewalling run inside the hypervisor host's software-defined networking engine—historically codenamed \emph{Accordo} and implemented by Microsoft's \textbf{Virtual Filtering Platform (VFP)}. When a workload sends a packet, VFP intercepts it at the virtual switch port on the host CPU, runs LPM against an in-memory radix trie of the subnet's effective routes, and encapsulates the packet in NVGRE or Geneve headers sent directly across the datacenter fabric to the next-hop physical server (such as the host running the Azure Firewall).
 \end{underthehoodbox}
+
+\subsection{Tracing One Packet End-to-End}
+To make these layers concrete, trace a single TCP SYN packet sent from our clinic API container at \texttt{10.1.1.10} (ephemeral source port \texttt{49152}) to the SQL Private Endpoint at \texttt{10.1.2.50} (port \texttt{1433}), assuming a UDR steers \texttt{10.1.2.0/24} through the Hub firewall (\texttt{10.0.100.4}):
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{DNS Resolution:} The API asks Azure DNS (\texttt{168.63.129.16}) for \texttt{sql-clinic.database.windows.net} and receives \texttt{10.1.2.50}.
+  \item \textbf{Source Outbound NSGs:} VFP evaluates the API's \textbf{NIC NSG} outbound rules, then \texttt{snet-app}'s \textbf{Subnet NSG} outbound rules, matching the 5-tuple $\langle \texttt{10.1.1.10}, 49152, \texttt{10.1.2.50}, 1433, \text{TCP} \rangle$. Both allow it.
+  \item \textbf{Route Lookup:} VFP runs LPM on \texttt{snet-app}'s effective routes and finds the UDR \texttt{10.1.2.0/24 -> VirtualAppliance 10.0.100.4}. VFP tunnels the packet across the Hub-Spoke peering to the firewall.
+  \item \textbf{Firewall Inspection:} Azure Firewall checks its Network Rules (L3/L4) and permits \texttt{10.1.1.0/24 -> 10.1.2.50:1433}.
+  \item \textbf{Destination Inbound NSGs:} Arriving at \texttt{snet-endpoints}, VFP checks the destination Subnet NSG (and NIC NSG if present) for inbound TCP 1433. Because both allow it, the packet reaches the Private Endpoint and enters Private Link to Azure SQL.
+\end{enumerate}
 
 \section{Network Access Control: NSGs and ASGs}
 
-A \textbf{Network Security Group (NSG)} is a stateful layer-4 packet-filtering firewall. It contains a list of Access Control Rules evaluated in numerical order from lowest to highest priority index (ranging from 100 to 4096).
+A \textbf{Network Security Group (NSG)} is a stateful Layer-4 packet filter. Rules are numbered by priority from \texttt{100} to \texttt{4096}; 	extbf{lower numbers evaluate first}, and the first matching rule wins (stopping further checks).
 
-\subsection{Stateful Connection Tracking and 5-Tuple Evaluation}
-Because NSGs are \textbf{stateful}, if an inbound connection is permitted through rule evaluation, the corresponding outbound response packet is automatically allowed regardless of outbound NSG rules. The packet is evaluated against the classic 5-tuple:
-\begin{equation}
-\langle \text{Source IP}, \text{Source Port}, \text{Destination IP}, \text{Destination Port}, \text{Protocol (TCP/UDP/ICMP)} \rangle
-\end{equation}
-
-\subsection{Default Security Rules}
-Every NSG contains three immutable default rules at the end of the rule list:
+\subsection{Stateful Tracking and Default Rules}
+Because NSGs are 	extbf{stateful}, permitting an inbound TCP request automatically creates a state-table entry that permits the return packets for that exact 5-tuple, even if an outbound rule would otherwise block them. Every NSG also ends with three immutable default rules (priorities \texttt{65000}, \texttt{65001}, \texttt{65500}):
 \begin{itemize}[leftmargin=12pt]
-  \item \textbf{Priority 65000 (\texttt{AllowVnetInBound}):} Allows all traffic originating from any VNet address space or peered VNet.
-  \item \textbf{Priority 65001 (\texttt{AllowAzureLoadBalancerInBound}):} Allows Azure health probes (\texttt{168.63.129.16}) to reach backends.
-  \item \textbf{Priority 65500 (\texttt{DenyAllInBound}):} Drops any inbound traffic not explicitly allowed by earlier rules.
+  \item \textbf{65000 (\texttt{AllowVnetInBound}):} Allows traffic from within the VNet or peered VNets.
+  \item \textbf{65001 (\texttt{AllowAzureLoadBalancerInBound}):} Allows Azure health probes originating from Azure's internal WireServer/host infrastructure IP \texttt{168.63.129.16}.
+  \item \textbf{65500 (\texttt{DenyAllInBound}):} Drops anything not explicitly allowed above.
 \end{itemize}
 
 \begin{figure}[htbp]
 \centering
 \begin{tikzpicture}[
-  node distance=1.1cm,
-  box/.style={rectangle, draw=headingblue, fill=white, rounded corners=2pt, text width=11.0cm, inner sep=7pt, font=\sffamily\footnotesize},
-  highlight/.style={rectangle, draw=warningRed, fill=warningBg, rounded corners=2pt, text width=11.0cm, inner sep=7pt, font=\sffamily\footnotesize},
-  arrow/.style={-{Stealth[scale=1.0]}, thick, color=headingblue}
+  node distance=0.6cm and 0.9cm,
+  gate/.style={rectangle, draw=headingblue, fill=exampleBg, rounded corners=2pt, text width=2.7cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  vm/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, text width=2.2cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  ext/.style={rectangle, draw=gray!60, fill=gray!10, rounded corners=2pt, text width=2.0cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize},
+  drop/.style={rectangle, draw=warningRed, fill=warningBg, rounded corners=2pt, text width=1.6cm, minimum height=0.6cm, align=center, font=\sffamily\tiny\bfseries},
+  arrow/.style={-{Stealth[scale=0.85]}, thick, color=headingblue},
+  darrow/.style={-{Stealth[scale=0.8]}, thick, dashed, color=warningRed}
 ]
 
-\node[box] (step1) {\textbf{Inbound Evaluation Order: Subnet NSG First, then NIC NSG}\\
-An external packet entering a VM first passes through the NSG associated with the \textbf{Subnet}. If permitted, it then passes through the NSG associated with the VM's \textbf{Network Interface (NIC)}. If either drops the packet, it is discarded.};
+% Inbound row
+\node[ext] (in_src) {Inbound Packet\\(Internet / Peer)};
+\node[gate, right=0.8cm of in_src] (in_snet) {1. Subnet NSG\\(Inbound Rules)};
+\node[gate, right=0.8cm of in_snet] (in_nic) {2. NIC NSG\\(Inbound Rules)};
+\node[vm, right=0.8cm of in_nic] (in_vm) {VM / Pod\\Receives Packet};
 
-\node[box, below=0.6cm of step1] (step2) {\textbf{Outbound Evaluation Order: NIC NSG First, then Subnet NSG}\\
-An egress packet leaving a VM first evaluates the \textbf{NIC NSG}. If permitted, it travels to the \textbf{Subnet NSG}. Both must evaluate to \texttt{Allow} for the packet to leave the subnet boundary.};
+\node[drop, below=0.55cm of in_snet] (d1) {Dropped};
+\node[drop, below=0.55cm of in_nic] (d2) {Dropped};
 
-\draw[arrow] (step1) -- (step2);
+\draw[arrow] (in_src) -- (in_snet);
+\draw[arrow] (in_snet) -- node[above, font=\tiny\sffamily]{Allow} (in_nic);
+\draw[arrow] (in_nic) -- node[above, font=\tiny\sffamily]{Allow} (in_vm);
+\draw[darrow] (in_snet) -- node[right, font=\tiny\sffamily]{Deny} (d1);
+\draw[darrow] (in_nic) -- node[right, font=\tiny\sffamily]{Deny} (d2);
+
+% Outbound row
+\node[vm, below=1.6cm of in_src] (out_vm) {VM / Pod\\Sends Packet};
+\node[gate, right=0.8cm of out_vm] (out_nic) {1. NIC NSG\\(Outbound Rules)};
+\node[gate, right=0.8cm of out_nic] (out_snet) {2. Subnet NSG\\(Outbound Rules)};
+\node[ext, right=0.8cm of out_snet] (out_dst) {Leaves Subnet\\to Next Hop};
+
+\node[drop, below=0.55cm of out_nic] (d3) {Dropped};
+\node[drop, below=0.55cm of out_snet] (d4) {Dropped};
+
+\draw[arrow] (out_vm) -- (out_nic);
+\draw[arrow] (out_nic) -- node[above, font=\tiny\sffamily]{Allow} (out_snet);
+\draw[arrow] (out_snet) -- node[above, font=\tiny\sffamily]{Allow} (out_dst);
+\draw[darrow] (out_nic) -- node[right, font=\tiny\sffamily]{Deny} (d3);
+\draw[darrow] (out_snet) -- node[right, font=\tiny\sffamily]{Deny} (d4);
 
 \end{tikzpicture}
-\caption{Two-Tier NSG Packet Evaluation Order}
-\label{fig:nsg-eval-order}
+\caption{Two-Tier NSG Packet Evaluation Order for Inbound vs.\ Outbound Traffic}
+\label{fig:v3-ch01-nsg-eval-order}
 \end{figure}
 
+As Figure~\ref{fig:v3-ch01-nsg-eval-order} illustrates, inbound packets pass through the 	extbf{Subnet NSG first and the NIC NSG second}, whereas outbound packets pass through the 	extbf{NIC NSG first and the Subnet NSG second}. Both gates must evaluate to \texttt{Allow}.
+
 \subsection{Application Security Groups (ASGs)}
-In dynamic cloud architectures, assigning static IP addresses to security rules creates unmaintainable brittle configurations. \textbf{Application Security Groups (ASGs)} allow administrators to group virtual network interfaces under logical tags (e.g., \texttt{asg-web-tier}, \texttt{asg-database-tier}). NSG rules then declare traffic flow policies between ASG tags directly, eliminating IP address maintenance as clusters scale horizontally.
+Hardcoding VM IP addresses into NSG rules breaks whenever autoscaling adds or replaces instances. \textbf{Application Security Groups (ASGs)} let you tag NICs with logical labels (such as \texttt{asg-clinic-api} and \texttt{asg-sql-pe}) and write NSG rules referencing those tags directly.
 
-\section{Perimeter Security: Azure Firewall Architecture}
+\section{Perimeter Defense and Private Link Connectivity}
 
-While NSGs operate at Layer 4 across individual subnets, an enterprise DMZ demands centralized, cloud-native Layer 3--Layer 7 inspection. \textbf{Azure Firewall} is a stateful, fully managed, highly available firewall-as-a-service with built-in autoscaling.
-
-\subsection{Rule Architecture and Processing Hierarchy}
-Azure Firewall evaluates incoming connections through a strict deterministic hierarchy:
+\subsection{Azure Firewall Processing Hierarchy}
+While NSGs filter at Layer 4, \textbf{Azure Firewall} provides centralized Layer-3 through Layer-7 inspection in a Hub VNet (Figure~\ref{fig:v3-ch01-hub-spoke}). It evaluates rules in strict order:
 \begin{enumerate}[leftmargin=15pt]
-  \item \textbf{DNAT Rules (Destination Network Address Translation):} Translates incoming public traffic hitting the firewall's public IP to internal private IP endpoints. Automatically applies a corresponding network rule to permit the translated traffic.
-  \item \textbf{Network Rules (L3/L4):} Evaluates protocol, source/destination IPs, and destination ports. Processed before any application inspection.
-  \item \textbf{Application Rules (L7):} Intercepts HTTP/HTTPS traffic to perform \textbf{FQDN filtering} (e.g., allowing egress only to \texttt{*.github.com} or \texttt{api.stripe.com}) and TLS termination for deep packet payload inspection.
+  \item \textbf{DNAT Rules:} Translate inbound public IP traffic to private internal endpoints.
+  \item \textbf{Network Rules (L3/L4):} Filter by IP, port, and protocol.
+  \item \textbf{Application Rules (L7):} Inspect HTTP Host headers and TLS SNI to enforce 	extbf{FQDN allowlists} (for example, permitting outbound HTTPS only to \texttt{api.rxnorm.nih.gov}).
 \end{enumerate}
 
 \begin{figure}[htbp]
@@ -211,88 +285,84 @@ Azure Firewall evaluates incoming connections through a strict deterministic hie
 \begin{tikzpicture}[
   scale=0.9, every node/.style={scale=0.9},
   node distance=1.2cm and 1.0cm,
-  vnet/.style={rectangle, draw=headingblue!70, fill=headingblue!3, dashed, inner sep=10pt, rounded corners=4pt},
   comp/.style={rectangle, draw=exampleBlue, fill=exampleBg, rounded corners=2pt, text width=3.4cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
   fw/.style={rectangle, draw=warningRed, fill=warningBg, rounded corners=2pt, text width=3.6cm, minimum height=1.2cm, align=center, font=\sffamily\scriptsize\bfseries},
   pe/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, text width=3.4cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
   arrow/.style={-{Stealth[scale=0.9]}, thick, color=headingblue!80}
 ]
-
-% Hub VNet
-\node[fw] (afw) {Azure Firewall\\(Central L3-L7 Inspection)\\\texttt{10.0.100.4}};
+\node[fw] (afw) {Azure Firewall\\(Central L3--L7 Inspection)\\\texttt{10.0.100.4}};
 \node[above=0.2cm of afw, font=\sffamily\small\bfseries\color{headingblue}] {Hub VNet (\texttt{10.0.0.0/16})};
 
-% Spoke VNet
-\node[comp, below left=1.6cm and 0.5cm of afw] (app) {Container App / VM\\(\texttt{snet-workload})\\\texttt{10.1.1.10}};
+\node[comp, below left=1.6cm and 0.5cm of afw] (app) {Clinic API Container\\(\texttt{snet-app})\\\texttt{10.1.1.10}};
 \node[pe, below right=1.6cm and 0.5cm of afw] (pe_db) {Private Endpoint\\(\texttt{snet-endpoints})\\\texttt{10.1.2.50}};
-\node[comp, right=1.0cm of pe_db] (db) {Azure SQL / Blob\\(PaaS Service Backing)};
+\node[comp, right=1.0cm of pe_db] (db) {Azure SQL / Blob\\(Public Access Disabled)};
 
-% Borders
-\draw[arrow] (app) -- node[left, font=\tiny\sffamily]{0.0.0.0/0 via UDR} (afw);
-\draw[arrow] (afw) -- node[right, font=\tiny\sffamily]{Filtered Inspection} (pe_db);
+\draw[arrow] (app) -- node[left, font=\tiny\sffamily]{UDR via Peering} (afw);
+\draw[arrow] (afw) -- node[right, font=\tiny\sffamily]{Inspected Flow} (pe_db);
 \draw[arrow, dashed] (pe_db) -- node[above, font=\tiny\sffamily]{Private Link} (db);
-
 \end{tikzpicture}
 \caption{Hub-and-Spoke Topology with Azure Firewall and Private Endpoint Routing}
-\label{fig:hub-spoke-topology}
+\label{fig:v3-ch01-hub-spoke}
 \end{figure}
 
-\section{Private Connectivity: Private Endpoints and Azure Private Link}
+\subsection{Service Endpoints vs.\ Private Endpoints}
+To keep database and storage traffic off the public internet, Azure historically offered \textbf{Service Endpoints}, which route traffic over Microsoft's backbone to the PaaS service's *public* IP. However, Service Endpoints permit traffic to *any* instance of that service in the region—meaning a compromised container can still exfiltrate patient records to an attacker's personal Azure Storage account.
 
-Historically, accessing Azure Platform-as-a-Service (PaaS) offerings (such as Azure Storage, Azure SQL Database, or Azure Key Vault) required routing over the public internet, secured only by firewall IP whitelisting or \emph{Service Endpoints}. 
-
-\subsection{Service Endpoints vs. Private Endpoints}
-\begin{itemize}[leftmargin=12pt]
-  \item \textbf{Service Endpoints:} Optimizes routing so packets traverse the Azure backbone rather than the public internet. However, the destination address remains the PaaS service's \emph{public IP}. Crucially, an attacker with code execution inside your subnet can exfiltrate stolen credentials to \emph{their own} external Azure Storage account over the enabled service endpoint.
-  \item \textbf{Private Endpoints (Azure Private Link):} Provisions a true virtual network interface (\texttt{nic-pe}) inside your private subnet. The PaaS resource is allocated a \textbf{private IP address from your subnet's CIDR block} (e.g., \texttt{10.1.2.50}). All communication with the PaaS service is encapsulated within your private network. Data exfiltration to unauthorized accounts is impossible because the endpoint binds strictly to a specific resource instance.
-\end{itemize}
+\textbf{Private Endpoints (Azure Private Link)} close that gap by placing a virtual network interface directly inside your subnet with a private IP (e.g., \texttt{10.1.2.50}) bound exclusively to *your* database or storage instance.
 
 \subsection{Split-Brain DNS Architecture}
-When an application connects to a PaaS service (e.g., \texttt{storageacc.blob.core.windows.net}), it expects valid TLS certificates. If your application attempts to connect directly to the raw IP \texttt{10.1.2.50}, TLS certificate validation will fail with a host mismatch error.
+Connecting straight to \texttt{10.1.2.50} breaks TLS certificate verification because the database's TLS certificate is issued for \texttt{sql-clinic.database.windows.net}, not an IP address. Azure solves this with 	extbf{Split-Brain DNS} (Figure~\ref{fig:v3-ch01-split-brain-dns}): external clients resolve the hostname to a public IP (which blocks connections when public ingress is disabled), while clients inside linked VNets resolve the exact same hostname to \texttt{10.1.2.50}.
 
-To resolve this seamlessly:
-\begin{enumerate}[leftmargin=15pt]
-  \item Azure configures the public DNS of the PaaS service to return a CNAME alias pointing to the Private Link namespace:
-  \begin{equation*}
-  \texttt{storageacc.blob.core.windows.net} \longrightarrow \texttt{storageacc.privatelink.blob.core.windows.net}
-  \end{equation*}
-  \item An \textbf{Azure Private DNS Zone} named \texttt{privatelink.blob.core.windows.net} is created and linked to the virtual network.
-  \item The Private DNS Zone contains an \texttt{A} record mapping \texttt{storageacc} to \texttt{10.1.2.50}.
-  \item Inside the VNet, the Azure DNS resolver intercepts the lookup, follows the CNAME, resolves it via the Private DNS Zone to \texttt{10.1.2.50}, and the client initiates an HTTPS handshake using the original hostname without TLS errors.
-\end{enumerate}
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=0.8cm,
+  actor/.style={rectangle, draw=headingblue, fill=headingblue!5, rounded corners=2pt, text width=2.5cm, minimum height=0.75cm, align=center, font=\sffamily\scriptsize\bfseries},
+  arrow/.style={-{Stealth[scale=0.8]}, thick, color=headingblue},
+  rarrow/.style={-{Stealth[scale=0.8]}, thick, dashed, color=intuitionTeal}
+]
+\node[actor] (app) {Clinic App\\(\texttt{10.1.1.10})};
+\node[actor, right=1.1cm of app] (dns) {Azure DNS\\(\texttt{168.63.129.16})};
+\node[actor, right=1.1cm of dns] (pub) {Public DNS\\(\texttt{database.windows.net})};
+\node[actor, right=1.1cm of pub] (priv) {Private DNS Zone\\(\texttt{privatelink...})};
 
-\section{Modern Compute Runtimes: App Services vs. Azure Container Apps}
+\draw[thick, color=gray!40] (app.south) -- ++(0,-4.4);
+\draw[thick, color=gray!40] (dns.south) -- ++(0,-4.4);
+\draw[thick, color=gray!40] (pub.south) -- ++(0,-4.4);
+\draw[thick, color=gray!40] (priv.south) -- ++(0,-4.4);
 
-Enterprise applications rarely deploy bare virtual machines. Modern workloads leverage containerized PaaS runtimes.
+\draw[arrow] ($(app.south)+(0,-0.6)$) -- node[above, font=\tiny\sffamily]{1. Query \texttt{sql-clinic.database.windows.net}} ($(dns.south)+(0,-0.6)$);
+\draw[arrow] ($(dns.south)+(0,-1.3)$) -- node[above, font=\tiny\sffamily]{2. Lookup} ($(pub.south)+(0,-1.3)$);
+\draw[rarrow] ($(pub.south)+(0,-2.0)$) -- node[above, font=\tiny\sffamily]{3. CNAME $\to$ \texttt{*.privatelink.database.windows.net}} ($(dns.south)+(0,-2.0)$);
+\draw[arrow] ($(dns.south)+(0,-2.7)$) -- node[above, font=\tiny\sffamily]{4. Resolve Private Zone (Linked VNet)} ($(priv.south)+(0,-2.7)$);
+\draw[rarrow] ($(priv.south)+(0,-3.4)$) -- node[above, font=\tiny\sffamily]{5. A Record: \texttt{10.1.2.50}} ($(dns.south)+(0,-3.4)$);
+\draw[rarrow] ($(dns.south)+(0,-4.0)$) -- node[above, font=\tiny\sffamily]{6. Return \texttt{10.1.2.50} (TLS SNI preserved)} ($(app.south)+(0,-4.0)$);
+\end{tikzpicture}
+\caption{Split-Brain Private Link DNS Resolution Sequence}
+\label{fig:v3-ch01-split-brain-dns}
+\end{figure}
 
-\subsection{Azure App Service and Regional VNet Integration}
-Azure App Service provides managed web hosting. For private enterprise architectures:
+\section{Managed Compute Abstractions: App Service vs.\ Container Apps}
+
+Most cloud applications run on managed Platform-as-a-Service compute rather than raw virtual machines:
 \begin{itemize}[leftmargin=12pt]
-  \item \textbf{Inbound Isolation:} Implemented by binding a \textbf{Private Endpoint} to the App Service, disabling public ingress.
-  \item \textbf{Outbound VNet Integration:} Connects the App Service to a dedicated delegated subnet in your VNet, allowing the web app to query internal databases, Private Endpoints, and on-premises systems over ExpressRoute.
+  \item \textbf{Azure App Service:} Managed web hosting for code or single containers. Inbound isolation uses a Private Endpoint; outbound traffic to private databases uses 	extbf{Regional VNet Integration} into a dedicated delegated subnet.
+  \item \textbf{Azure Container Apps (ACA):} Serverless container hosting built on top of managed Kubernetes and Envoy proxies. Deployed in \texttt{--internal-only true} mode, ACA assigns its ingress load balancer a private VNet IP and scales replicas automatically based on HTTP load or queue depth (we examine the underlying Kubernetes and KEDA machinery in Chapters~\ref{chap:containers} and~\ref{chap:kubernetes}).
 \end{itemize}
 
-\subsection{Azure Container Apps (ACA)}
-\textbf{Azure Container Apps} is built on top of a fully managed Kubernetes and Envoy proxy foundation. It provides:
-\begin{itemize}[leftmargin=12pt]
-  \item \textbf{True Scale-to-Zero:} Utilizing the \textbf{Kubernetes Event-driven Autoscaling (KEDA)} engine, containers can scale to zero replicas when idle and scale up rapidly in response to HTTP traffic, Azure Service Bus queues, or Kafka lag.
-  \item \textbf{Microservice Ingress \& Traffic Splitting:} Native Envoy sidecars provide zero-downtime blue-green deployments, canary testing, and mutual TLS (mTLS) between containers inside the Container Apps Environment.
-  \item \textbf{Internal VNet Deployment:} ACA environments can be provisioned in an ``Internal'' VIP mode, ensuring that the Envoy ingress controller is assigned a private IP accessible only within your VNet topology.
-\end{itemize}
-
-\begin{lstlisting}[language=bash, caption={Deploying an Internal Azure Container App with Private Ingress}]
+\begin{lstlisting}[language=bash, caption={Provisioning a VNet-Isolated Azure Container App via Azure CLI}]
 az containerapp env create \
-  --name "cae-banking-prod" \
-  --resource-group "rg-banking-prod" \
+  --name "cae-clinic-prod" \
+  --resource-group "rg-clinic-prod" \
   --location "eastus" \
   --infrastructure-subnet-resource-id "/subscriptions/.../subnets/snet-aca" \
   --internal-only true
 
 az containerapp create \
-  --name "order-api" \
-  --resource-group "rg-banking-prod" \
-  --environment "cae-banking-prod" \
-  --image "myacr.azurecr.io/order-service:v2.1" \
+  --name "patient-api" \
+  --resource-group "rg-clinic-prod" \
+  --environment "cae-clinic-prod" \
+  --image "myacr.azurecr.io/patient-api:v2.1" \
   --target-port 8080 \
   --ingress internal \
   --min-replicas 1 \
@@ -300,91 +370,111 @@ az containerapp create \
   --cpu 0.5 --memory 1.0Gi
 \end{lstlisting}
 
+\textbf{Step-by-step trace of Listing 2:} Lines 1--6 create the Container Apps Environment inside the delegated \texttt{snet-aca} subnet with \texttt{--internal-only true}, ensuring no public IP is allocated to the ingress proxy. Lines 8--17 deploy the \texttt{patient-api} container image listening on port 8080, restrict ingress to internal VNet callers, and reserve 0.5 vCPU and 1.0 GiB RAM per replica between 1 and 10 instances.
+
 \begin{commonmistakebox}[Subnet Delegation Collisions]
-When configuring App Service VNet integration or Azure Container Apps, the assigned subnet must be \textbf{delegated} exclusively to that service (e.g., \texttt{Microsoft.App/environments} or \texttt{Microsoft.Web/serverFarms}). Attempting to co-locate standard Virtual Machines, Azure Firewalls, or Private Endpoints in a delegated subnet will trigger immediate ARM provisioning errors.
+App Service VNet integration and Azure Container Apps require their subnets to be \textbf{delegated} exclusively to their resource provider (e.g., \texttt{Microsoft.App/environments}). Attempting to place a VM, Firewall, or Private Endpoint inside a delegated subnet fails immediately at ARM validation time.
 \end{commonmistakebox}
 
-\begin{realworldbox}[A Fortune 500 Outage from Flawed DNS Resolution]
-A multi-national retailer migrating an e-commerce platform to Azure Private Link experienced a total checkout outage during Black Friday. Engineers had provisioned a Private Endpoint for their primary Cosmos DB account. However, they linked the Private DNS Zone (\texttt{privatelink.documents.azure.com}) to the spoke VNet hosting the application pods, but \emph{failed} to link it to the hub VNet where their custom on-premises forwarders queried Azure DNS. When pods attempted to authenticate using microservice service accounts resolved via the on-prem recursive resolver, the DNS query resolved to the public IP of Cosmos DB. Because public network access was disabled on the database, all checkout queries were dropped with a 403 Forbidden connection reset. The outage persisted for 42 minutes until the Hub VNet link was added to the Private DNS zone.
+\begin{realworldbox}[Diagnosing a Split-Brain DNS Outage]
+\textbf{Symptom:} After disabling public network access on a production Azure SQL server, the clinic API begins throwing \texttt{403 / Deny Public Network Access} errors even though a Private Endpoint (\texttt{10.1.2.50}) is deployed.
+
+\textbf{Diagnostic Logs \& Steps:}
+\begin{enumerate}[leftmargin=12pt]
+  \item From a debug shell inside the Hub VNet's custom DNS forwarder, running \texttt{dig sql-clinic.database.windows.net +short} returns:
+  \begin{verbatim}
+  sql-clinic.privatelink.database.windows.net.
+  20.62.128.44
+  \end{verbatim}
+  Notice the public IP \texttt{20.62.128.44}! The CNAME worked, so Public DNS is fine, but the Private DNS Zone was never consulted.
+  \item Checking linked VNets via \texttt{az network private-dns link vnet list -g rg-networking-eastus -z privatelink.database.windows.net} reveals a link to \texttt{vnet-spoke-clinic}, but 	extbf{no link to \texttt{vnet-hub}}, where the forwarding resolver lives.
+  \item Adding the missing virtual network link to \texttt{vnet-hub} immediately resolves \texttt{sql-clinic.database.windows.net} to \texttt{10.1.2.50}, restoring connectivity without restarting containers.
+\end{enumerate}
 \end{realworldbox}
 
-\begin{tryityourselfbox}[Verifying DNS Resolution via Azure CLI]
-You can diagnose split-brain Private Link DNS resolution directly from any Linux shell using \texttt{dig} or \texttt{nslookup}:
-\begin{lstlisting}[language=bash]
-# Test resolution against public root DNS
-dig storageacc.blob.core.windows.net +short
-# Output: blob.core.windows.net. CNAME ... public IP (e.g., 20.60.x.x)
-
-# Test resolution against Azure Private DNS within VNet (168.63.129.16)
-dig @168.63.129.16 storageacc.blob.core.windows.net +short
-# Output: storageacc.privatelink.blob.core.windows.net.
-#         10.1.2.50 (Private IP)
-\end{lstlisting}
-Observe how the CNAME redirection mechanism preserves client hostname verification while directing packets into the private virtual network.
+\begin{tryityourselfbox}[Tracing Effective Routes and Split-Brain DNS]
+Before reading the solutions section, work through these two hands-on checks:
+\begin{enumerate}[leftmargin=12pt]
+  \item On paper, compute the usable IP range for subnet \texttt{10.24.8.64/26}, and identify which exact IP addresses Azure reserves for the gateway and DNS.
+  \item Suppose a subnet has both a system route \texttt{10.1.0.0/16 -> VnetLocal} and a UDR \texttt{10.1.2.0/24 -> VirtualAppliance 10.0.100.4}. If a packet is sent to \texttt{10.1.2.50} and another is sent to \texttt{10.1.5.12}, which next hop does Azure pick for each packet and why? (Run \texttt{dig @168.63.129.16 <your-storage>.blob.core.windows.net} if you have an Azure VNet lab to compare against your local resolver.)
+\end{enumerate}
 \end{tryityourselfbox}
 
-\section{Chapter Summary \& Key Takeaways}
+\begin{labbridgebox}[Network Validation in Project 8 and Project 9]
+Inspect how Private Link DNS validation and subnet CIDR partitioning are implemented in the repository:
+\begin{itemize}[leftmargin=12pt]
+  \item \texttt{projects/p08-azure-secure-app/src/network.py} --- validates Private Endpoint CIDR membership and \texttt{privatelink.vaultcore.azure.net} DNS resolution rules in Python.
+  \item \texttt{projects/p09-terraform-infrastructure/modules/networking/} --- declares the VNet, dedicated subnets, and default-deny NSG rules we will automate with Terraform in Chapter~\ref{chap:terraform}.
+\end{itemize}
+\end{labbridgebox}
+
+\section{Chapter Summary \protect\& Key Takeaways}
 \begin{itemize}[leftmargin=15pt]
-  \item \textbf{ARM Governance:} The management hierarchy descends from Tenant Root $\to$ Management Groups $\to$ Subscriptions $\to$ Resource Groups. Subscriptions act as technical quota, billing, and blast-radius boundaries.
-  \item \textbf{IP Allocation:} Azure reserves 5 IP addresses in every subnet (.0, .1, .2, .3, and .255). Minimum subnet size is \texttt{/29}.
-  \item \textbf{VNet Peering:} Non-transitive, high-speed private backbone connection. Transitive routing requires a hub NVA or Azure Firewall with User-Defined Routes (UDRs).
-  \item \textbf{Traffic Control:} Longest Prefix Match governs routing. A UDR with \texttt{0.0.0.0/0} targeting an NVA overrides Azure's default internet egress.
-  \item \textbf{NSGs:} Stateful 5-tuple inspection. Inbound packets hit Subnet NSG then NIC NSG. Outbound packets hit NIC NSG then Subnet NSG.
-  \item \textbf{Private Link:} Assigns a private IP to a PaaS service, neutralizing data exfiltration risks inherent in Service Endpoints. Relies on split-brain Private DNS Zones.
-  \item \textbf{Container Apps:} Built on Kubernetes, Envoy, and KEDA, providing serverless microservices with scale-to-zero capabilities and internal VNet ingress.
+  \item \textbf{Networking Basics:} CIDR \texttt{/N} fixes $N$ network bits and leaves $32-N$ host bits; SNAT/DNAT translate private RFC 1918 IPs across boundaries; DNS maps names to IPs.
+  \item \textbf{ARM Hierarchy:} Management Groups $\to$ Subscriptions (blast-radius boundary) $\to$ Resource Groups $\to$ Resources.
+  \item \textbf{Azure Subnets:} Reserve 5 IPs (\texttt{+0}, \texttt{+1}, \texttt{+2}, \texttt{+3}, broadcast). Minimum subnet is \texttt{/29}.
+  \item \textbf{Routing \& Peering:} VNet peering is non-transitive. Longest Prefix Match selects routes, with UDR $>$ BGP $>$ System ties broken by source.
+  \item \textbf{NSGs:} Stateful 5-tuple inspection. Inbound evaluates Subnet NSG then NIC NSG; outbound evaluates NIC NSG then Subnet NSG.
+  \item \textbf{Private Link:} Places a private NIC in your subnet and uses split-brain Private DNS Zones so TLS hostname validation succeeds over private IPs.
 \end{itemize}
 
 \section{Exercises}
 
 \subsection{Mechanics}
 \begin{enumerate}[leftmargin=18pt]
-  \item Calculate the total number of usable host IP addresses available for workloads in an Azure subnet allocated with the CIDR prefix \texttt{10.240.4.0/27}. List each of the five Azure-reserved addresses explicitly.
-  \item Suppose a subnet has an NSG with an Inbound Rule at Priority 200 permitting TCP port 443 from \texttt{0.0.0.0/0}. The VM inside this subnet has a NIC-level NSG with Priority 150 denying TCP port 443 from \texttt{0.0.0.0/0}. Does an incoming HTTPS packet reach the VM? Explain the exact evaluation chain.
+  \item \textbf{Exercise~\thechapter.1:} Calculate the total number of usable host IP addresses available for workloads in an Azure subnet allocated with the CIDR prefix \texttt{10.240.4.0/27}. List each of the five Azure-reserved addresses explicitly.
+  \item \textbf{Exercise~\thechapter.2:} Suppose a subnet has an NSG with an Inbound Rule at Priority 200 permitting TCP port 443 from \texttt{0.0.0.0/0}. A VM inside this subnet has a NIC-level NSG with Priority 150 denying TCP port 443 from \texttt{0.0.0.0/0}. Does an incoming HTTPS packet reach the VM? Trace the exact evaluation chain.
 \end{enumerate}
 
 \subsection{Debugging}
 \begin{enumerate}[leftmargin=18pt]
   \setcounter{enumi}{2}
-  \item A backend application running inside an Azure Container App in \texttt{Subnet-App} (\texttt{10.2.1.0/24}) fails to connect to an Azure SQL database configured with a Private Endpoint in \texttt{Subnet-Data} (\texttt{10.2.2.0/24}). Running \texttt{curl -v https://sql-banking.database.windows.net:1433} from a debugging pod returns a connection timeout. Provide a systematic 4-step diagnostic checklist to isolate the failure across routing, DNS, and security group layers.
+  \item \textbf{Exercise~\thechapter.3:} A backend application running inside an Azure Container App in \texttt{Subnet-App} (\texttt{10.2.1.0/24}) fails to connect to an Azure SQL database configured with a Private Endpoint in \texttt{Subnet-Data} (\texttt{10.2.2.0/24}). Running \texttt{nc -vz sql-clinic.database.windows.net 1433} (or PowerShell \texttt{Test-NetConnection sql-clinic.database.windows.net -Port 1433} for the TDS database protocol) from a debugging container times out. Provide a systematic 4-step diagnostic checklist across DNS, routing, NSGs, and Private Link state.
 \end{enumerate}
 
 \subsection{Architecture}
 \begin{enumerate}[leftmargin=18pt]
   \setcounter{enumi}{3}
-  \item Design an enterprise Hub-and-Spoke topology across two regions (\texttt{eastus} and \texttt{westus}) supporting 50 spoke VNets. All spoke-to-spoke and spoke-to-internet traffic must pass through centralized firewalls. Detail the VNet peering links, Route Tables, and Gateway Transit configurations required to avoid non-transitive routing deadlocks.
+  \item \textbf{Exercise~\thechapter.4:} Design an enterprise Hub-and-Spoke topology across two regions (\texttt{eastus} and \texttt{westus}) supporting 50 spoke VNets, where all spoke-to-spoke and spoke-to-internet traffic must pass through centralized Azure Firewalls, and on-premises traffic arrives via an ExpressRoute Virtual Network Gateway in each Hub. Detail the VNet peering links, Route Tables, and where \texttt{AllowGatewayTransit} applies versus where UDRs handle firewall inspection.
 \end{enumerate}
 
 \section{Detailed Solutions}
 \begin{enumerate}[leftmargin=18pt]
-  \item \textbf{Solution (Mechanics):}\\
-  A \texttt{/27} prefix has a 32-bit address space with $32 - 27 = 5$ host bits. Total raw IP addresses = $2^5 = 32$. In Azure, 5 addresses are reserved:\\
-  Total usable IPs = $32 - 5 = 27$ usable addresses.\\
-  Reserved IPs:
+  \item \textbf{Solution~\thechapter.1 (Mechanics):}\\
+  A \texttt{/27} prefix leaves $32 - 27 = 5$ host bits, giving $2^5 = 32$ raw IP addresses (\texttt{10.240.4.0} through \texttt{10.240.4.31}). Subtracting Azure's 5 reserved addresses yields $32 - 5 = \mathbf{27}$ usable IPs:
   \begin{itemize}[leftmargin=12pt]
     \item \texttt{10.240.4.0}: Network address.
     \item \texttt{10.240.4.1}: Default Gateway.
-    \item \texttt{10.240.4.2}: Azure DNS mapping.
-    \item \texttt{10.240.4.3}: Internal Azure DNS coordinator.
-    \item \texttt{10.240.4.31}: Subnet broadcast address.
+    \item \texttt{10.240.4.2}: Azure DNS resolver mapping.
+    \item \texttt{10.240.4.3}: Azure internal DNS reservation.
+    \item \texttt{10.240.4.31}: Broadcast address.
   \end{itemize}
 
-  \item \textbf{Solution (Mechanics):}\\
-  No, the packet is dropped. For inbound traffic, Azure evaluates the Subnet-level NSG first. The packet matches Priority 200 and is permitted past the subnet boundary. Next, the packet reaches the NIC-level NSG. At Priority 150 (which evaluates before default rules), it matches the explicit \texttt{Deny} rule. Since both NSG levels must permit the packet, the NIC NSG drops the packet.
+  \item \textbf{Solution~\thechapter.2 (Mechanics):}\\
+  No, the packet is dropped. For inbound traffic, VFP evaluates the Subnet NSG first: Priority 200 matches and permits the packet past the subnet boundary. Next, VFP evaluates the NIC NSG: Priority 150 matches the explicit \texttt{Deny} rule before any default rule and drops the packet.
 
-  \item \textbf{Solution (Debugging):}\\
-  \textbf{Step 1: Verify DNS Resolution.} Run \texttt{nslookup sql-banking.database.windows.net}. Confirm that it resolves to the Private Endpoint IP (\texttt{10.2.2.x}) and not the public Azure SQL VIP. If it returns a public IP, check whether the Private DNS Zone \texttt{privatelink.database.windows.net} is linked to the VNet hosting \texttt{Subnet-App}.\\
-  \textbf{Step 2: Check Effective Routes.} In the Azure Portal or via CLI, inspect the \emph{Effective Routes} on the Container App's virtual NIC. Confirm that a route exists for \texttt{10.2.2.0/24} with next-hop \texttt{Virtual network} or \texttt{VirtualAppliance}.\\
-  \textbf{Step 3: Evaluate NSG Rules.} Inspect NSGs on both \texttt{Subnet-App} (outbound rules) and \texttt{Subnet-Data} (inbound rules). Ensure TCP port 1433 is not blocked by custom deny rules or default \texttt{DenyAllInBound}.\\
-  \textbf{Step 4: Verify Private Endpoint Connection State.} Inspect the Private Endpoint resource itself. Ensure its \emph{Connection State} is \texttt{Approved} and that private link network policies are not misconfigured.
+  \item \textbf{Solution~\thechapter.3 (Debugging):}\\
+  \textbf{Step 1 (DNS Resolution):} Run \texttt{dig sql-clinic.database.windows.net +short} inside the subnet. Confirm it returns \texttt{10.2.2.x} (not a public Azure SQL IP). If it returns a public IP, link \texttt{privatelink.database.windows.net} to the VNet.\\
+  \textbf{Step 2 (Effective Routes):} Inspect Effective Routes on the subnet/NIC. Confirm a route covers \texttt{10.2.2.0/24} via \texttt{VnetLocal} or the expected Firewall \texttt{VirtualAppliance} IP (with no blackhole/stale next-hop).\\
+  \textbf{Step 3 (NSG Evaluation):} Inspect outbound rules on \texttt{Subnet-App} and inbound rules on \texttt{Subnet-Data} (and any firewall rules) to ensure TCP port \texttt{1433} (TDS) is permitted.\\
+  \textbf{Step 4 (Private Endpoint Approval):} Check the Azure SQL Private Endpoint's connection state is \texttt{Approved} and that \texttt{publicNetworkAccess} isn't mispaired with blocked private link network policies.
 
-  \item \textbf{Solution (Architecture):}\\
-  In each region, deploy a central Hub VNet containing an Azure Firewall in the \texttt{AzureFirewallSubnet}. Peer the Hub VNet to all regional Spoke VNets using bi-directional VNet peering. On the Hub-to-Spoke peering, enable \texttt{AllowGatewayTransit}. On the Spoke-to-Hub peering, enable \texttt{UseRemoteGateways}. Deploy a Route Table on every spoke subnet with a default route \texttt{0.0.0.0/0} targeting the regional Azure Firewall private IP as a \texttt{VirtualAppliance}. Connect the two regional Hubs via Global VNet Peering. On each Hub Firewall, configure routing rules directing cross-region spoke traffic through the inter-hub peering, thereby establishing a fully inspected, transitive multi-region mesh.
+  \item \textbf{Solution~\thechapter.4 (Architecture):}\\
+  In each region, deploy a Hub VNet housing an Azure Firewall (in \texttt{AzureFirewallSubnet}) and the ExpressRoute Virtual Network Gateway (in \texttt{GatewaySubnet}). Peer every regional Spoke VNet bi-directionally to its regional Hub VNet.
+  \begin{itemize}[leftmargin=12pt]
+    \item \textbf{Firewall Transitive Inspection (UDRs):} Enable IP forwarding on Azure Firewall (built in) and attach a Route Table to every spoke subnet with \texttt{0.0.0.0/0 -> VirtualAppliance <Regional Firewall Private IP>} plus specific spoke-range UDRs if needed so spoke-to-spoke and spoke-to-internet traffic never bypasses the Hub Firewall.
+    \item \textbf{ExpressRoute Gateway Sharing (\texttt{AllowGatewayTransit}):} Only for sharing the Hub's \emph{ExpressRoute/VPN Virtual Network Gateway} with spokes (not for Azure Firewall NVA routing!), enable \texttt{AllowGatewayTransit} on the Hub-to-Spoke peering and \texttt{UseRemoteGateways} on the Spoke-to-Hub peering, plus a \texttt{GatewaySubnet} UDR steering on-prem return traffic back through the Hub Firewall.
+    \item \textbf{Cross-Region Connectivity:} Connect the two regional Hubs via Global VNet Peering and add Hub Firewall UDRs/rules directing traffic destined for the remote region's spoke CIDRs through the remote regional firewall.
+  \end{itemize}
+
+  \item \textbf{Try-It-Yourself Verification:}\\
+  (1) A \texttt{/26} block has $2^6 = 64$ addresses: \texttt{10.24.8.64}--\texttt{10.24.8.127}. Reserved IPs are \texttt{.64} (network), \texttt{.65} (gateway), \texttt{.66} (DNS), \texttt{.67} (internal DNS), and \texttt{.127} (broadcast), leaving $64 - 5 = 59$ usable IPs (\texttt{.68}--\texttt{.126}).\\
+  (2) For \texttt{10.1.2.50}, both \texttt{/16} and \texttt{/24} match; LPM selects \texttt{10.1.2.0/24} ($24 > 16$), sending the packet to \texttt{10.0.100.4}. For \texttt{10.1.5.12}, only \texttt{10.1.0.0/16} matches, so it travels directly via \texttt{VnetLocal}.
 \end{enumerate}
 
-\section{Further Reading \& Citations}
+\section{Further Reading \protect\& Citations}
 \begin{itemize}[leftmargin=15pt]
-  \item Microsoft Learn. \emph{Azure Virtual Network Architecture and Security Best Practices}, 2025.
+  \item Microsoft Learn. \emph{Azure Virtual Network Architecture and Virtual Filtering Platform}, 2025.
   \item RFC 1918. \emph{Address Allocation for Private Internets}, Internet Engineering Task Force (IETF).
   \item Russinovich, M., et al. \emph{Inside the Microsoft Azure Datacenter Architecture}, Microsoft Press.
-  \item NIST Special Publication 800-207. \emph{Zero Trust Architecture}, National Institute of Standards and Technology.
 \end{itemize}

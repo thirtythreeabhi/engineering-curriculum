@@ -1,0 +1,299 @@
+\chapter{Technical Design Documents}
+\label{chap:tdd}
+
+\begin{chaptergoalsbox}
+\textbf{What You Will Learn:}
+\begin{itemize}[leftmargin=12pt]
+  \item Synthesize Chapters~1--6 (Requirements, C4, UML Sequence, Threat Modeling, SLOs, and ADRs) into one cohesive, reviewable **Technical Design Document (TDD / RFC)**.
+  \item Write measurable **Goals** and ruthless **Non-Goals** that prevent multi-month scope creep.
+  \item Specify unambiguous machine-readable wire contracts (**Protocol Buffers**) and trace payload fields step by step.
+  \item Understand PostgreSQL \texttt{ALTER TABLE} \texttt{ACCESS EXCLUSIVE} lock queues and execute zero-downtime migrations via **Four-Phase Cutovers** and **Expand and Contract**.
+  \item Build an **Operational Readiness Review** anchored by a **Failure Mode and Effects Analysis (FMEA)** table.
+\end{itemize}
+
+\textbf{Prerequisites \& Calibration:}
+This chapter pulls together every tool introduced in Chapters~\ref{chap:requirements}--\ref{chap:adrs}. Whenever we introduce new database migration mechanics (like PostgreSQL lock queues or EBS IOPS limits), we explain them from first principles.
+
+\textbf{Opening Problem:}
+A platform team spends six months building a real-time ledger pipeline to replace nightly batch invoicing. Two weeks before launch, Compliance discovers the pipeline replicates unencrypted European PII into a US cloud region (violating GDPR), and DBAs discover the workload demands 8,000 sustained write IOPS against a 500 GB AWS RDS \texttt{gp2} volume---which only provides 1,500 baseline IOPS and drains its 5.4M burst-credit bucket down to throttling in 60 minutes. Both showstoppers were catchable in a two-hour design review; cancelling and re-architecting wastes \$750,000 in engineering time.
+\end{chaptergoalsbox}
+
+\section{The Anatomy of a Technical Design Document}
+
+A **Technical Design Document (TDD)**---also called an **Engineering RFC (Request for Comments)**---is a blueprint written \emph{before} major coding begins. While an ADR (Chapter~\ref{chap:adrs}) records one narrow decision, a TDD weaves together all ten dimensions of a system launch (Table~\ref{tab:v5-ch07-tdd-template}).
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lp{10.5cm}}
+\toprule
+\textbf{TDD Section} & \textbf{Synthesized Artifact \& Purpose} \\
+\midrule
+\textbf{1. Metadata} & Authors, Reviewers (Staff, Security, SRE), Status (\textit{Draft, Review, Approved}), Date. \\
+\textbf{2. Executive Summary} & Under 250 words: problem, proposed system, primary business impact. \\
+\textbf{3. Context \& Motivation} & Current bottlenecks, traffic forecasts, compliance or cost drivers. \\
+\textbf{4. Goals \& Non-Goals} & Quantitative FURPS+ targets (Ch~\ref{chap:requirements}) and explicit scope exclusions. \\
+\textbf{5. Proposed Architecture} & C4 Level 1--3 diagrams (Ch~\ref{chap:c4}) and key sequence flows (Ch~\ref{chap:uml}). \\
+\textbf{6. Detailed Design} & Formal API contracts (Protobuf/OpenAPI), DB schemas, concurrency invariants. \\
+\textbf{7. Alternatives \& ADRs} & 2--3 competing options evaluated; links to accepted ADRs (Ch~\ref{chap:adrs}). \\
+\textbf{8. Security \& Privacy} & DFD trust boundaries, STRIDE mitigations, data residency, cloud cost (Ch~\ref{chap:threat-modeling}). \\
+\textbf{9. Migration \& Rollout} & Shadow dual-writes, canary cutover, Expand-and-Contract schema steps. \\
+\textbf{10. Operational Readiness} & SLOs/burn-rate alerts (Ch~\ref{chap:slos}), FMEA table, runbooks, RPO/RTO checks. \\
+\bottomrule
+\end{tabular}
+\caption{The 10-Section Enterprise Technical Design Document Template}
+\label{tab:v5-ch07-tdd-template}
+\end{table}
+
+\begin{intuitionbox}[Blueprinting Before Pouring Concrete]
+No structural engineer pours concrete for a bridge from hallway chats. Discovering a missing expansion joint on paper costs 15 minutes with an eraser; discovering it after concrete cures costs millions. In software, code is concrete and the TDD is the structural blueprint.
+\end{intuitionbox}
+
+\begin{underthehoodbox}[AWS EBS/RDS Storage Tiers: Why \texttt{gp2} Burst Credits Trap Write-Heavy Pipelines]
+In our Opening Problem, why did the 500 GB \texttt{gp2} RDS disk stall after 60 minutes?
+\begin{itemize}[leftmargin=14pt]
+  \item \textbf{\texttt{gp2} (General Purpose SSD)} grants $3\text{ IOPS/GB}$ baseline ($500 \times 3 = 1,500\text{ IOPS}$), bursting up to \textbf{3,000 IOPS} using a 5.4-million I/O credit bucket (and caps at \textbf{16,000 IOPS} even on huge $>5.3\text{ TB}$ volumes). At 3,000 IOPS, a 500 GB disk spends $3,000 - 1,500 = 1,500\text{ credits/s}$, emptying $5,400,000 / 1,500 = 3,600\text{ s}$ (60 minutes) before hard-throttling to 1,500 IOPS!
+  \item \textbf{\texttt{gp3}} provides 3,000 baseline IOPS for free and scales up to 16,000 provisioned IOPS with zero burst credits.
+  \item \textbf{\texttt{io1}/\texttt{io2} (Provisioned IOPS SSD)} sustain up to 64,000+ IOPS continuously without burst credits---at significantly higher monthly cost.
+\end{itemize}
+Calculating sustained write IOPS in Section~10 of a TDD prevents last-minute storage rewrites.
+\end{underthehoodbox}
+
+\section{End-to-End Mini-TDD Walkthrough: \texttt{checkout-ledger-v2}}
+
+Rather than reading disconnected fragments, let us walk through **one unified mini-TDD** for replacing a legacy synchronous billing database with an **Idempotent Multi-Currency Checkout & Ledger Service (\texttt{checkout-ledger-v2})**, connecting Chapters~1 through~6 end-to-end.
+
+\subsection{Goals, Non-Goals, and Capacity Math (Ch~\ref{chap:requirements})}
+
+Every goal must be quantitative and testable; every Non-Goal blocks scope creep during review:
+\begin{lstlisting}[language=bash, caption={Mini-TDD Section 4: Crisp Goals and Ruthless Non-Goals for \texttt{checkout-ledger-v2}}]
+Goals:
+1. Process peak arrival rate of 2,500 charge requests/sec with p99 latency <= 120 ms.
+2. Enforce 99.95% monthly availability (21.6 min/mo budget) and zero duplicate debits
+   using client-supplied UUIDv4 Idempotency-Key tokens.
+3. Keep all EU customer PII strictly inside eu-central-1 (GDPR residency) with RPO <= 1 min.
+
+Non-Goals:
+1. Real-time multi-currency FX trading (uses daily locked spot rates only).
+2. Full double-entry general-ledger ERP reporting (handled downstream via Kafka).
+3. Supporting legacy XML/SOAP checkout clients (v2 accepts gRPC/HTTP2 and REST JSON only).
+\end{lstlisting}
+
+\subsection{Architecture, Contracts, and Security Synthesis (Ch~\ref{chap:c4}--\ref{chap:adrs})}
+
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{C4 Scope (Ch~\ref{chap:c4})}: \texttt{API Gateway [Envoy]} routes \texttt{Charge} RPCs to \texttt{checkout-ledger-v2 [Go]}, which writes atomically to \texttt{Ledger DB [PostgreSQL 16 on io2]} and a transactional outbox table, publishing \texttt{PaymentCaptured} events to \texttt{Kafka}.
+  \item \textbf{Sequence & Concurrency (Ch~\ref{chap:uml})}: Requests enforce \texttt{grpc-timeout: 100ms} deadlines and execute \texttt{INSERT ... ON CONFLICT (idempotency\_key) DO NOTHING} inside the same ACID transaction as the balance update, eliminating TOCTOU double-spends.
+  \item \textbf{Threat Model (Ch~\ref{chap:threat-modeling})}: Internal hops between \texttt{API Gateway} and \texttt{checkout-ledger-v2} cross into the Secure Ledger Enclave over **mTLS**; card tokens are never logged.
+  \item \textbf{SLO & ADRs (Ch~\ref{chap:slos}--\ref{chap:adrs})}: Protected by $14.4\times$ (\texttt{1h}/\texttt{5m}) burn-rate alerts; linked to \texttt{ADR-0014} documenting why virtual-bucket sharding on PostgreSQL beat DynamoDB for ACID double-entry invariants.
+\end{itemize}
+
+Listing~\ref{lst:v5-ch07-protobuf} gives the formal machine-readable contract for Section~6 of the mini-TDD.
+
+\begin{lstlisting}[language=C, caption={Mini-TDD Section 6: Production Protobuf Contract for \texttt{checkout-ledger-v2}}, label={lst:v5-ch07-protobuf}]
+syntax = "proto3";
+package checkout.ledger.v2;
+
+service LedgerChargeService {
+  // Executes an idempotent charge and appends a double-entry ledger row
+  rpc Charge(ChargeRequest) returns (ChargeResponse);
+}
+
+message ChargeRequest {
+  string idempotency_key = 1;       // Client UUIDv4 preventing duplicate charges
+  int64 amount_in_cents = 2;        // Minor units: $10.50 -> 1050 (avoids float rounding)
+  string currency = 3;              // ISO-4217 code, e.g. "USD", "EUR"
+  string merchant_id = 4;
+  string payment_method_token = 5;  // Opaque vault token (never raw PAN)
+}
+
+message ChargeResponse {
+  string transaction_id = 1;
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_SUCCEEDED = 1;
+    STATUS_PENDING = 2;
+    STATUS_DECLINED = 3;
+  }
+  Status status = 2;
+  int64 settled_epoch_ms = 3;
+}
+\end{lstlisting}
+
+\textbf{Line-by-Line Contract Trace on a Concrete Checkout:}
+Suppose a shopper pays **\$10.50 USD** at merchant \texttt{m\_904}:
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Line 10}: The browser generates \texttt{idempotency\_key = "8f14e45f-..."}. If Wi-Fi drops and the client retries, the server returns the exact same \texttt{ChargeResponse}.
+  \item \textbf{Line 11}: Storing money as integer minor units (\texttt{int64 amount\_in\_cents = 1050}) avoids binary floating-point rounding bugs (where \texttt{0.1 + 0.2 != 0.3} in IEEE-754 floats).
+  \item \textbf{Lines 12--14}: \texttt{currency = "USD"} and \texttt{payment\_method\_token = "pm\_tok\_41"} ensure raw credit card numbers (PAN) never cross into \texttt{checkout-ledger-v2}, keeping it outside heavy PCI-DSS cardholder scope.
+  \item \textbf{Lines 18--26}: \texttt{ChargeResponse} uses an explicit \texttt{STATUS\_UNSPECIFIED = 0} sentinel so unset Protobuf fields can never silently look like \texttt{STATUS\_SUCCEEDED}.
+\end{enumerate}
+
+\section{Zero-Downtime Migration and Schema Lock Safety}
+
+Replacing a live billing database mid-flight follows the **Four-Phase Cutover** (Figure~\ref{fig:v5-ch07-migration}):
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Phase 1 (Shadow Dual-Write)}: Write synchronously to Legacy DB and mirror asynchronously via Outbox/Kafka to \texttt{checkout-ledger-v2}, backfilling old rows in batches.
+  \item \textbf{Phase 2 (Dark Read Verification)}: Serve clients from Legacy DB while asynchronously reading \texttt{checkout-ledger-v2} in the background and alerting on any 1-cent diff.
+  \item \textbf{Phase 3 (Canary Cutover)}: Shift live reads $1\% \rightarrow 5\% \rightarrow 25\% \rightarrow 100\%$ via feature flags while keeping dual-writes active for instant rollback.
+  \item \textbf{Phase 4 (Teardown)}: After 14 clean days, stop dual-writes and archive Legacy DB snapshots.
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=0.45cm,
+  phase/.style={rectangle, draw=headingblue!80, fill=headingblue!5, rounded corners=3pt, text width=11.8cm, minimum height=1.0cm, inner sep=6pt, font=\sffamily\footnotesize}
+]
+
+\node[phase] (p1) {
+  \textbf{Phase 1: Shadow Dual-Write + Batch Backfill} --- App writes to Legacy DB (sync) and mirrors via Outbox/Kafka to New DB; reconciler backfills history.
+};
+\node[phase, below=of p1] (p2) {
+  \textbf{Phase 2: Dark Read Verification} --- Client reads stay on Legacy DB; background comparator diffs New DB responses down to 1 cent.
+};
+\node[phase, below=of p2] (p3) {
+  \textbf{Phase 3: Canary Cutover ($1\% \rightarrow 100\%$)} --- Feature flag gradually shifts reads to New DB while dual-writes preserve instant rollback.
+};
+\node[phase, below=of p3] (p4) {
+  \textbf{Phase 4: Teardown} --- Verify 14 days zero diffs; sever Legacy dual-writes and archive cold snapshot.
+};
+
+\draw[-{Stealth[scale=1.0]}, thick, color=headingblue!70] (p1) -- (p2);
+\draw[-{Stealth[scale=1.0]}, thick, color=headingblue!70] (p2) -- (p3);
+\draw[-{Stealth[scale=1.0]}, thick, color=headingblue!70] (p3) -- (p4);
+
+\end{tikzpicture}
+\caption{Four-Phase Zero-Downtime Cutover Pipeline for \texttt{checkout-ledger-v2}}
+\label{fig:v5-ch07-migration}
+\end{figure}
+
+\subsection{Why \texttt{ALTER TABLE} Triggers Outages: \texttt{ACCESS EXCLUSIVE} Locks}
+
+Before refactoring existing SQL columns, engineers must understand PostgreSQL's lock queue. Commands like \texttt{ALTER TABLE ledger DROP COLUMN legacy\_note} or changing a column type acquire an **`ACCESS EXCLUSIVE` lock**---the strongest lock in PostgreSQL, blocking *all* concurrent \texttt{SELECT}, \texttt{INSERT}, \texttt{UPDATE}, and \texttt{DELETE} queries.
+
+Even worse is the **lock-queue pileup**: if a slow analytics \texttt{SELECT} is currently running (holding a light \texttt{ACCESS SHARE} lock for 45 seconds), \texttt{ALTER TABLE} waits behind it---and every *new* incoming checkout \texttt{SELECT} queues behind the waiting \texttt{ALTER TABLE}, freezing the entire site within 3 seconds!
+
+\begin{productionwarningbox}[Expand and Contract Schema Refactoring]
+Never rename or drop a live column in one deploy (old running pods would crash, and locks would stall traffic). Use **Expand and Contract**:
+\begin{enumerate}[leftmargin=14pt]
+  \item \textbf{Expand}: Run \texttt{SET lock\_timeout = '2s'; ALTER TABLE ledger ADD COLUMN new\_col BIGINT NULL;} (metadata-only instant operation; aborts cleanly if blocked). Dual-write both columns.
+  \item \textbf{Backfill}: Populate historical rows in small throttled batches ($1,000\text{ rows/tx}$) to avoid I/O spikes.
+  \item \textbf{Switch}: Deploy code reading \texttt{new\_col}, then add constraints \texttt{NOT VALID} followed by \texttt{VALIDATE CONSTRAINT} (which avoids holding \texttt{ACCESS EXCLUSIVE}).
+  \item \textbf{Contract}: Days later, stop referencing the old column in code and drop it safely with \texttt{lock\_timeout = '2s'}.
+\end{enumerate}
+\end{productionwarningbox}
+
+\section{Operational Readiness and FMEA}
+
+Section~10 of our mini-TDD ends with a **Failure Mode and Effects Analysis (FMEA)** mapping every critical failure mode to its blast radius, mitigation, and alert (Table~\ref{tab:v5-ch07-fmea}).
+
+\begin{table}[htbp]
+\centering\scriptsize
+\begin{tabular}{p{2.7cm}p{2.7cm}p{1.2cm}p{3.2cm}p{2.8cm}}
+\toprule
+\textbf{Failure Mode} & \textbf{System Effect} & \textbf{Severity} & \textbf{Mitigation Strategy} & \textbf{Detection / Alert} \\
+\midrule
+Primary Ledger DB AZ fails & Writes fail; 500s on checkout & Critical & Multi-AZ Patroni failover ($\le 45\text{ s}$); \texttt{io2} Provisioned IOPS & Alert: \texttt{PostgresPrimaryDown > 15s} \\
+Fraud API latency spikes to 10s & Worker threads saturate (Little's Law) & Critical & \texttt{grpc-timeout: 150ms}; circuit breaker falls back to rules cache & Alert: \texttt{CircuitBreakerOpen: Fraud} \\
+Kafka disk hits 100\% & Outbox relay stalls; events delayed & High & Transactional outbox table buffers events safely in Postgres & Alert: \texttt{OutboxLag > 10,000 rows} \\
+Duplicate retry from mobile drop & Risk of double customer charge & Critical & Unique index on \texttt{idempotency\_key} returns cached response & Metric: \texttt{IdempotencyHitRate} \\
+\bottomrule
+\end{tabular}
+\caption{Mini-TDD Section 10: FMEA Matrix for \texttt{checkout-ledger-v2}}
+\label{tab:v5-ch07-fmea}
+\end{table}
+
+\begin{commonmistakebox}[The Post-Hoc TDD]
+Writing a TDD after 85\% of the code is already merged turns design review into defensive rationalization rather than architecture exploration. Always circulate the TDD when changing direction still costs hours, not quarters.
+\end{commonmistakebox}
+
+\begin{realworldbox}[Diagnostic Walkthrough: Sharding a Billing Ledger Without Dropping a Cent]
+\textbf{Symptoms:} At hundreds of millions of daily transactions, Stripe's primary billing database hit severe row-lock wait spikes (\texttt{LWLock: buffer\_content} and \texttt{LockManager} stalls in PostgreSQL metrics) during hourly invoice batch runs.\\
+\textbf{Design & Verification:} Engineers authored an RFC evaluating range sharding, consistent hashing on \texttt{merchant\_id}, and **virtual buckets** (1,024 logical buckets mapped to 32 physical clusters). During Phase~2 (Dark Read Verification), the shadow comparator logged subtle 1-cent mismatch alerts: \texttt{diff\_cents=1 invoice=in\_8821 reason=rounding\_order}. Catching that edge case in shadow traffic let the team align rounding order before moving a single live merchant across shards.
+\end{realworldbox}
+
+\begin{tryityourselfbox}[Draft Goals and Non-Goals for a Media Processing Service]
+You are leading the TDD for a **Media Processing Service** that resizes user avatars, banners, and product photos. Write an explicit Goals and Non-Goals section specifying:
+\begin{enumerate}
+  \item Throughput and latency percentiles (\texttt{p95}/\texttt{p99}).
+  \item Accepted input formats (JPEG, PNG, WebP) and max payload size.
+  \item At least three clear Non-Goals bounding scope.
+\end{enumerate}
+\end{tryityourselfbox}
+
+\section{Summary \protect\& Key Takeaways}
+
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Synthesis Artifact}: A TDD unites FURPS+ goals, C4/UML diagrams, STRIDE boundaries, SLOs, ADRs, rollout steps, and FMEA in one peer-reviewed blueprint.
+  \item \textbf{Ruthless Non-Goals}: Explicit exclusions protect timelines and focus architectural reviews.
+  \item \textbf{Lock-Safe Migrations}: Understand \texttt{ACCESS EXCLUSIVE} lock queues and use Four-Phase Cutovers plus Expand and Contract with \texttt{lock\_timeout}.
+  \item \textbf{Capacity Sanity}: Verify sustained storage IOPS (\texttt{gp2} burst credits vs.\ \texttt{gp3}/\texttt{io2}) and failure modes in FMEA before writing production code.
+\end{itemize}
+
+\section{Exercises}
+
+\subsection*{Mechanics}
+\begin{enumerate}[label=\textbf{Exercise~\thechapter.\arabic*}, leftmargin=*]
+  \item List all 10 sections of an enterprise TDD and explain why the \emph{Alternatives Considered} section prevents confirmation bias.
+  \item Explain why running \texttt{ALTER TABLE orders DROP COLUMN legacy\_tax} directly in production can cause a site-wide outage even on a fast database.
+\end{enumerate}
+
+\subsection*{Debugging}
+\begin{enumerate}[label=\textbf{Exercise~\thechapter.\arabic*}, leftmargin=*, start=3]
+  \item Critique this goal from a draft RFC: \textit{``The new invoicing service will be super reliable, clean, and built with Go, Docker, and Kubernetes.''} Rewrite it into two measurable architectural goals and explain where Go/Docker/Kubernetes belong.
+\end{enumerate}
+
+\subsection*{Architecture Design}
+\begin{enumerate}[label=\textbf{Exercise~\thechapter.\arabic*}, leftmargin=*, start=4]
+  \item Build a 3-row FMEA table for a high-volume **Webhook Dispatch Engine** delivering millions of HTTP callbacks/hour to external merchant servers (covering slow endpoints, poison-pill JSON payloads, and HTTP \texttt{429} rate-limit storms).
+\end{enumerate}
+
+\section{Detailed Solutions}
+
+\subsection*{Try It Yourself Solution}
+\begin{lstlisting}[language=bash, caption={Worked Goals and Non-Goals for Media Processing Service}]
+Goals:
+1. Resize and optimize JPEG, PNG, and WebP images up to 15 MB within p95 <= 180 ms
+   and p99 <= 400 ms under sustained peak load of 1,500 images/sec.
+2. Achieve 99.95% availability and strip EXIF GPS metadata from 100% of outputs.
+3. Cache resized variants at CDN edge with >= 90% cache hit ratio.
+
+Non-Goals:
+1. Video transcoding or animated MP4/GIF frame editing (handled by Video Pipeline).
+2. Accepting raw camera formats (CR2/NEF/DNG) or SVG uploads (XXE/XSS risk).
+3. Client-side cropping UI widgets or AI background-removal filters.
+\end{lstlisting}
+
+\subsection*{Mechanics, Debugging & Architecture Solutions}
+\begin{enumerate}[label=\textbf{Solution~\thechapter.\arabic*}, leftmargin=*]
+  \item The 10 sections are Metadata, Executive Summary, Context \& Motivation, Goals \& Non-Goals, Proposed Architecture, Detailed Design, Alternatives Considered, Security \& Privacy, Migration \& Rollout, and Operational Readiness. Documenting 2--3 rejected alternatives proves the author evaluated concrete trade-offs (cost, latency, operational complexity) rather than rationalizing a favorite tool.
+  \item Two hazards: (1) Older app pods still running mid-rollout will fail with \texttt{UndefinedColumn} SQL errors; (2) \texttt{ALTER TABLE} requests an \texttt{ACCESS EXCLUSIVE} lock that blocks behind any long-running query and forces all incoming \texttt{SELECT}/\texttt{INSERT} requests to pile up behind it, exhausting connection pools. Use Expand and Contract with \texttt{lock\_timeout}.
+  \item \textbf{Critique}: ``Super reliable'' and ``clean'' are unmeasurable, and Go/Docker/Kubernetes are implementation tools, not goals. \textbf{Rewritten Goals}: (1) \textit{Sustain $99.95\%$ monthly availability ($\le 21.6\text{ min}$ downtime) at $10,000\text{ RPS}$}; (2) \textit{Hold \texttt{p99} invoice read latency $\le 50\text{ ms}$}. Place Go/Docker/Kubernetes in \emph{Proposed Architecture / Technology Justification}.
+  \item Table~\ref{tab:v5-ch07-webhook-fmea} provides the complete FMEA matrix.
+\end{enumerate}
+
+\begin{table}[htbp]
+\centering\scriptsize
+\begin{tabular}{p{2.6cm}p{2.7cm}p{1.2cm}p{3.2cm}p{2.8cm}}
+\toprule
+\textbf{Failure Mode} & \textbf{System Effect} & \textbf{Severity} & \textbf{Mitigation Strategy} & \textbf{Detection / Alert} \\
+\midrule
+Merchant server stalls 30s on HTTP POST & Worker pool fills (Little's Law); queue backs up & High & Enforce 3s connect+read timeout; isolate slow domains into separate low-priority queue & Alert: \texttt{WebhookQueueLag > 50,000} \\
+Poison-pill event crashes JSON serializer & Worker crash-loops and redelivers endlessly & High & Catch parse exceptions; route to Dead-Letter Queue (DLQ) after 3 attempts & Alert: \texttt{WebhookDLQRate > 10/min} \\
+Merchant returns HTTP 429 rate limit & Retries worsen merchant throttling & Medium & Exponential backoff with full jitter; dynamically lower per-domain concurrency cap & Metric: \texttt{Webhook429Rate by domain} \\
+\bottomrule
+\end{tabular}
+\caption{FMEA Matrix for High-Volume Webhook Dispatch Engine}
+\label{tab:v5-ch07-webhook-fmea}
+\end{table}
+
+\begin{labbridgebox}
+Use \texttt{projects/p12-end-to-end-platform/} as the subject of a practice TDD: review \texttt{README.md}, \texttt{docker-compose.yml}, \texttt{init-db/01-init.sql}, \texttt{observability/prometheus.yml}, and \texttt{tests/test\_e2e\_platform.py} to see how requirements, containers, database schema, metrics, and tests interlock.
+\end{labbridgebox}
+
+\section{Further Reading \protect\& Citations}
+\begin{itemize}[leftmargin=18pt]
+  \item Kleppmann, M. (2017). \textit{Designing Data-Intensive Applications}~\cite{kleppmann2017designing}. O'Reilly Media.
+  \item Fowler, M., \& Sadalage, P. (2006). \textit{Refactoring Databases: Evolutionary Database Design}. Addison-Wesley.
+  \item Nygard, M. (2018). \textit{Release It!} (2nd ed.). Pragmatic Bookshelf.
+\end{itemize}

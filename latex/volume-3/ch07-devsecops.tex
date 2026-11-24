@@ -1,0 +1,314 @@
+\chapter{DevSecOps and Software Supply Chain Security}
+\label{chap:devsecops}
+
+\begin{chaptergoalsbox}
+\textbf{What You Will Learn:}
+\begin{itemize}[leftmargin=12pt]
+  \item Shift-left economics (the Boehm curve) and software supply-chain threats (dependency confusion, typosquatting, pipeline poisoning).
+  \item Static Application Security Testing (SAST) with Semgrep: Abstract Syntax Tree (AST) matching and source-to-sink taint analysis.
+  \item Software Composition Analysis (SCA) with Trivy: prioritizing CVEs with EPSS alongside CVSS.
+  \item Secret scanning with TruffleHog: bit-guessing intuition for Shannon Entropy and active API verification probes.
+  \item Digital signatures, ephemeral X.509 certificates (Fulcio), Merkle transparency logs (Rekor), and Kyverno admission enforcement.
+  \item Software Bills of Materials (SBOMs) via Syft (SPDX vs.\ CycloneDX, \texttt{purl}) and the four SLSA v1.0 build levels (L0--L3).
+\end{itemize}
+
+\textbf{What You Should Already Understand:}
+\begin{itemize}[leftmargin=12pt]
+  \item Asymmetric keys, X.509 certificates, and OIDC tokens (Chapter~\ref{chap:infra-security}).
+  \item GitHub Actions workflows and Kubernetes admission webhooks (Chapters~\ref{chap:kubernetes} and~\ref{chap:cicd}).
+\end{itemize}
+
+\textbf{Why This Topic Exists:}
+Modern applications assemble 80--90\% of their code from open-source packages, base images, and CI scripts. Firewalls cannot stop a poisoned dependency or a compromised CI script from shipping malware directly inside your signed container. DevSecOps embeds automated, cryptographically verifiable gates across every build stage.
+
+\textbf{Motivating Practical Problem:}
+During an enterprise compliance audit, regulators ask for verifiable evidence that: (1) no hardcoded cloud secrets sit in Git history, (2) user-supplied HTTP inputs cannot reach shell or SQL execution sinks, (3) every container ships an immutable dependency manifest (SBOM), and (4) production Kubernetes rejects any image not signed by your exact CI workflow on \texttt{main}. How do you wire Semgrep, Trivy, TruffleHog, Syft, Sigstore/Cosign, and Kyverno together?
+\end{chaptergoalsbox}
+
+\section{Shift-Left Economics and Supply Chain Threats}
+
+Fixing a security flaw in production—emergency hotfixes, incident forensics, customer notifications—costs roughly $100\times$--$600\times$ more than catching it in an editor or pull request (the Boehm cost curve). 	extbf{DevSecOps} automates checks inside the pull request so flaws break builds in seconds rather than failing audits months later.
+
+Attacking the software supply chain targets four weak points (Figure~\ref{fig:v3-ch07-pipeline}):
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{Dependency Confusion:} Uploading a malicious public package with the same name as an internal private library at a higher version number.
+  \item \textbf{Typosquatting:} Publishing lookalike packages (\texttt{reqeusts} vs.\ \texttt{requests}) hoping a developer mistypes.
+  \item \textbf{Compromised Maintainer Accounts:} Hijacking an open-source maintainer's npm/PyPI account to push trojanized releases.
+  \item \textbf{CI/CD Pipeline Poisoning:} Modifying build scripts on a CI runner to inject backdoors into compiled binaries without touching Git source files.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.85, every node/.style={scale=0.85},
+  node distance=0.7cm and 0.65cm,
+  stage/.style={rectangle, draw=headingblue, fill=headingblue!5, rounded corners=2pt, text width=2.45cm, minimum height=1.0cm, align=center, font=\sffamily\tiny\bfseries},
+  tool/.style={rectangle, draw=exampleBlue, fill=exampleBg, rounded corners=2pt, text width=2.45cm, minimum height=0.85cm, align=center, font=\sffamily\tiny},
+  arrow/.style={-{Stealth[scale=0.8]}, thick, color=headingblue}
+]
+\node[stage] (s1) {1. Git Commit\\\& History};
+\node[tool, below=0.4cm of s1] (t1) {TruffleHog\\(Entropy + Probes)};
+\node[stage, right=0.55cm of s1] (s2) {2. Pull Request\\Source};
+\node[tool, below=0.4cm of s2] (t2) {Semgrep\\(AST Taint SAST)};
+\node[stage, right=0.55cm of s2] (s3) {3. Packages \&\\Base Image};
+\node[tool, below=0.4cm of s3] (t3) {Trivy\\(CVE + EPSS)};
+\node[stage, right=0.55cm of s3] (s4) {4. Artifact\\Inventory};
+\node[tool, below=0.4cm of s4] (t4) {Syft\\(SPDX/CycloneDX)};
+\node[stage, right=0.55cm of s4] (s5) {5. Signing \&\\Admission};
+\node[tool, below=0.4cm of s5] (t5) {Cosign + Kyverno\\(Fulcio/Rekor)};
+
+\draw[arrow] (s1) -- (s2);
+\draw[arrow] (s2) -- (s3);
+\draw[arrow] (s3) -- (s4);
+\draw[arrow] (s4) -- (s5);
+\draw[arrow, dashed] (s1) -- (t1);
+\draw[arrow, dashed] (s2) -- (t2);
+\draw[arrow, dashed] (s3) -- (t3);
+\draw[arrow, dashed] (s4) -- (t4);
+\draw[arrow, dashed] (s5) -- (t5);
+\end{tikzpicture}
+\caption{End-to-End DevSecOps Continuous Verification Gates}
+\label{fig:v3-ch07-pipeline}
+\end{figure}
+
+\section{SAST with Semgrep: ASTs and Taint Tracking}
+
+Plain regular-expression scanners flood teams with false positives because regex cannot tell a comment from an executed function call, and miss bugs split across multiple variables. 	extbf{Semgrep} parses source files into an 	extbf{Abstract Syntax Tree (AST)}—a structured tree of program constructs (\texttt{Assign}, \texttt{Call}, \texttt{StringLiteral})—so formatting, comments, and whitespace are ignored automatically.
+
+In 	extbf{taint mode} (\texttt{mode: taint}), Semgrep tracks data flow from untrusted 	extbf{Sources} (HTTP query parameters) through variable assignments into dangerous 	extbf{Sinks} (\texttt{os.system}, raw SQL), clearing the taint only if it passes through an approved 	extbf{Sanitizer} (such as \texttt{shlex.quote}).
+
+\begin{lstlisting}[language=Python, caption={Vulnerable Python Flask Endpoint Traced by Semgrep}]
+import os, shlex
+from flask import Flask, request
+
+app = Flask(__name__)
+
+@app.route("/diag/ping")
+def ping_host():
+    host = request.args.get("host", "")          # 1. TAINT SOURCE
+    cmd = f"ping -c 1 {host}"                    # 2. PROPAGATES TAINT
+    # safe_cmd = f"ping -c 1 {shlex.quote(host)}" # (Would sanitize)
+    os.system(cmd)                               # 3. TAINT SINK -> ALERT!
+    return "ok"
+\end{lstlisting}
+
+\begin{lstlisting}[language=yaml, caption={Matching Semgrep Taint Rule in YAML}]
+rules:
+  - id: python-command-injection
+    languages: [python]
+    severity: ERROR
+    message: "Untrusted input reaches os.system() without shlex.quote()."
+    mode: taint
+    pattern-sources:
+      - pattern: request.args.get(...)
+    pattern-sanitizers:
+      - pattern: shlex.quote(...)
+    pattern-sinks:
+      - pattern: os.system(...)
+\end{lstlisting}
+
+\textbf{Step-by-step taint trace:} On line 8 of Listing 1, \texttt{request.args.get(...)} matches \texttt{pattern-sources}, marking \texttt{host} as tainted. On line 9, f-string interpolation propagates taint into \texttt{cmd}. Line 10 is commented out, so no \texttt{shlex.quote(...)} sanitizer executes. On line 11, \texttt{cmd} enters \texttt{os.system(cmd)}, matching \texttt{pattern-sinks} and firing \texttt{python-command-injection}. If an attacker passes \texttt{host=1.1.1.1;id}, \texttt{os.system} runs arbitrary shell commands.
+
+\section{SCA with Trivy (CVSS vs.\ EPSS) and Secret Scanning}
+
+\subsection{Prioritizing CVEs with EPSS}
+While SAST inspects *your* code, 	extbf{Software Composition Analysis (SCA)} with 	extbf{Trivy} scans OS packages and language libraries for known 	extbf{CVEs} (Common Vulnerabilities and Exposures). Ranking CVEs strictly by 	extbf{CVSS} severity ($0.0$--$10.0$) creates alert fatigue because many CVSS 9.8 bugs have no known exploit. Pairing CVSS with the 	extbf{Exploit Prediction Scoring System (EPSS $\in [0, 1]$)}—the statistical probability a CVE will be exploited in the wild within 30 days—lets teams fix a CVSS 7.2 / EPSS 0.92 bug *before* a theoretical CVSS 9.8 / EPSS 0.008 bug.
+
+\begin{lstlisting}[language=bash, caption={Trivy CI Container Gate Failing on Fixable High/Critical CVEs}]
+trivy image --exit-code 1 --severity CRITICAL,HIGH --ignore-unfixed \
+  --vuln-type os,library myregistry.azurecr.io/payment-api:v2.1
+\end{lstlisting}
+
+\subsection{Bit-Guessing Intuition for Shannon Entropy and TruffleHog}
+How does a secret scanner spot a leaked API key whose prefix it has never seen before? By measuring 	extbf{Shannon Entropy}.
+
+\begin{intuitionbox}[Entropy as Yes/No Bit-Guessing]
+Imagine playing a guessing game where you ask yes/no questions to identify the next character in a string:
+\begin{itemize}[leftmargin=12pt]
+  \item In \texttt{"aaaaaaaaaaaaaaaa"}, every character is \texttt{'a'}. You need 	extbf{0 questions} to guess the next character: $H = 0.0\text{ bits/char}$.
+  \item In \texttt{"1234567890abcdef"} (all 16 hex digits equally likely), a binary search needs 	extbf{4 yes/no questions} per character (first half vs.\ second half, repeated 4 times): $H = \log_2 16 = 4.0\text{ bits/char}$.
+\end{itemize}
+English variable names average $2.5$--$3.2\text{ bits/char}$, whereas cryptographic secrets typically exceed $4.5\text{ bits/char}$.
+\end{intuitionbox}
+
+Formally, for character probabilities $P(x_i)$ in a candidate string:
+\begin{equation}
+H(X) = -\sum_{i} P(x_i) \log_2 P(x_i)
+\end{equation}
+High entropy alone still flags harmless UUIDs or SHA hashes. 	extbf{TruffleHog} eliminates false positives with 	extbf{Active Verification Probes}: when it spots a candidate AWS keypair (both the Access Key ID \texttt{AKIA...} and the Secret Access Key), it signs a non-destructive read-only request to the 	extbf{AWS Security Token Service API (\texttt{sts.amazonaws.com}, action \texttt{sts:GetCallerIdentity})} using AWS SigV4 (note: this is the public AWS STS API, \emph{not} an instance metadata endpoint). An HTTP 200 response proves the leaked keypair is live right now.
+
+\section{Digital Signatures, Certificates, and Merkle Logs (Sigstore)}
+
+Chapter~\ref{chap:infra-security} introduced asymmetric signatures and X.509 certificates. Traditionally, signing container images required managing long-lived GPG private keys—if leaked, attackers could sign malware; if lost, teams couldn't deploy.
+
+\textbf{Sigstore} and 	extbf{Cosign} enable 	extbf{keyless signing} using three pieces:
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Fulcio (Ephemeral CA):} Inside GitHub Actions, Cosign generates a temporary keypair in RAM, sends the public key plus GitHub's OIDC JWT to Fulcio, and receives an X.509 certificate valid for just 	extbf{10 minutes} binding the key to that workflow's \texttt{iss} and \texttt{sub} claims.
+  \item \textbf{Merkle Trees \& Rekor (Transparency Log):} Once the 10-minute certificate expires, how can Kubernetes verify the signature next month? Before discarding the temporary private key, Cosign records the signature and certificate inside 	extbf{Rekor}, an append-only ledger structured as a 	extbf{Merkle tree} (a binary hash tree where every parent node hashes its two child hashes). Altering any historical entry changes the top root hash immediately, and verifying inclusion takes only $O(\log N)$ sibling hashes. Rekor issues a cryptographically signed timestamp proving the signature was created *while* the 10-minute Fulcio cert was valid.
+  \item \textbf{Cosign:} Pushes the signature and attestation artifacts alongside the image digest in the OCI registry (Figure~\ref{fig:v3-ch07-sigstore}).
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.85, every node/.style={scale=0.85},
+  node distance=1.0cm and 1.2cm,
+  ci/.style={rectangle, draw=headingblue, fill=headingblue!5, rounded corners=2pt, text width=3.8cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  fulcio/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, text width=3.8cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  rekor/.style={rectangle, draw=exampleBlue, fill=exampleBg, rounded corners=2pt, text width=3.8cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  reg/.style={rectangle, draw=warningRed, fill=warningBg, rounded corners=2pt, text width=3.8cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=headingblue}
+]
+\node[ci] (cosign) {CI Runner (Cosign)\\OIDC JWT + Ephemeral Key};
+\node[fulcio, right=1.6cm of cosign] (fulcio) {Fulcio Ephemeral CA\\Issues 10-min X.509 Cert};
+\node[rekor, below=1.1cm of fulcio] (rekor) {Rekor Transparency Log\\Merkle Tree Timestamp};
+\node[reg, below=1.1cm of cosign] (reg) {OCI Registry\\Image Digest + Signature};
+
+\draw[arrow] (cosign) -- node[above, font=\tiny\sffamily]{1. OIDC JWT + PubKey} (fulcio);
+\draw[arrow] (fulcio) -- node[right, font=\tiny\sffamily]{2. 10-min Cert} (cosign);
+\draw[arrow] (cosign) -- node[above, font=\tiny\sffamily]{3. Log Entry} (rekor);
+\draw[arrow] (cosign) -- node[left, font=\tiny\sffamily]{4. Push Signature} (reg);
+\end{tikzpicture}
+\caption{Sigstore Keyless Signing Architecture}
+\label{fig:v3-ch07-sigstore}
+\end{figure}
+
+\subsection{Kubernetes Admission Verification with Kyverno}
+Listing~\ref{lst:v3-ch07-kyverno} enforces signature verification at pod creation time. Notice that \texttt{rekor:} sits as a 	extbf{sibling of \texttt{entries:}} directly under the \texttt{attestors[0]} list item (not nested inside \texttt{keyless:}).
+
+\begin{lstlisting}[language=yaml, caption={Kyverno ClusterPolicy Enforcing Sigstore Signatures}, label={lst:v3-ch07-kyverno}]
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: check-image-signature
+spec:
+  validationFailureAction: Enforce
+  rules:
+  - name: verify-sigstore
+    match:
+      any:
+      - resources:
+          kinds: [Pod]
+    verifyImages:
+    - imageReferences: ["myregistry.azurecr.io/banking/*"]
+      attestors:
+      - entries:
+        - keyless:
+            issuer: https://token.actions.githubusercontent.com
+            subject: https://github.com/contoso/banking/.github/workflows/release.yaml@refs/heads/main
+        rekor:
+          url: https://rekor.sigstore.dev
+\end{lstlisting}
+
+\textbf{Step-by-step trace of Listing~\ref{lst:v3-ch07-kyverno}:} Lines 6--12 intercept every \texttt{Pod} creation request in validating admission (Chapter~\ref{chap:kubernetes}). For images matching \texttt{myregistry.azurecr.io/banking/*} (line 14), Kyverno queries the Rekor transparency log (lines 20--21) and verifies the Fulcio certificate inside \texttt{attestors[0].entries[0]} (lines 16--19) was minted by GitHub's OIDC issuer specifically from \texttt{release.yaml} on \texttt{refs/heads/main}. Unsigned or tampered pods are rejected before scheduling.
+
+\section{SBOMs (Syft) and the SLSA v1.0 Framework}
+
+A 	extbf{Software Bill of Materials (SBOM)} catalogs every OS package and library inside an artifact using standardized 	extbf{Package URLs (\texttt{purl})} like \texttt{pkg:pypi/fastapi@0.110.0}. Two formats dominate: 	extbf{SPDX} (Linux Foundation ISO/IEC 5962:2021, strong for license compliance) and 	extbf{CycloneDX} (OWASP, tailored for vulnerability mapping). Generating one takes one command:
+\begin{lstlisting}[language=bash]
+syft packages myregistry.azurecr.io/payment-api:v2.1 -o cyclonedx-json=sbom.json
+\end{lstlisting}
+
+\subsection{SLSA v1.0 Build Track Levels (L0--L3)}
+	extbf{SLSA (Supply-chain Levels for Software Artifacts) v1.0} defines 	extbf{four} progressive Build Track maturity levels (	extbf{Build L0 through Build L3}, Table~\ref{tab:v3-ch07-slsa}):
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{llp{7.4cm}}
+\toprule
+\textbf{SLSA Level} & \textbf{Build Track Requirement} & \textbf{Security Guarantee Provided} \\
+\midrule
+\textbf{Build L0} & No Guarantees & Ad-hoc or manual builds with no provenance metadata; vulnerable to untraceable tampering. \\
+\textbf{Build L1} & Provenance Exists & Automated build emits unverified metadata documenting source, builder, and inputs (protects against accidental mistakes). \\
+\textbf{Build L2} & Hosted Build + Signed Provenance & Runs on a hosted build service that cryptographically signs provenance, blocking tampering after the build. \\
+\textbf{Build L3} & Hardened Platform + Non-Falsifiable Provenance & Ephemeral, isolated builds where user build steps cannot access signing keys or forge provenance; secrets cannot bleed across runs. \\
+\bottomrule
+\end{tabular}
+\caption{The Four SLSA v1.0 Build Track Maturity Levels (L0--L3)}
+\label{tab:v3-ch07-slsa}
+\end{table}
+
+\begin{realworldbox}[Diagnosing and Preventing the Codecov Uploader Compromise]
+\textbf{Symptom:} Security telemetry flags unexpected outbound HTTPS POST connections from ephemeral CI runners to an unrecognized external IP right after the test-coverage upload step runs.
+
+\textbf{Diagnostic Steps:}
+\begin{enumerate}[leftmargin=12pt]
+  \item Pipeline logs show \texttt{curl -s https://codecov.io/bash | bash} executed without verifying a SHA-256 checksum.
+  \item Comparing the fetched script against the upstream repository reveals a single added \texttt{curl} line exfiltrating \texttt{env} variables (API keys, Git tokens).
+  \item \textbf{Remediation:} Never pipe unverified remote scripts to \texttt{bash}; verify SHA-256 hashes of every downloaded CI tool, enforce egress allowlists on runners, and adopt SLSA L3 isolated provenance builders.
+\end{enumerate}
+\end{realworldbox}
+
+\begin{tryityourselfbox}[Tracing AST Taint and Computing Entropy]
+Complete both tasks before checking the solutions:
+\begin{enumerate}[leftmargin=12pt]
+  \item Why does a naive regex like \verb|os\.system\(.*request\.| miss the vulnerability in Listing 1, whereas Semgrep catches it?
+  \item Compute the exact Shannon Entropy $H(X)$ in bits/character of the 12-character string \texttt{"abc123abc123"} (6 distinct characters, each appearing twice: $P(x_i) = 2/12 = 1/6$). Compare it conceptually against a 16-character all-unique hex string (\texttt{4.0} bits/char).
+\end{enumerate}
+\end{tryityourselfbox}
+
+\begin{labbridgebox}[SAST Matcher, SPDX Auditor, and Project 10 Pipeline]
+Run and inspect all three DevSecOps labs in the repository:
+\begin{itemize}[leftmargin=12pt]
+  \item \texttt{exercises/volume3/ex03\_semgrep\_sast\_matcher.py} --- scans sample vulnerable Python code with declarative SAST rules (note: it demonstrates regex pattern matching as a lightweight conceptual contrast to Semgrep's full AST engine).
+  \item \texttt{exercises/volume3/ex04\_spdx\_sbom\_parser.py} --- parses SPDX-2.3 JSON SBOMs and enforces an approved open-source license whitelist.
+  \item \texttt{projects/p10-cicd-security-pipeline/} --- inspect \texttt{app-sbom.spdx.json}, \texttt{scripts/simulate\_pipeline.py}, and \texttt{tests/test\_pipeline\_definition.py}.
+\end{itemize}
+\end{labbridgebox}
+
+\section{Chapter Summary \protect\& Key Takeaways}
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{Semgrep SAST:} Parses ASTs and runs source-to-sink taint tracking, ignoring formatting and requiring explicit sanitizers.
+  \item \textbf{Trivy \& TruffleHog:} Pair CVSS with EPSS exploitation probability; use Shannon Entropy ($-\sum P(x_i)\log_2 P(x_i)$) plus active probes (like AWS \texttt{sts:GetCallerIdentity} with both keys) to verify live secrets.
+  \item \textbf{Sigstore \& Kyverno:} Fulcio issues 10-minute certs from OIDC tokens, Rekor logs signatures in a tamper-evident Merkle tree, and Kyverno blocks unsigned images at admission.
+  \item \textbf{SBOM \& SLSA v1.0:} Syft exports SPDX/CycloneDX SBOMs with \texttt{purl}s; SLSA v1.0 defines 4 levels (L0--L3) up to hardened non-falsifiable provenance.
+\end{itemize}
+
+\section{Exercises}
+
+\subsection{Mechanics}
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Exercise~\thechapter.1:} Compute the exact Shannon Entropy $H(X)$ in bits for \texttt{"1234567890abcdef"} (16 unique hex characters) vs.\ \texttt{"aaaaaaaaaaaaaaaa"}. Why does TruffleHog still pair entropy thresholds with active API verification?
+  \item \textbf{Exercise~\thechapter.2:} A Trivy scan reports CVE-A (CVSS 9.8, EPSS 0.008) and CVE-B (CVSS 7.2, EPSS 0.92). Which should be patched first, and why?
+\end{enumerate}
+
+\subsection{Debugging}
+\begin{enumerate}[leftmargin=18pt]
+  \setcounter{enumi}{2}
+  \item \textbf{Exercise~\thechapter.3:} Kyverno blocks a newly pushed image with \texttt{validation error: check-image-signature failed: no matching signatures found in transparency log}. Outline a 3-step debugging checklist covering digests vs.\ mutable tags, Rekor lookup, and OIDC \texttt{subject} matching.
+\end{enumerate}
+
+\subsection{Architecture}
+\begin{enumerate}[leftmargin=18pt]
+  \setcounter{enumi}{3}
+  \item \textbf{Exercise~\thechapter.4:} Design an end-to-end software supply chain across four stages—(1) Pre-commit/Push, (2) Pull Request CI, (3) Registry Storage, and (4) Kubernetes Admission—naming exact tools, gating criteria, and SLSA Level 3 protections.
+\end{enumerate}
+
+\section{Detailed Solutions}
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Solution~\thechapter.1 (Mechanics):}\\
+  For \texttt{"1234567890abcdef"}, each of the 16 characters has $P(x_i) = 1/16 = 2^{-4}$, so $H(X) = -16 \cdot \frac{1}{16} \log_2(2^{-4}) = \mathbf{4.0\text{ bits}}$. For \texttt{"aaaaaaaaaaaaaaaa"}, $P(\text{'a'}) = 1$, so $H(X) = -1 \cdot \log_2(1) = \mathbf{0.0\text{ bits}}$. Active API verification is still required because harmless UUIDs, hashes, and random test strings also exceed 4.0 bits.
+
+  \item \textbf{Solution~\thechapter.2 (Mechanics):}\\
+  Patch 	extbf{CVE-B} first: EPSS 0.92 means a 92\% 30-day probability of active exploitation in the wild, whereas CVE-A's EPSS 0.008 ($<1\%$) indicates minimal active weaponization despite its higher theoretical CVSS score.
+
+  \item \textbf{Solution~\thechapter.3 (Debugging):}\\
+  \textbf{Step 1 (Digest vs.\ Tag):} Confirm deployment uses immutable \texttt{@sha256:...}; if a mutable tag like \texttt{:v2.1} was overwritten, the signature belongs to the old digest.\\
+  \textbf{Step 2 (Inspect Rekor):} Run \texttt{cosign verify --certificate-identity-regexp ... --certificate-oidc-issuer https://token.actions.githubusercontent.com <image@sha256:...>} to confirm the entry exists in Rekor and cluster egress isn't blocking \texttt{rekor.sigstore.dev}.\\
+  \textbf{Step 3 (OIDC Subject):} Verify Kyverno's \texttt{subject} matches the exact workflow path and ref (\texttt{@refs/heads/main} vs.\ a feature branch or tag).
+
+  \item \textbf{Solution~\thechapter.4 (Architecture):}\\
+  (1) \emph{Pre-commit:} TruffleHog blocks secrets before commit; signed commits enforced. (2) \emph{PR CI:} Semgrep AST taint gates + Trivy failing on fixable High/Critical CVEs with EPSS $>0.10$. (3) \emph{Registry:} SLSA L3 isolated builder generates CycloneDX SBOM via Syft and signs image + SBOM attestation via Cosign/Fulcio/Rekor. (4) \emph{Admission:} Kyverno \texttt{ClusterPolicy} verifies Rekor entries and GitHub OIDC \texttt{main} workflow identity before any Pod schedules.
+
+  \item \textbf{Try-It-Yourself Verification:}\\
+  (1) In Listing 1, \texttt{request.args.get} is on line 8 and \texttt{os.system} is on line 11 using intermediate variable \texttt{cmd}; a single-line regex never matches \texttt{request} inside \texttt{os.system(...)}, whereas Semgrep's AST taint graph tracks \texttt{host -> cmd -> os.system}.\\
+  (2) $H(X) = -6 \times \frac{1}{6} \log_2\!\left(\frac{1}{6}\right) = \log_2(6) \approx \mathbf{2.585\text{ bits/char}}$—well below the 4.0+ bits/char typical of high-entropy secrets.
+\end{enumerate}
+
+\section{Further Reading \protect\& Citations}
+\begin{itemize}[leftmargin=15pt]
+  \item Boehm, B. \emph{Software Engineering Economics}. Prentice-Hall, 1981.
+  \item OpenSSF. \emph{SLSA: Supply-chain Levels for Software Artifacts v1.0}, \texttt{slsa.dev}, 2024.
+  \item Sigstore Authors. \emph{Sigstore: Software Signing for the Open Source Ecosystem}, ACM CCS, 2022.
+  \item Jacobs, J., et al. \emph{Exploit Prediction Scoring System (EPSS)}, First.org, 2023.
+\end{itemize}

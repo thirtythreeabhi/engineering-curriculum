@@ -1,0 +1,456 @@
+\chapter{Modern PHP 8.1--8.4: Runtime Internals, Types, and PSR Architecture}
+\label{chap:modern-php}
+
+Consider this 5-line PHP endpoint sitting behind Nginx:
+
+\begin{lstlisting}[language=PHP,caption={A Minimal 5-Line PHP HTTP Endpoint (	exttt{quote.php})}]
+<?php
+declare(strict_types=1);
+$price = (int) ($_GET['price'] ?? 100);
+$total = $price * 1.1;
+echo json_encode(['total' => $total]);
+\end{lstlisting}
+
+What actually happens in the two milliseconds between Nginx receiving 	exttt{GET /quote.php?price=200} and returning 	exttt{\{"total":220\}}? Unlike Python or Node.js where a single long-lived process owns an HTTP server loop, standard production PHP isolates every request inside an ephemeral memory sandbox managed by \textbf{PHP-FPM}, executes it on the \textbf{Zend Engine} virtual machine, caches compiled instructions in \textbf{OPcache}, and throws the entire request heap away at the end. Understanding those mechanics turns PHP from ``magic scripting'' into a predictable, strictly typed backend platform.
+
+% ==========================================
+\section{PHP-FPM and the Shared-Nothing Request Lifecycle}
+
+When a user sends an HTTP request to Nginx or Caddy, the web server does not execute PHP itself. It forwards the request over a local UNIX domain socket (or loopback TCP) to \textbf{PHP-FPM (FastCGI Process Manager)} using the binary \textbf{FastCGI} protocol.
+
+\subsection{FastCGI 8-Byte Record Headers}
+
+FastCGI packages HTTP headers and body streams into discrete binary frames prefixed by a fixed 8-byte struct:
+
+\begin{lstlisting}[language=C,caption={FastCGI Protocol Header Struct}]
+typedef struct {
+    unsigned char version;          /* FCGI_VERSION_1 (0x01) */
+    unsigned char type;             /* BEGIN_REQUEST (1), PARAMS (4), STDIN (5) */
+    unsigned char requestIdB1;      /* Request ID high byte */
+    unsigned char requestIdB0;      /* Request ID low byte */
+    unsigned char contentLengthB1;  /* Payload length high byte */
+    unsigned char contentLengthB0;  /* Payload length low byte */
+    unsigned char paddingLength;    /* Trailing alignment bytes */
+    unsigned char reserved;
+} fcgi_header;
+\end{lstlisting}
+
+Nginx sends a 	exttt{FCGI\_BEGIN\_REQUEST} frame, encodes HTTP headers and query parameters (	exttt{price=200}) as key-value pairs inside 	exttt{FCGI\_PARAMS} frames, streams any POST body in 	exttt{FCGI\_STDIN} frames, and finishes with an empty 	exttt{FCGI\_STDIN} record. A PHP-FPM worker reads those records and populates 	exttt{\$\_GET}, 	exttt{\$\_SERVER}, and 	exttt{php://input}.
+
+\subsection{Master and Worker Process Pools}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.9, transform shape,
+  node distance=1.0cm and 1.6cm,
+  box/.style={rectangle, draw=headingblue, fill=codebg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily},
+  accentbox/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily\bfseries},
+  line/.style={draw=headingblue, -{Stealth[length=2.5mm]}, thick}
+]
+  \node[box] (nginx) {\textbf{Reverse Proxy}\\\small Nginx / Caddy};
+  \node[accentbox, right=of nginx] (master) {\textbf{FPM Master Process}\\\footnotesize Owns Listening Socket};
+  \node[box, below=0.9cm of master, xshift=-2.8cm] (w1) {\textbf{Worker 1}\\\footnotesize Clean Request Heap};
+  \node[box, below=0.9cm of master] (w2) {\textbf{Worker 2}\\\footnotesize Idle / Waiting};
+  \node[box, below=0.9cm of master, xshift=2.8cm] (w3) {\textbf{Worker $N$}\\\footnotesize Active Execution};
+
+  \draw[line] (nginx) -- node[above, font=\footnotesize\ttfamily] {FastCGI} (master);
+  \draw[line] (master) -- (w1);
+  \draw[line] (master) -- (w2);
+  \draw[line] (master) -- (w3);
+
+  \node[draw=gray!50, dashed, fit=(w1) (w2) (w3), inner sep=8pt, label=below:{\footnotesize\sffamily Isolated OS Processes (Shared-Nothing Memory)}] {};
+\end{tikzpicture}
+\caption{PHP-FPM master process supervising an isolated worker pool.}
+\label{fig:v1-ch03-fpm-arch}
+\end{figure}
+
+One privileged \textbf{Master Process} binds the socket, handles signals (	exttt{SIGUSR2} for zero-downtime reload), and forks unprivileged \textbf{Worker Processes} configured either dynamically (	exttt{pm = dynamic}) or pre-forked at fixed size (	exttt{pm = static}, preferred under steady high load to avoid fork churn).
+
+\subsection{The 5-Stage Shared-Nothing Lifecycle}
+
+Every worker runs five phases:
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{MINIT (Module Init):} Runs once when the worker boots. Extensions register functions and persistent structs.
+  \item \textbf{RINIT (Request Init):} Runs before 	exttt{quote.php} starts. The \textbf{Zend Memory Manager (ZMM)} allocates a fresh request memory arena and initializes 	exttt{\$\_GET}/	exttt{\$\_SERVER}.
+  \item \textbf{Execute:} The Zend VM runs 	exttt{quote.php}.
+  \item \textbf{RSHUTDOWN (Request Shutdown):} Flushes output, runs destructors, and lets ZMM wipe the \emph{entire} request arena in bulk---so a per-request memory leak cannot poison future requests.
+  \item \textbf{MSHUTDOWN:} Runs once when the worker exits.
+\end{enumerate}
+
+\begin{productionwarningbox}[Recycle Workers via 	exttt{pm.max\_requests}]
+Although ZMM resets the PHP request heap on every 	exttt{RSHUTDOWN}, third-party C extensions can still fragment native 	exttt{malloc} memory over hours. Setting 	exttt{pm.max\_requests = 10000} tells the master to cleanly respawn each worker after 10,000 requests.
+\end{productionwarningbox}
+
+% ==========================================
+\section{Zend Engine 4: Tracing Our 5-Line Script to Bytecode and JIT}
+
+Remember from the Foundations Primer: CPUs cannot read PHP text. Let's trace our exact 5-line 	exttt{quote.php} script through every stage of the \textbf{Zend Engine} \cite{phpinternals}:
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.88, transform shape,
+  node distance=0.9cm and 1.1cm,
+  stage/.style={rectangle, draw=headingblue, fill=codebg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily},
+  astage/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily\bfseries},
+  line/.style={draw=headingblue, -{Stealth[length=2.5mm]}, thick}
+]
+  \node[stage] (src) {\textbf{Source}\\	exttt{quote.php}};
+  \node[stage, right=of src] (lex) {\textbf{Lexer (re2c)}\\\small Tokens};
+  \node[stage, right=of lex] (parse) {\textbf{Parser (Bison)}\\\small 	exttt{zend\_ast}};
+  \node[astage, below=0.9cm of parse] (comp) {\textbf{Compiler}\\\small 	exttt{zend\_op\_array}};
+  \node[stage, left=of comp] (opcache) {\textbf{OPcache}\\\small Shared Memory + SSA};
+  \node[astage, left=of opcache] (vm) {\textbf{Zend VM}\\\small Computed-	exttt{goto} Loop};
+
+  \draw[line] (src) -- (lex);
+  \draw[line] (lex) -- (parse);
+  \draw[line] (parse) -- (comp);
+  \draw[line] (comp) -- (opcache);
+  \draw[line] (opcache) -- (vm);
+\end{tikzpicture}
+\caption{Zend Engine 4 compilation and execution pipeline.}
+\label{fig:v1-ch03-zend-pipeline}
+\end{figure}
+
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Lexing (Tokens via 	exttt{re2c}):} The scanner chops 	exttt{\$total = \$price * 1.1;} into tokens: 	exttt{T\_VARIABLE("\$total")}, 	exttt{'='}, 	exttt{T\_VARIABLE("\$price")}, 	exttt{'*'}, 	exttt{T\_DNUMBER(1.1)}, 	exttt{';'}.
+  \item \textbf{Parsing (AST via Bison):} A LALR(1) grammar checks syntax and builds a 	exttt{zend\_ast} tree where 	exttt{ZEND\_AST\_ASSIGN} links 	exttt{\$total} to 	exttt{ZEND\_AST\_BINARY\_OP(MUL, \$price, 1.1)}.
+  \item \textbf{Lowering / Opcode Emission:} The compiler flattens the AST into a linear array of instructions (	exttt{zend\_op\_array}). Each instruction is a C struct 	exttt{zend\_op} holding an 	exttt{opcode} (e.g., 	exttt{ZEND\_MUL}, 	exttt{ZEND\_ASSIGN}), two input operands (	exttt{op1}, 	exttt{op2}), and a 	exttt{result} operand. Local variables like 	exttt{\$price} and 	exttt{\$total} become \textbf{Compiled Variables (	exttt{IS\_CV})} stored in a flat indexed array on the call frame---so accessing 	exttt{\$price} is an $O(1)$ pointer offset, not a hash-table lookup!
+  \item \textbf{VM Dispatch Loop:} On GCC/Clang builds, the Zend VM uses \textbf{direct threading} (computed 	exttt{goto} jump tables): each opcode handler increments 	exttt{execute\_data->opline++} and jumps straight to the next handler, avoiding central 	exttt{switch} branch misprediction.
+\end{enumerate}
+
+\subsection{OPcache Shared Memory, Preloading, and the Tracing JIT}
+
+Compiling 	exttt{quote.php} from scratch on every HTTP request would waste CPU. \textbf{OPcache} compiles each file once and caches its 	exttt{zend\_op\_array} inside OS shared memory (SHM) visible to every FPM worker. With 	exttt{opcache.preload}, a startup script compiles core framework classes via 	exttt{opcache\_compile\_file()} before the first request ever arrives.
+
+For CPU-heavy loops, PHP 8 introduced a \textbf{Tracing JIT} configured via the 4-digit \textbf{CRTO} flag:
+
+\begin{lstlisting}[language=sh,caption={Tracing JIT Configuration (	exttt{php.ini})}]
+; CRTO digits:
+;   C = 1 (CPU-specific AVX optimizations)
+;   R = 2 (Global linear-scan register allocation)
+;   T = 5 (Tracing JIT: compile hot executed instruction traces)
+;   O = 5 (Optimization level 5: full trace/function SSA + DCE + devirtualization)
+opcache.jit = 1255
+opcache.jit_buffer_size = 128M
+\end{lstlisting}
+
+When a loop or function crosses a hotness counter threshold, the Tracing JIT records the exact runtime types seen on that hot path, optimizes them in an intermediate representation (IR), and emits native x86-64 or ARM64 machine code into the JIT buffer. (In PHP 8.0--8.3 this used DynASM directly; 	extbf{PHP 8.4} introduced a unified 	extbf{IR JIT backend} that improves register allocation and cross-architecture portability.)
+
+\begin{intuitionbox}[When Does the PHP JIT Matter?]
+Our 5-line 	exttt{quote.php} spends almost all its time in FastCGI I/O and JSON encoding, where the JIT adds little (roughly 3--8\% on typical database-backed web endpoints). The JIT shines when PHP executes tight numerical loops---image transforms, vector math, parsers, or cryptographic routines---bypassing VM opcode dispatch altogether.
+\end{intuitionbox}
+
+% ==========================================
+\section{Modern PHP 8.1--8.4 Type Safety}
+
+Modern PHP enforces runtime type checks with 	exttt{declare(strict\_types=1);} (disabling silent coercions like 	exttt{"100"} $\to$ 	exttt{100}) and supports algebraic combinations of types:
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{Union Types (PHP 8.0):} 	exttt{int|float|string} (satisfies at least one type).
+  \item \textbf{Intersection Types (PHP 8.1):} 	exttt{Entity\&Auditable} (must implement \emph{both} interfaces simultaneously).
+  \item \textbf{DNF Types (PHP 8.2):} \textbf{Disjunctive Normal Form} means writing combined union-and-intersection rules cleanly as an \emph{OR of ANDs}, such as 	exttt{(Entity\&Auditable)|NullObject}. Requiring DNF prevents ambiguous nested parentheses and keeps runtime type-checking fast.
+\end{itemize}
+
+\begin{lstlisting}[language=PHP,caption={DNF Types, Backed Enums, Readonly Classes, and PHP 8.4 Asymmetric Visibility}]
+<?php
+declare(strict_types=1);
+
+interface Entity { public function getId(): string; }
+interface Auditable { public function getAuditLog(): array; }
+interface NullObject {}
+
+enum AccountStatus: string {
+    case Active = 'ACTIVE';
+    case Frozen = 'FROZEN';
+}
+
+readonly class Money {
+    public function __construct(public int $cents, public string $currency) {}
+}
+
+class LedgerAccount {
+    // Publicly readable anywhere, but writable ONLY inside LedgerAccount (PHP 8.4)
+    public private(set) int $balanceCents;
+    public private(set) AccountStatus $status;
+
+    public function __construct(int $initialCents) {
+        $this->balanceCents = $initialCents;
+        $this->status = AccountStatus::Active;
+    }
+
+    public function record((Entity\&Auditable)|NullObject $entry): void {
+        if ($entry instanceof NullObject) {
+            return;
+        }
+        // Safe: runtime already proved $entry implements BOTH Entity \& Auditable
+        $id = $entry->getId();
+        $log = $entry->getAuditLog();
+    }
+}
+\end{lstlisting}
+
+\textbf{Walkthrough:} Notice 	exttt{public private(set) int \$balanceCents;} in PHP 8.4: callers can read 	exttt{\$account->balanceCents} directly without boilerplate getters, yet attempting 	exttt{\$account->balanceCents = 0} outside 	exttt{LedgerAccount} triggers a compile/runtime error. Meanwhile 	exttt{Money} is a 	exttt{readonly class}, making all its properties immutable after construction.
+
+% ==========================================
+\section{Memory Internals: 16-Byte 	exttt{zval}, CoW, and Cyclic GC}
+
+To understand why PHP handles arrays quickly---and why long-running workers still occasionally leak RAM---you have to look at how PHP stores every variable in 16 bytes.
+
+\subsection{The 16-Byte 	exttt{zval} and PHP 8.x 	exttt{zend\_refcounted\_h}}
+
+In PHP 8, every variable container (	exttt{zval}) is exactly \textbf{16 bytes}:
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{8 bytes (	exttt{zend\_value}):} Holds an integer (	exttt{lval}), float (	exttt{dval}), or a pointer (	exttt{*arr}, 	exttt{*str}, 	exttt{*obj}) to a heap structure.
+  \item \textbf{4 bytes (	exttt{u1.type\_info}):} Holds the type tag (	exttt{IS\_LONG}, 	exttt{IS\_ARRAY}, etc.) and type flags (	exttt{IS\_TYPE\_REFCOUNTED}).
+  \item \textbf{4 bytes (	exttt{u2}):} Holds auxiliary metadata (hash collision chain 	exttt{next}, opcode cache slot, or line number).
+\end{itemize}
+
+Integers, floats, booleans, and 	exttt{null} fit directly inside those 16 bytes with \textbf{zero heap allocation}. Heap structures like strings, arrays, and objects begin with a shared 8-byte header 	exttt{zend\_refcounted\_h}:
+
+\begin{lstlisting}[language=C,caption={PHP 8.x Reference-Counted Header (	exttt{Zend/zend\_types.h})}]
+typedef struct _zend_refcounted_h {
+    uint32_t refcount;          /* Active references pointing here */
+    union {
+        uint32_t type_info;     /* Bit-packed: type (bits 0..7), flags (8..15),
+                                   and GC color + root buffer index (gc_info) */
+    } u;
+} zend_refcounted_h;
+\end{lstlisting}
+
+Notice that in PHP 8.x, 	exttt{type\_info} packs the type byte, immutability/interned flags, and garbage-collector color (	exttt{GC\_PURPLE}, 	exttt{GC\_GREY}, 	exttt{GC\_WHITE}, 	exttt{GC\_BLACK}) plus root-buffer index using bitmasks (	exttt{GC\_TYPE\_INFO} / 	exttt{GC\_INFO\_SHIFT}) into a single 32-bit integer so the engine can read or update flags atomically in one CPU instruction.
+
+\subsection{Copy-on-Write (CoW) and Interned Strings}
+
+\begin{lstlisting}[language=PHP,caption={Copy-on-Write (	exttt{CoW}) Reference Counting Trace}]
+<?php
+$a = range(1, 100_000); // Allocates ~4 MB array; arr->refcount = 1
+$b = $a;                // Zero copy! $b points to SAME zend_array; arr->refcount = 2
+$b[] = 100_001;         // Write sees refcount > 1 -> clones array for $b (refcount = 1)
+                        // $a keeps original array (refcount = 1)
+\end{lstlisting}
+
+Compile-time string literals, class names, and function names carry the 	exttt{IS\_STR\_INTERNED} flag: they live once in shared memory and skip reference-count increments entirely.
+
+\begin{intuitionbox}[The Sticky-Note Analogy for Copy-on-Write]
+Assigning 	exttt{\$b = \$a} does not photocopy a 400-page binder; it simply puts a second sticky note (	exttt{refcount = 2}) on the same binder. Only when someone tries to write a change onto 	exttt{\$b} does PHP check ``is anyone else still pointing at this binder?'' (	exttt{refcount > 1}) and photocopy it just before applying the edit.
+\end{intuitionbox}
+
+\subsection{Tracing Cyclic Garbage Collection Step-by-Step}
+
+Reference counting immediately frees normal objects when 	exttt{refcount} hits 0, \textbf{except when objects point to each other in a cycle}. Trace a concrete cycle between two objects 	exttt{\$a} and 	exttt{\$b}:
+
+\begin{enumerate}[leftmargin=15pt]
+  \item Create 	exttt{\$a = new Node(); \$b = new Node();}: both objects sit on the heap with 	exttt{refcount = 1} (from local variables 	exttt{\$a} and 	exttt{\$b}).
+  \item Link them: 	exttt{\$a->peer = \$b; \$b->peer = \$a;}: now 	exttt{\$a} has 	exttt{refcount = 2} (	exttt{\$a} + 	exttt{\$b->peer}), and 	exttt{\$b} has 	exttt{refcount = 2} (	exttt{\$b} + 	exttt{\$a->peer}).
+  \item Drop external handles: 	exttt{unset(\$a, \$b);}: both 	exttt{refcount}s drop from $2 \to 1$. Neither reaches 0, yet both objects are completely unreachable!
+  \item \textbf{Mark Purple:} Because their refcounts decremented without hitting 0, PHP colors both \textbf{Purple} and appends them to the 	extbf{GC Roots Buffer} (capacity 10,000 roots).
+  \item \textbf{Mark Grey (Trial Deletion):} When the Roots Buffer fills (or 	exttt{gc\_collect\_cycles()} runs), the Bacon--Rajan collector walks the subgraph from each Purple root, temporarily decrementing internal child refcounts by 1 and coloring visited nodes \textbf{Grey}: 	exttt{\$a->peer} drops 	exttt{\$b}'s trial refcount $1 \to 0$; 	exttt{\$b->peer} drops 	exttt{\$a}'s trial refcount $1 \to 0$.
+  \item \textbf{Scan (White vs.\ Black):} Any node whose trial refcount is still $> 0$ must have an external live reference, so the collector restores counts and marks it \textbf{Black} (alive). Here both 	exttt{\$a} and 	exttt{\$b} sit at $0$, so both are marked \textbf{White} (garbage).
+  \item \textbf{Sweep:} All \textbf{White} nodes are destroyed and freed.
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.88, transform shape,
+  node distance=0.9cm and 1.2cm,
+  state/.style={circle, draw=headingblue, thick, minimum size=1.7cm, align=center, font=\small\sffamily},
+  line/.style={draw=headingblue, -{Stealth[length=2.3mm]}, thick}
+]
+  \node[state, fill=purple!20] (purple) {\textbf{Purple}\\\footnotesize Possible Root};
+  \node[state, fill=gray!30, right=of purple] (gray) {\textbf{Grey}\\\footnotesize Trial Decr};
+  \node[state, fill=black, text=white, below=1.0cm of gray] (black) {\textbf{Black}\\\footnotesize Live ($>0$)};
+  \node[state, fill=white, draw=gray, below=1.0cm of purple] (white) {\textbf{White}\\\footnotesize Garbage ($0$)};
+
+  \draw[line] (purple) -- node[above, font=\tiny\sffamily] {Mark Grey} (gray);
+  \draw[line] (gray) -- node[above, font=\tiny\sffamily] {refcount == 0} (white);
+  \draw[line] (gray) -- node[right, font=\tiny\sffamily] {refcount > 0} (black);
+  \draw[line] (white) -- node[left, font=\tiny\sffamily] {Sweep \& Free} (purple);
+\end{tikzpicture}
+\caption{Bacon--Rajan cycle collector color transitions.}
+\label{fig:v1-ch03-gc-states}
+\end{figure}
+
+\begin{realworldbox}[Debugging OOM Crashes in Long-Running PHP Queue Workers]
+\textbf{Symptom:} A Laravel Horizon / Symfony Messenger worker dies after 40 minutes with 	exttt{Allowed memory size of 536870912 bytes exhausted}, even though each job handles only 500 records and calls 	exttt{unset(\$entity)}.
+
+\textbf{Diagnostic Steps:}
+\begin{enumerate}[leftmargin=15pt,itemsep=2pt]
+  \item Log 	exttt{memory\_get\_usage(true)} and 	exttt{gc\_status()} (	exttt{runs}, 	exttt{collected}, 	exttt{roots}) after every 100 jobs: observe 	exttt{roots} climbing steadily toward 10,000 followed by 200\,ms CPU pauses, or memory climbing even after 	exttt{gc\_collect\_cycles()}.
+  \item Inspect the object graph: ORM entities hold bidirectional parent-child arrays (or Doctrine's internal identity map holds strong references to every loaded row).
+  \item Replace child-to-parent strong references with 	exttt{WeakReference::create(\$parent)}, call 	exttt{\$entityManager->clear()} between batches, and restart CLI workers periodically via 	exttt{--max-jobs=500}.
+\end{enumerate}
+\end{realworldbox}
+
+% ==========================================
+\section{Closures, First-Class Callables, and PSR Middleware}
+
+Closures in PHP are instances of the internal 	exttt{Closure} class capturing lexical variables with 	exttt{use (\$var)}. In PHP 8.1+, any function or method can be turned into a 	exttt{Closure} using 	extbf{first-class callable syntax} 	exttt{<callable>(...)} (for example, 	exttt{strlen(...)} or 	exttt{\$this->validate(...)}):
+
+\begin{lstlisting}[language=PHP,caption={First-Class Callables and 	exttt{Closure::bindTo}}]
+<?php
+declare(strict_types=1);
+
+$hasher = hash_hmac(...);              // Converts built-in function to Closure
+$mac = $hasher('sha256', 'msg', 'key');
+
+class Vault { private string $key = 'AES_KEY_0xFA'; }
+$reader = (fn() => $this->key)->bindTo(new Vault(), Vault::class);
+echo $reader();                        // Prints: AES_KEY_0xFA
+\end{lstlisting}
+
+\subsection{PSR-4 Autoloading and the PSR-7 / PSR-15 Onion Pipeline}
+
+\textbf{PSR-4} maps namespaces directly to directories (	exttt{App\textbackslash Billing\textbackslash Invoice} $\to$ 	exttt{src/Billing/Invoice.php}); running 	exttt{composer dump-autoload --optimize --classmap-authoritative} compiles all paths into an in-memory map so PHP avoids slow 	exttt{file\_exists()} disk checks.
+
+\textbf{PSR-7} models HTTP requests and responses as \emph{immutable} value objects (	exttt{\$req->withHeader(...)} returns a clone), while \textbf{PSR-15} composes middleware like layers of an onion:
+
+\begin{lstlisting}[language=PHP,caption={PSR-15 Middleware Executed as an Onion Pipeline}]
+<?php
+declare(strict_types=1);
+
+use Psr\Http\Message\{ResponseInterface, ServerRequestInterface};
+use Psr\Http\Server\{MiddlewareInterface, RequestHandlerInterface};
+
+final class CorrelationIdMiddleware implements MiddlewareInterface {
+    public function process(
+        ServerRequestInterface $request,
+        RequestHandlerInterface $handler
+    ): ResponseInterface {
+        // 1. INBOUND (outer -> inner): attach correlation ID before inner layers run
+        $cid = $request->getHeaderLine('X-Correlation-ID') ?: bin2hex(random_bytes(8));
+        $enriched = $request->withHeader('X-Correlation-ID', $cid);
+
+        // 2. DELEGATE: pass request inward to next middleware or controller
+        $response = $handler->handle($enriched);
+
+        // 3. OUTBOUND (inner -> outer): stamp response header as stack unwinds
+        return $response->withHeader('X-Correlation-ID', $cid);
+    }
+}
+\end{lstlisting}
+
+\textbf{Concrete onion trace:} When 	exttt{GET /orders} arrives without 	exttt{X-Correlation-ID}, 	exttt{CorrelationIdMiddleware} generates 	exttt{a3f9...}, clones the immutable PSR-7 request with that header, and calls 	exttt{\$handler->handle(\$enriched)}. Inner auth middleware and the controller read the header, build a 	exttt{200 OK} response, and return it back outward; line 19 attaches the same 	exttt{X-Correlation-ID} to the outgoing response before PHP-FPM sends it to Nginx.
+
+\begin{tryityourselfbox}[Predict Refcounts Through Assignment and Explicit Reference]
+Trace the exact 	exttt{refcount} of the underlying array 	exttt{[10, 20]} at each line:
+\begin{lstlisting}[language=PHP]
+$x = [10, 20];
+$y = $x;
+$z = \&$y;
+$z[] = 30;
+\end{lstlisting}
+Does mutating 	exttt{\$z} modify 	exttt{\$x}? Why or why not?
+\end{tryityourselfbox}
+
+% ==========================================
+\section{Chapter Summary \protect\& Key Takeaways}
+
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{PHP-FPM Shared-Nothing:} FastCGI streams HTTP into isolated FPM workers; 	exttt{RSHUTDOWN} wipes the request memory arena between requests, preventing cross-request state leaks.
+  \item \textbf{Zend VM, OPcache \& JIT:} 	exttt{re2c} + Bison compile PHP into 	exttt{zend\_op\_array} instructions cached in OPcache shared memory. 	exttt{opcache.jit=1255} enables tracing optimization (and PHP 8.4 adds a new IR JIT backend).
+  \item \textbf{Type System:} Strict types, Union, Intersection, DNF (	exttt{(A\&B)|C}), backed enums, 	exttt{readonly} classes, and PHP 8.4 	exttt{public private(set)} enforce domain invariants early.
+  \item \textbf{Memory \& GC:} 16-byte 	exttt{zval}s store scalars inline; PHP 8.x 	exttt{zend\_refcounted\_h} packs type, flags, and GC color into 	exttt{uint32\_t type\_info}; CoW defers cloning until write; Bacon--Rajan trial deletion reclaims cyclic objects.
+  \item \textbf{PSR Ecosystem:} 	exttt{<callable>(...)} creates Closures cleanly; PSR-7 immutability and PSR-15 onion middleware structure clean HTTP pipelines.
+\end{itemize}
+
+% ==========================================
+\section{Exercises and Real-World Scenarios}
+
+\subsection{Mechanics Exercises}
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Exercise~\thechapter.1:} Explain why changing 	exttt{\$b[0] = 99} after 	exttt{\$a = range(1, 50000); \$b = \$a;} doubles array memory only at the moment of the write, and identify which bit of 	exttt{zend\_refcounted\_h} governs this check.
+  \item \textbf{Exercise~\thechapter.2:} Write a PHP 8.4 class 	exttt{UserProfile} using asymmetric visibility so 	exttt{\$username} and 	exttt{\$email} are publicly readable, writable only inside 	exttt{UserProfile} or subclasses, and validated before assignment.
+\end{enumerate}
+
+\subsection{Debugging Exercise}
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Exercise~\thechapter.3:} A CLI importer crashes after 45 minutes with 	exttt{Allowed memory size exhausted} even though it calls 	exttt{unset(\$node)} on every row:
+\begin{lstlisting}[language=PHP]
+while ($row = $db->fetchNext()) {
+    $node = new Node($row);
+    $node->parent = $currentNode;
+    $currentNode->addChild($node);
+    $currentNode = $node;
+    unset($node);
+}
+\end{lstlisting}
+  Explain why 	exttt{unset(\$node)} does not free RAM and provide three concrete fixes.
+\end{enumerate}
+
+\subsection{Architecture Design Problem}
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Exercise~\thechapter.4:} Architect a PSR-15 HTTP request pipeline and PHP 8.4 CLI batch processor for an invoice-PDF export service. Specify how FPM workers are sized (	exttt{pm}, 	exttt{pm.max\_requests}), how OPcache preloading is configured, how PSR-15 middleware handles timing/correlation/auth cleanly, and how the long-running CLI worker avoids cyclic memory leaks while processing 2 million invoices.
+\end{enumerate}
+
+% ==========================================
+\section{Detailed Solutions}
+
+\subsection{Solution to Try It Yourself: Refcount \protect\& CoW With 	exttt{\&\$y}}
+\begin{enumerate}[leftmargin=15pt]
+  \item 	exttt{\$x = [10, 20];}: Heap 	exttt{zend\_array} created with 	exttt{refcount = 1}.
+  \item 	exttt{\$y = \$x;}: CoW shares the array; 	exttt{refcount = 2}.
+  \item 	exttt{\$z = \&\$y;}: Taking a PHP reference separates 	exttt{\$y} from direct CoW sharing: Zend allocates a 	exttt{zend\_reference} wrapper (with its own 	exttt{refcount = 2}, pointed to by 	exttt{\$y} and 	exttt{\$z}) which points to the 	exttt{zend\_array} (still 	exttt{refcount = 2}, held by 	exttt{\$x} and the 	exttt{zend\_reference}).
+  \item 	exttt{\$z[] = 30;}: Because the underlying array still has 	exttt{refcount = 2} ($> 1$), mutating through 	exttt{\$z} triggers CoW separation: 	exttt{\$y} and 	exttt{\$z} now share a cloned array 	exttt{[10, 20, 30]}, while 	exttt{\$x} remains untouched as 	exttt{[10, 20]}.
+\end{enumerate}
+
+\subsection{Solution~\thechapter.1: Copy-on-Write Check}
+Zend checks 	exttt{GC\_REFCOUNT(arr) > 1} in 	exttt{zend\_refcounted\_h.refcount} (and verifies the array is not immutable). While 	exttt{refcount == 2}, 	exttt{\$a} and 	exttt{\$b} share one 400\,KB--4\,MB allocation; only upon write (	exttt{\$b[0] = 99}) does 	exttt{SEPARATE\_ARRAY} duplicate the bucket array and drop the original 	exttt{refcount} back to $1$.
+
+\subsection{Solution~\thechapter.2: PHP 8.4 Asymmetric Visibility}
+\begin{lstlisting}[language=PHP]
+<?php
+declare(strict_types=1);
+
+class UserProfile {
+    public protected(set) string $username;
+    public protected(set) string $email;
+
+    public function __construct(string $username, string $email) {
+        $this->updateContact($username, $email);
+    }
+
+    public function updateContact(string $username, string $email): void {
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            throw new InvalidArgumentException("Invalid email");
+        }
+        $this->username = $username;
+        $this->email = $email;
+    }
+}
+\end{lstlisting}
+
+\subsection{Solution~\thechapter.3: Cyclic Tree Memory Leak}
+\textbf{Diagnosis:} Every 	exttt{Node} references 	exttt{\$currentNode} via 	exttt{\$node->parent}, and 	exttt{\$currentNode} stores 	exttt{\$node} in its children array. Calling 	exttt{unset(\$node)} only removes the loop's temporary handle; the parent still references the child and 	exttt{\$currentNode} keeps extending an ever-growing doubly-linked tree pinned in RAM!
+\textbf{Fixes:} (1) Use 	exttt{WeakReference::create(\$currentNode)} for 	exttt{\$node->parent} so child-to-parent links do not increment refcount; (2) detach finished subtrees (	exttt{\$node->parent = null;}) and avoid holding the root/chain in 	exttt{\$currentNode}; (3) periodically invoke 	exttt{gc\_collect\_cycles()} in long CLI batches.
+
+\subsection{Solution~\thechapter.4: PHP 8.4 HTTP Pipeline + CLI Batch Architecture}
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{PHP-FPM Pool \& OPcache:} Set 	exttt{pm = static} with 	exttt{pm.max\_children} sized to $(\text{Available RAM} / \text{avg worker RSS})$, e.g.\ 64 workers on an 8\,GB node at ~80\,MB/worker, and 	exttt{pm.max\_requests = 10000} to recycle native extension fragmentation. Enable 	exttt{opcache.validate\_timestamps = 0} in immutable container builds and preload 	exttt{src/Domain/} + 	exttt{vendor/} via 	exttt{opcache.preload}.
+  \item \textbf{PSR-15 Middleware Stack:} Compose outer-to-inner: 	exttt{CorrelationIdMiddleware} $\rightarrow$ 	exttt{RequestTimingMiddleware} $\rightarrow$ 	exttt{JwtAuthMiddleware} (attaching authenticated principal via PSR-7 	exttt{\$request->withAttribute('user', \$u)}) $\rightarrow$ 	exttt{InvoiceExportHandler}, which enqueues an async export job and returns 	exttt{202 Accepted}.
+  \item \textbf{Memory-Safe CLI Batch Processor:}
+\begin{lstlisting}[language=PHP]
+while ($batch = $repo->fetchPendingChunk(limit: 200)) {
+    foreach ($batch as $invoice) {
+        $pdfGenerator->renderToDisk($invoice);
+    }
+    $entityManager->clear(); // Detach all cached ORM entities from Identity Map
+    unset($batch);
+    if (gc_status()['roots'] > 5000) {
+        gc_collect_cycles();
+    }
+}
+\end{lstlisting}
+  Clearing the ORM Identity Map every 200 invoices keeps heap RSS flat across 2 million records, and wrapping parent links in 	exttt{WeakReference} ensures cyclic DTOs never pile up.
+\end{enumerate}
+
+\begin{labbridgebox}[Explore PHP Internals \& Strict Types in Code]
+\begin{itemize}[leftmargin=15pt,itemsep=2pt]
+  \item 	exttt{exercises/volume1/ex01\_php\_cow\_zval.php}: Run 	exttt{php exercises/volume1/ex01\_php\_cow\_zval.php} to measure real memory usage before and after CoW writes and 	exttt{\&\$var} references.
+  \item 	exttt{projects/p01-php-db-integration/src/Domain/}: Inspect PHP 8.3 readonly domain models, backed enums (	exttt{OrderStatus}), and strict typing in action.
+\end{itemize}
+\end{labbridgebox}
+
+\section*{Further Reading}
+For deeper Zend Engine source-level internals, consult the \textit{PHP Internals Book} \cite{phpinternals} and RFCs for Fibers, DNF types, and PHP 8.4 Asymmetric Visibility.

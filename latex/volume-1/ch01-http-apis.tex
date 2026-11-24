@@ -1,0 +1,484 @@
+\chapter{Transport Foundations, HTTP Evolution, and API Paradigms}
+\label{chap:http-apis}
+
+Open your browser's Network tab while loading a web app on office Wi-Fi and everything looks effortless: requests turn green in 18\,ms. Put that exact same app on a commuter train with patchy cellular signal and suddenly pages hang for six seconds, a live ticker disconnects, and an internal microservice starts dropping requests under JSON parsing load. Nothing changed in your application code---what changed is how bytes move across the network wire.
+
+This chapter builds API communication from the transport layer upward: first understanding IP, DNS, TCP, UDP, and TLS 1.3; then tracing why HTTP evolved from HTTP/1.1 to HTTP/2 and HTTP/3; and finally dissecting REST, WebSockets, Server-Sent Events (SSE), and gRPC with Protocol Buffers down to individual bits and bytes.
+
+% ==========================================
+\section{Before HTTP: IP, DNS, TCP, UDP, and TLS 1.3}
+
+Every HTTP call, WebSocket frame, or gRPC message rides on top of lower-level protocols managed by your operating system kernel. Without a clear mental model of those lower layers, higher-level API bugs look mysterious.
+
+\subsection{IP Addresses, Ports, and DNS}
+
+When your laptop calls 	exttt{https://api.shop.example/orders}, two things must happen before any HTTP text is sent:
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Name Resolution (DNS):} Computers route packets using numeric \textbf{IP addresses} (such as 	exttt{203.0.113.42} in IPv4 or 	exttt{2001:db8::42} in IPv6), not hostnames. Your OS sends a tiny query to a \textbf{DNS resolver}, which returns the IP address along with a \textbf{TTL (Time To Live)} in seconds telling your client how long it may cache that answer.
+  \item \textbf{Ports:} A single server machine often runs Nginx, PostgreSQL, and Redis simultaneously. A 16-bit integer \textbf{port} ($1$ to $65535$) identifies which program on that host should receive the bytes (by convention, 	exttt{443} for HTTPS, 	exttt{80} for plain HTTP, 	exttt{5432} for PostgreSQL).
+\end{enumerate}
+
+\subsection{TCP vs.\ UDP: Ordered Byte Streams vs.\ Independent Datagrams}
+
+Once your client knows the destination 	exttt{(IP, port)}, it chooses one of two kernel transport protocols:
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{TCP (Transmission Control Protocol):} TCP creates a virtual, reliable, strictly ordered pipe between client and server. Before sending application data, client and server perform a \textbf{three-way handshake}: 	exttt{SYN} (``I want to connect, my starting sequence number is $x$'') $\rightarrow$ 	exttt{SYN-ACK} (``I hear $x$, my starting number is $y$'') $\rightarrow$ 	exttt{ACK} (``I hear $y$''). That handshake costs \textbf{one full round-trip time (1\,RTT)} before the first byte of application data can leave the client. Every chunk of bytes carries a sequence number; if packet \#3 is lost on the wire while packets \#4 and \#5 arrive safely, the receiver's kernel \emph{holds back} \#4 and \#5 in memory until \#3 is retransmitted and arrives.
+  \item \textbf{UDP (User Datagram Protocol):} UDP sends discrete, independent packets (\textbf{datagrams}) with no handshake, no sequence numbers, and no automatic retransmission. If datagram \#3 is dropped, datagram \#4 is delivered to the application immediately. Because UDP adds almost zero kernel policy, modern protocols like QUIC (HTTP/3) use UDP as a blank canvas to build custom reliability in user space.
+\end{itemize}
+
+\subsection{TLS 1.3: Encrypting the Pipe}
+
+Plain TCP sends bytes in clear text---any router or Wi-Fi access point along the path can read passwords or inject fake responses. \textbf{TLS (Transport Layer Security)} wraps the connection in encryption and identity verification:
+\begin{enumerate}[leftmargin=15pt]
+  \item During the \textbf{TLS 1.3 handshake}, the server presents an \textbf{X.509 certificate} signed by a trusted Certificate Authority (proving it truly owns 	exttt{api.shop.example}), and both sides run a Diffie-Hellman key exchange to derive a shared temporary symmetric session key.
+  \item In TLS 1.3 over TCP, this adds \textbf{1\,RTT} on top of TCP's 1\,RTT handshake---so a brand-new HTTPS connection takes \textbf{2\,RTTs} before the client can even transmit 	exttt{GET /orders}.
+\end{enumerate}
+
+\begin{intuitionbox}[Why Latency Multiplies on Mobile Networks]
+If a round trip between your phone and a data center takes $60\text{\,ms}$, establishing TCP + TLS 1.3 consumes $2 \times 60\text{\,ms} = 120\text{\,ms}$ before a single byte of HTTP reaches the API handler. Add a DNS lookup ($30\text{\,ms}$) and the HTTP request itself ($60\text{\,ms}$), and a ``simple'' cold API call takes $210\text{\,ms}$ even if the server processes it in $1\text{\,ms}$!
+\end{intuitionbox}
+
+% ==========================================
+\section{The Evolution of HTTP: From HTTP/1.1 to HTTP/3 QUIC}
+
+The Hypertext Transfer Protocol (HTTP) has undergone three major transport rewrites to keep up with modern web workloads.
+
+\subsection{HTTP/1.1: Plaintext Requests and Application Head-of-Line Blocking}
+
+Standardized in RFC 2616 (and updated in RFC 9112), HTTP/1.1 sends human-readable ASCII headers and introduced 	exttt{Connection: keep-alive}, allowing a client to reuse one TCP connection for multiple sequential requests instead of paying 2\,RTTs per image or API call.
+
+\subsubsection{Why HTTP/1.1 Pipelining Failed}
+Suppose a browser needs three files over one TCP connection: 	exttt{/profile} (takes $300\text{\,ms}$ on the DB), 	exttt{/styles.css} ($2\text{\,ms}$), and 	exttt{/logo.png} ($2\text{\,ms}$). HTTP/1.1 \emph{pipelining} allowed sending all three requests back-to-back without waiting, \textbf{but required the server to send responses in the exact order requests arrived}. Because 	exttt{/profile} takes $300\text{\,ms}$, 	exttt{/styles.css} and 	exttt{/logo.png} sit stuck behind it even though they are ready. This is \textbf{Application-Layer Head-of-Line (HoL) Blocking}.
+
+Because buggy proxies also scrambled pipelined responses, browsers disabled pipelining and instead opened \textbf{6 parallel TCP connections per hostname}---burning extra handshakes, TLS negotiations, and server socket memory.
+
+\subsection{HTTP/2: Binary Framing, Streams, and HPACK Compression}
+
+Standardized in RFC 7540 \cite{rfc7540}, HTTP/2 keeps the same HTTP verbs and status codes, but inserts a \textbf{binary framing layer} between the application and the single persistent TCP socket.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.88, transform shape,
+  node distance=0.7cm and 1.2cm,
+  layer/.style={rectangle, draw=headingblue, fill=codebg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily},
+  accent/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily\bfseries},
+  line/.style={draw=headingblue, -{Stealth[length=2.5mm]}, thick}
+]
+  \node[layer, minimum width=10.5cm] (app) {Application Layer (HTTP Methods, Headers, Status Codes)};
+  \node[accent, below=of app, minimum width=10.5cm] (frame) {HTTP/2 Binary Framing Layer\\(Multiplexed Streams: 9-Byte Frame Headers + Interleaved Payloads)};
+  \node[layer, below=of frame, minimum width=10.5cm] (tcp) {Transport Layer: Single Persistent TLS + TCP Connection};
+
+  \draw[line] (app) -- (frame);
+  \draw[line] (frame) -- (tcp);
+\end{tikzpicture}
+\caption{HTTP/2 binary framing layer enabling stream multiplexing over a single TCP connection.}
+\label{fig:v1-ch01-http2-framing}
+\end{figure}
+
+\subsubsection{Streams and Multiplexing}
+HTTP/2 slices every request and response into small binary frames stamped with a 31-bit \textbf{Stream ID}:
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{Stream:} An independent, bidirectional exchange inside the single TCP connection. Client-initiated streams use odd IDs ($1, 3, 5, \dots$); server-initiated streams use even IDs ($2, 4, \dots$).
+  \item \textbf{9-Byte Frame Header + Payload:} Every frame begins with a fixed 9-byte header (24-bit length, 8-bit type, 8-bit flags, 1 reserved bit, 31-bit Stream ID). Common types are 	exttt{HEADERS} (starts a stream), 	exttt{DATA} (body chunks), 	exttt{SETTINGS}, 	exttt{RST\_STREAM} (cancels one stream without tearing down the TCP connection), and 	exttt{WINDOW\_UPDATE} (flow control).
+\end{itemize}
+
+Frames from Stream 1 (	exttt{/profile}) and Stream 3 (	exttt{/styles.css}) interleave freely on the wire, so 	exttt{/styles.css} finishes in $2\text{\,ms}$ without waiting for the $300\text{\,ms}$ database query on Stream 1. Application-layer HoL blocking is eliminated.
+
+\subsubsection{HPACK Header Compression (RFC 7541)}
+In HTTP/1.1, verbose headers (	exttt{User-Agent}, 	exttt{Cookie}, 	exttt{Authorization}) are resent as raw ASCII text on every request. HTTP/2's \textbf{HPACK} shrinks headers via three mechanisms:
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Static Table:} 61 pre-numbered common headers (e.g., index 2 = 	exttt{:method: GET}, index 7 = 	exttt{:scheme: https}), sent as compact integer indices.
+  \item \textbf{Dynamic Table:} A per-connection sliding dictionary. A long 	exttt{Authorization: Bearer ...} header is sent once, indexed, and referenced by a single integer on subsequent streams.
+  \item \textbf{Huffman Coding:} A static Huffman table compresses remaining literal strings.
+\end{enumerate}
+
+\subsubsection{The Hidden Trap: TCP-Level Head-of-Line Blocking}
+Although HTTP/2 multiplexes dozens of logical streams, the operating system kernel underneath still sees \textbf{one single TCP byte stream}. If one IP packet carrying part of Stream 1 is lost in transit, the kernel stalls delivery of \emph{all} subsequent bytes---including Stream 3 and Stream 5---until TCP retransmits the missing segment. Under $2\%$ packet loss on mobile or congested networks, all HTTP/2 streams freeze simultaneously!
+
+\subsection{HTTP/3: QUIC over UDP and Connection Migration}
+
+Standardized in RFC 9114 \cite{rfc9114}, HTTP/3 abandons TCP and runs over \textbf{QUIC (RFC 9000)} \cite{rfc9000}, an encrypted, stream-multiplexed transport built in user space on top of \textbf{UDP}.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.88, transform shape,
+  node distance=0.8cm and 1.2cm,
+  proto/.style={rectangle, draw=headingblue, fill=codebg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily},
+  accent/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily\bfseries}
+]
+  % Stack HTTP/2
+  \node[proto, minimum width=5.2cm] (h2) {\textbf{HTTP/2 (HPACK)}};
+  \node[proto, below=0.3cm of h2, minimum width=5.2cm] (tls12) {TLS 1.2 / 1.3};
+  \node[proto, below=0.3cm of tls12, minimum width=5.2cm] (tcp) {TCP (Kernel Ordered Stream)};
+
+  % Stack HTTP/3
+  \node[accent, right=1.8cm of h2, minimum width=5.6cm] (h3) {\textbf{HTTP/3 (QPACK)}};
+  \node[accent, below=0.3cm of h3, minimum width=5.6cm] (quic) {QUIC (Independent Streams + TLS 1.3)};
+  \node[accent, below=0.3cm of quic, minimum width=5.6cm] (udp) {UDP (Unordered Datagrams)};
+
+  \node[above=0.2cm of h2, font=\small\sffamily\bfseries] {HTTP/2 Protocol Stack};
+  \node[above=0.2cm of h3, font=\small\sffamily\bfseries] {HTTP/3 Protocol Stack};
+\end{tikzpicture}
+\caption{Protocol stack comparison: HTTP/2 over TCP+TLS vs.\ HTTP/3 over QUIC+UDP.}
+\label{fig:v1-ch01-http3-stack}
+\end{figure}
+
+\subsubsection{Three Structural Wins of HTTP/3 QUIC}
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Independent Stream Delivery:} QUIC tracks sequence numbers and retransmissions \emph{per stream}. If a UDP datagram carrying Stream 4 drops, Streams 1, 2, and 3 keep delivering bytes to the application with zero stall.
+  \item \textbf{Fused 1-RTT Handshake (and 0-RTT Resumption):} QUIC embeds TLS 1.3 directly inside its transport handshake. Client and server exchange cryptographic parameters and transport settings in a single \textbf{1-RTT} exchange (or \textbf{0-RTT} when resuming a known session using a pre-shared ticket, sending an idempotent request in the very first packet).
+  \item \textbf{Connection Migration via Variable-Length Connection IDs:} TCP identifies a connection by its 4-tuple 	exttt{(src\_ip, src\_port, dst\_ip, dst\_port)}. When your phone walks out of Wi-Fi onto 5G, its source IP changes and every TCP socket dies. Per RFC 9000, QUIC instead identifies connections using a variable-length \textbf{Connection ID (CID) of 0 to 20 bytes (0 to 160 bits)}, chosen by the endpoints (for example, 8 bytes on typical servers, or 0 bytes when a client uses a single path and wants zero overhead). When your phone switches IPs, it keeps the same Destination CID and the connection survives seamlessly.
+\end{enumerate}
+
+\begin{realworldbox}[Diagnosing HTTP/2 TCP HoL Stalls on Mobile \& VPN Traffic]
+\textbf{Symptom:} After migrating an API gateway from HTTP/1.1 to HTTP/2, p50 latency improves from 45\,ms to 28\,ms, yet p99 latency spikes to 4,800\,ms during morning commute hours while API server CPU remains under 20\%.
+
+\textbf{Diagnostic Steps:}
+\begin{enumerate}[leftmargin=15pt,itemsep=2pt]
+  \item Inspect active socket metrics on the gateway host with 	exttt{ss -ti dst <client\_subnet>} and observe high 	exttt{retrans:3/42} and elevated 	exttt{rttvar} on long-lived HTTP/2 connections.
+  \item Check Envoy/Nginx access logs: multiple unrelated endpoints (	exttt{/health}, 	exttt{/quotes}, 	exttt{/orders}) sharing the same 	exttt{connection\_id} finish at the exact same millisecond right after a 1.5\,s gap---the classic signature of kernel TCP retransmission blocking all multiplexed streams.
+  \item Enable HTTP/3 (	exttt{Alt-Svc: h3=":443"; ma=86400}) on the edge load balancer so mobile clients with packet loss use independent QUIC streams, or cap HTTP/2 connection lifetime/pooling for internal lossy WAN hops.
+\end{enumerate}
+\end{realworldbox}
+
+% ==========================================
+\section{REST Constraints, Maturity, and Method Semantics}
+
+Defined in Roy Fielding's 2000 doctoral dissertation, \textbf{Representational State Transfer (REST)} is an architectural style---not a wire protocol---governed by six constraints:
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Client-Server Separation:} UI concerns stay decoupled from storage and domain logic.
+  \item \textbf{Statelessness:} Every request carries all context needed to execute it (tokens, parameters); the server stores no per-client conversational state between requests.
+  \item \textbf{Cacheability:} Responses declare whether intermediaries may cache them (	exttt{Cache-Control}, 	exttt{ETag}).
+  \item \textbf{Uniform Interface:} Resources have stable URIs (	exttt{/orders/123}), are manipulated via standard representations (JSON), use self-descriptive status codes and MIME types, and embed links to valid next actions (\textbf{HATEOAS}).
+  \item \textbf{Layered System:} A client cannot tell whether it talks directly to the origin server or through a CDN, WAF, or reverse proxy.
+  \item \textbf{Code on Demand (Optional):} Servers may ship executable client code (such as JavaScript).
+\end{enumerate}
+
+\subsection{The Richardson Maturity Model}
+
+\begin{table}[htbp]
+\centering
+\small\sffamily
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Level} & \textbf{Core Characteristic} & \textbf{Concrete HTTP Example} \\ \midrule
+\textbf{Level 0} & The Swamp of POX & 	exttt{POST /api} with body 	exttt{\{"action": "getOrder", "id": 123\}} \\
+\textbf{Level 1} & Resources & 	exttt{POST /orders/123} (distinct URI, single verb) \\
+\textbf{Level 2} & HTTP Verbs \& Codes & 	exttt{GET /orders/123} $\rightarrow$ 	exttt{200 OK}; 	exttt{POST /orders} $\rightarrow$ 	exttt{201 Created} \\
+\textbf{Level 3} & HATEOAS & Response includes 	exttt{"\_links": \{"cancel": "/orders/123/cancel"\}} \\ \bottomrule
+\end{tabular}
+\caption{The Richardson Maturity Model for HTTP APIs.}
+\label{tab:v1-ch01-richardson}
+\end{table}
+
+\subsection{Safe vs.\ Idempotent Methods}
+
+Network timeouts are ambiguous: did your request fail before reaching the server, or did the server succeed and the response got lost? HTTP method semantics determine whether a client or proxy may safely retry:
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{Safe Methods (	exttt{GET}, 	exttt{HEAD}, 	exttt{OPTIONS}):} Read-only; calling them 1 time or 1,000 times leaves server state untouched.
+  \item \textbf{Idempotent Methods (	exttt{PUT}, 	exttt{DELETE}, 	exttt{GET}):} Executing the call $N$ times yields the same server state as executing it once ($f(f(x)) = f(x)$). Replacing a record via 	exttt{PUT /users/42} with 	exttt{\{"name": "Alice"\}} is safe to retry on network timeout.
+  \item \textbf{Non-Idempotent Methods (	exttt{POST}, 	exttt{PATCH}):} Retrying 	exttt{POST /charges} after a timeout can charge a customer twice unless the server enforces an explicit \textbf{idempotency key} (covered in Chapter~\ref{chap:auth-security}).
+\end{itemize}
+
+% ==========================================
+\section{WebSockets (RFC 6455): Full-Duplex Streaming}
+
+When a client and server both push frequent updates (live chat, collaborative editors, multiplayer state), opening repeated HTTP requests wastes headers and round trips. \textbf{WebSockets (RFC 6455)} turns a standard HTTP/1.1 connection into a persistent, full-duplex binary frame pipe.
+
+\subsection{The 101 Switching Protocols Upgrade}
+
+A WebSocket connection starts as a plain HTTP/1.1 	exttt{GET} request containing 	exttt{Upgrade} headers and a random Base64 nonce:
+
+\begin{lstlisting}[language=sh,caption={Client WebSocket Upgrade Request}]
+GET /stream HTTP/1.1
+Host: api.example.com
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+Sec-WebSocket-Version: 13
+\end{lstlisting}
+
+To prove the server genuinely supports RFC 6455 (and isn't just echoing headers), it concatenates the client key with the RFC's fixed GUID, takes the SHA-1 digest, and Base64-encodes it:
+$$\text{Sec-WebSocket-Accept} = \text{Base64}\Big(\text{SHA-1}\big(\text{Sec-WebSocket-Key} \;\Vert\; 	exttt{"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"}\big)\Big)$$
+For 	exttt{dGhlIHNhbXBsZSBub25jZQ==}, the server returns HTTP 	exttt{101 Switching Protocols} with 	exttt{Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=}. Once sent, both sides detach their HTTP parsers and speak binary WebSocket frames over that same TCP socket.
+
+\subsection{WebSocket Frame Structure and Client Masking}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.86, transform shape,
+  node distance=0.08cm,
+  fld/.style={rectangle, draw=headingblue, fill=codebg, thick, minimum height=0.95cm, align=center, font=\scriptsize\ttfamily}
+]
+  \node[fld, minimum width=1.0cm] (fin) {FIN\\(1b)};
+  \node[fld, minimum width=1.1cm, right=of fin] (rsv) {RSV1-3\\(3b)};
+  \node[fld, minimum width=1.5cm, right=of rsv] (op) {Opcode\\(4b)};
+  \node[fld, minimum width=1.1cm, right=of op] (mask) {MASK\\(1b)};
+  \node[fld, minimum width=2.1cm, right=of mask] (len) {Payload Len\\(7b: 0..127)};
+  \node[fld, minimum width=3.5cm, right=of len, fill=intuitionBg] (ext) {Extended Payload Len\\(0, 16b if 126, 64b if 127)};
+  \node[fld, minimum width=3.2cm, below=0.25cm of fin, xshift=1.4cm] (mkey) {Masking Key\\(0 or 4 bytes)};
+  \node[fld, minimum width=7.2cm, right=of mkey] (payload) {Extension Data + Application Payload Data};
+
+  \node[draw=intuitionTeal, dashed, fit=(fin) (rsv) (op) (mask) (len) (ext) (mkey) (payload), inner sep=5pt] {};
+\end{tikzpicture}
+\caption{WebSocket binary frame layout (RFC 6455) including extended 16/64-bit length fields.}
+\label{fig:v1-ch01-websocket-frame}
+\end{figure}
+
+Notice how the 7-bit 	exttt{Payload Len} field encodes arbitrary sizes compactly:
+\begin{itemize}[leftmargin=15pt]
+  \item $0 \dots 125$: The payload length in bytes is literally that 7-bit integer (no extended field).
+  \item $126$: The next \textbf{16 bits (2 bytes, big-endian)} hold the actual unsigned payload length (up to 65,535 bytes).
+  \item $127$: The next \textbf{64 bits (8 bytes, big-endian)} hold the actual payload length.
+\end{itemize}
+
+\subsubsection{Why Clients Must XOR-Mask Every Frame}
+RFC 6455 requires every client-to-server frame to set 	exttt{MASK=1} and include a random 4-byte 	exttt{Masking Key} $K$. If a server receives an unmasked client frame, it must close the connection immediately.
+
+\begin{underthehoodbox}[The Proxy Cache Poisoning Attack That Forced Masking]
+Early WebSocket prototypes did not mask client payloads. Researchers demonstrated that malicious JavaScript on a web page could open a WebSocket to an attacker server and send bytes that looked like a valid HTTP request (	exttt{GET /evil.js HTTP/1.1...}). Broken transparent corporate proxies misunderstood the TCP stream after 	exttt{Upgrade}, parsed the WebSocket payload as a second HTTP request, and cached the attacker's fake response for every employee behind the proxy.
+
+XORing every payload byte $i$ with $K[i \bmod 4]$ turns predictable ASCII HTTP headers into random-looking bytes on the wire, making proxy misinterpretation impossible. The server recovers the plaintext byte-by-byte:
+$$P_{\text{unmasked}}[i] = P_{\text{masked}}[i] \oplus K[i \bmod 4]$$
+\end{underthehoodbox}
+
+For example, if the server receives masked payload bytes 	exttt{0x72 0x41 0x5c 0x2e 0x55} with 4-byte key $K = [	exttt{0x3a}, 	exttt{0x24}, 	exttt{0x30}, 	exttt{0x42}]$:
+\begin{itemize}[leftmargin=15pt]
+  \item $i=0$: $	exttt{0x72} \oplus 	exttt{0x3a} = 	exttt{0x48}$ (	exttt{'H'})
+  \item $i=1$: $	exttt{0x41} \oplus 	exttt{0x24} = 	exttt{0x65}$ (	exttt{'e'})
+  \item $i=2$: $	exttt{0x5c} \oplus 	exttt{0x30} = 	exttt{0x6c}$ (	exttt{'l'})
+  \item $i=3$: $	exttt{0x2e} \oplus 	exttt{0x42} = 	exttt{0x6c}$ (	exttt{'l'})
+  \item $i=4$: $	exttt{0x55} \oplus K[4 \bmod 4] = 	exttt{0x55} \oplus 	exttt{0x3a} = 	exttt{0x6f}$ (	exttt{'o'})
+\end{itemize}
+The decoded payload is 	exttt{"Hello"}.
+
+% ==========================================
+\section{Server-Sent Events (SSE): Unidirectional Streaming}
+
+When data flows only from server to client---such as AI token streaming, live order-status updates, or stock tickers---WebSockets add handshake complexity and custom reconnection logic you do not need. \textbf{Server-Sent Events (SSE)} streams UTF-8 records over a standard HTTP response with 	exttt{Content-Type: text/event-stream}.
+
+\begin{lstlisting}[language=sh,caption={SSE Wire Format Stream}]
+HTTP/1.1 200 OK
+Content-Type: text/event-stream
+Cache-Control: no-cache
+
+retry: 3000
+event: quote
+id: 10452
+data: {"symbol": "AAPL", "price": 182.45}
+
+event: quote
+id: 10453
+data: {"symbol": "GOOGL", "price": 141.20}
+
+\end{lstlisting}
+
+Each record ends with a blank line (	exttt{\textbackslash n\textbackslash n}). The browser's built-in 	exttt{EventSource} API automatically reconnects after 	exttt{retry} milliseconds if the socket drops and sends the HTTP header 	exttt{Last-Event-ID: 10453} so the backend can replay missed events from a stream or cache.
+
+\begin{intuitionbox}[SSE vs.\ WebSockets: Picking the Right Tool]
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{Choose SSE} for server-to-client feeds (LLM token streaming, notifications, tickers). SSE rides directly over HTTP/2 and HTTP/3 multiplexed streams, survives corporate proxies cleanly, and reconnects automatically with 	exttt{Last-Event-ID}.
+  \item \textbf{Choose WebSockets} only when both client and server send high-frequency messages continuously (multiplayer games, collaborative canvases, bidirectional audio/telemetry).
+\end{itemize}
+\end{intuitionbox}
+
+% ==========================================
+\section{gRPC and Protocol Buffers: Binary Wire Formats}
+
+Inside a data center, microservices often exchange tens of thousands of internal calls per second. Sending JSON over HTTP/1.1 forces every server to repeatedly transmit long text field names (	exttt{"customer\_id":}) and burn CPU cycles parsing ASCII digits and floating-point text. \textbf{gRPC} combines \textbf{Protocol Buffers (Protobuf v3)} binary serialization with HTTP/2 multiplexing.
+
+\subsection{Bits, Two's Complement, Arithmetic Shifts, Varints, and ZigZag}
+
+To read Protobuf bytes without guessing, you need four tiny bit-level building blocks:
+
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Binary and Shifts:} Each byte has 8 bits (MSB = bit 7, LSB = bit 0). Shifting left by $k$ ($x \ll k$) multiplies by $2^k$; shifting right ($x \gg k$) divides by $2^k$.
+  \item \textbf{Two's Complement Negative Numbers:} CPUs store signed integers in \textbf{two's complement}: to negate a 32-bit integer $n$, invert every bit and add $1$. Thus $-1$ in 32-bit signed binary is 	exttt{0xFFFFFFFF} (all thirty-two bits are 	exttt{1}!) and $-2$ is 	exttt{0xFFFFFFFE}.
+  \item \textbf{Varint (Variable-Length Integer) Encoding:} Rather than always spending 4 or 8 bytes per integer, Protobuf splits an unsigned integer into \textbf{7-bit chunks, least-significant chunk first}. Bit 7 (the MSB) of each output byte is a \textbf{continuation flag}: 	exttt{1} means ``another byte follows'', 	exttt{0} means ``this is the final byte''.
+  \item \textbf{ZigZag Encoding for Signed Integers (	exttt{sint32} / 	exttt{sint64}):} Because $-1$ in two's complement has all bits set to 	exttt{1}, encoding $-1$ directly as a plain Varint would waste 10 bytes! \textbf{ZigZag} maps signed integers to unsigned integers in alternating order ($0 \to 0$, $-1 \to 1$, $1 \to 2$, $-2 \to 3$, $2 \to 4$) using an \textbf{arithmetic right shift} (where the sign bit is copied into vacated left bits, so $-1 \gg 31 = 	exttt{0xFFFFFFFF}$ while $+1 \gg 31 = 	exttt{0x00000000}$):
+  $$\text{ZigZag32}(n) = (n \ll 1) \oplus (n \gg 31)$$
+\end{enumerate}
+
+Let's verify ZigZag32 step-by-step on $n = -2$:
+\begin{itemize}[leftmargin=15pt]
+  \item $n = -2$ in 32-bit two's complement is 	exttt{0xFFFFFFFE}.
+  \item $n \ll 1$ shifts left by 1 bit: 	exttt{0xFFFFFFFC}.
+  \item Arithmetic shift $n \gg 31$ replicates the sign bit 	exttt{1} across all 32 bits: 	exttt{0xFFFFFFFF}.
+  \item XOR them: $	exttt{0xFFFFFFFC} \oplus 	exttt{0xFFFFFFFF} = 	exttt{0x00000003} = 3$.
+  \item Now Varint-encode $3$: fits in 7 bits with continuation bit 	exttt{0}, so $-2$ takes \textbf{1 single byte} (	exttt{0x03}) on the wire!
+\end{itemize}
+
+\subsection{Tracing a Concrete Message from 	exttt{order.proto}}
+
+Consider this gRPC service contract defining messages and two RPC methods:
+
+\begin{lstlisting}[language=C,caption={Protobuf IDL Definition (	exttt{order.proto})}]
+syntax = "proto3";
+package commerce;
+
+service OrderService {
+    rpc CreateOrder (OrderRequest) returns (OrderResponse);        // Unary RPC
+    rpc StreamOrderUpdates (OrderQuery) returns (stream OrderEvent); // Server streaming
+}
+
+message OrderRequest {
+    int64 customer_id = 1;
+    string sku = 2;
+    int32 quantity = 3;
+    sint32 discount_delta = 4;
+}
+
+message OrderResponse {
+    string order_id = 1;
+    bool success = 2;
+}
+
+message OrderQuery { string order_id = 1; }
+message OrderEvent { string order_id = 1; string status = 2; int64 timestamp = 3; }
+\end{lstlisting}
+
+\textbf{Line-by-line walkthrough of 	exttt{order.proto}:} Lines 1--2 declare Protobuf v3 syntax and namespace 	exttt{commerce}. Lines 4--7 define two RPC endpoints: 	exttt{CreateOrder} takes one 	exttt{OrderRequest} and returns one 	exttt{OrderResponse} (unary), while 	exttt{StreamOrderUpdates} takes one 	exttt{OrderQuery} and returns a continuous HTTP/2 stream of 	exttt{OrderEvent} frames. Lines 9--14 assign permanent numeric field tags ($1, 2, 3, 4$) to 	exttt{OrderRequest}---the wire payload transmits those tag numbers, never the text names.
+
+Each field on the wire starts with a Varint tag key combining the field number and its \textbf{wire type} (Table~\ref{tab:v1-ch01-protobuf-wire}):
+$$\text{Key} = (\text{field\_number} \ll 3) \mid \text{wire\_type}$$
+
+\begin{table}[htbp]
+\centering
+\small\sffamily
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Wire Type} & \textbf{Meaning} & \textbf{Used For} \\ \midrule
+0 & Varint & 	exttt{int32}, 	exttt{int64}, 	exttt{uint32}, 	exttt{bool}, 	exttt{enum}, 	exttt{sint32}, 	exttt{sint64} \\
+1 & 64-bit fixed & 	exttt{fixed64}, 	exttt{sfixed64}, 	exttt{double} \\
+2 & Length-delimited & 	exttt{string}, 	exttt{bytes}, submessages, packed repeated fields \\
+5 & 32-bit fixed & 	exttt{fixed32}, 	exttt{sfixed32}, 	exttt{float} \\ \bottomrule
+\end{tabular}
+\caption{Protocol Buffer wire types.}
+\label{tab:v1-ch01-protobuf-wire}
+\end{table}
+
+Now trace serializing the concrete message:
+$$	exttt{OrderRequest\{customer\_id: 300, sku: "A1", quantity: 1, discount\_delta: -1\}}$$
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Field 1 (	exttt{customer\_id = 300}, wire type 0):}
+  \begin{itemize}
+    \item Tag key: $(1 \ll 3) \mid 0 = 8 = 	exttt{0x08}$.
+    \item Value $300$ in binary is $100101100_2$ (9 bits). Split into 7-bit chunks from least-significant end: lower 7 bits = $0101100_2$ (44), upper bits = $0000010_2$ (2). Add MSB continuation bit 	exttt{1} to the first chunk ($10101100_2 = 	exttt{0xAC}$) and 	exttt{0} to the last chunk ($00000010_2 = 	exttt{0x02}$). Bytes: 	exttt{08 AC 02}.
+  \end{itemize}
+  \item \textbf{Field 2 (	exttt{sku = "A1"}, wire type 2):}
+  \begin{itemize}
+    \item Tag key: $(2 \ll 3) \mid 2 = 16 + 2 = 18 = 	exttt{0x12}$.
+    \item Length Varint: $2$ bytes = 	exttt{0x02}. UTF-8 bytes of 	exttt{"A1"} = 	exttt{0x41 0x31}. Bytes: 	exttt{12 02 41 31}.
+  \end{itemize}
+  \item \textbf{Field 3 (	exttt{quantity = 1}, wire type 0):}
+  \begin{itemize}
+    \item Tag key: $(3 \ll 3) \mid 0 = 24 = 	exttt{0x18}$. Value $1 = 	exttt{0x01}$. Bytes: 	exttt{18 01}.
+  \end{itemize}
+  \item \textbf{Field 4 (	exttt{discount\_delta = -1}, wire type 0):}
+  \begin{itemize}
+    \item Tag key: $(4 \ll 3) \mid 0 = 32 = 	exttt{0x20}$.
+    \item ZigZag32($-1$) $= ((-1 \ll 1) \oplus (-1 \gg 31)) = 1 = 	exttt{0x01}$. Bytes: 	exttt{20 01}.
+  \end{itemize}
+\end{enumerate}
+Total serialized payload: 	exttt{08 AC 02 12 02 41 31 18 01 20 01}---just \textbf{11 bytes}, compared to 75+ bytes of JSON!
+
+\subsection{gRPC over HTTP/2 Framing}
+
+gRPC wraps that 11-byte payload inside an HTTP/2 	exttt{POST /commerce.OrderService/CreateOrder} stream with 	exttt{content-type: application/grpc} and 	exttt{te: trailers}. Inside the 	exttt{DATA} frame, every Protobuf message is prefixed with 5 bytes: 1 compression flag byte (	exttt{0x00} uncompressed) + 4 big-endian payload length bytes (	exttt{0x00 00 00 0B} = 11). At the end of the response, the server sends an HTTP/2 	exttt{HEADERS} trailer frame containing 	exttt{grpc-status: 0} (OK).
+
+\begin{tryityourselfbox}[Encode a Protobuf Message by Hand]
+Using 	exttt{OrderRequest} from 	exttt{order.proto}, manually encode 	exttt{OrderRequest\{customer\_id: 150, sku: "BK", quantity: 2, discount\_delta: -3\}} into hexadecimal wire bytes. Check your answer against the worked solution at the end of the chapter.
+\end{tryityourselfbox}
+
+% ==========================================
+\section{Chapter Summary \protect\& Key Takeaways}
+
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{Transport Foundations:} Cold HTTPS over TCP + TLS 1.3 spends 2\,RTTs on handshakes before application data moves. TCP guarantees strict byte order, which causes kernel-level stalling on packet loss.
+  \item \textbf{HTTP/1.1 $\rightarrow$ HTTP/2 $\rightarrow$ HTTP/3:} HTTP/2 fixes application HoL blocking via multiplexed binary streams and HPACK headers, but shares one TCP stream. HTTP/3 runs QUIC over UDP with independent streams, 1-RTT/0-RTT handshakes, and variable 0--20 byte Connection IDs for seamless IP migration.
+  \item \textbf{REST \& Idempotency:} 	exttt{GET} is safe and idempotent; 	exttt{PUT}/	exttt{DELETE} are idempotent; 	exttt{POST}/	exttt{PATCH} require explicit application idempotency keys before retrying.
+  \item \textbf{WebSockets vs.\ SSE:} WebSockets upgrade HTTP/1.1 via 	exttt{101 Switching Protocols} with mandatory 4-byte XOR client masking and 7/16/64-bit payload lengths. SSE provides lightweight unidirectional streaming with built-in 	exttt{Last-Event-ID} recovery.
+  \item \textbf{gRPC \& Protobuf:} Field tags, Varints (7 bits + MSB continuation), and ZigZag encoding pack typed RPC messages into minimal binary frames over HTTP/2.
+\end{itemize}
+
+% ==========================================
+\section{Exercises and Real-World Scenarios}
+
+\subsection{Mechanics Exercises}
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Exercise~\thechapter.1:} Encode the integer $16{,}385$ into a Protocol Buffer Varint byte sequence. Show binary decomposition, 7-bit chunks, continuation bits, and final hex bytes.
+  \item \textbf{Exercise~\thechapter.2:} Explain the exact sequence of HTTP/2 frames exchanged when a client cancels an in-flight download without closing the underlying TCP connection.
+\end{enumerate}
+
+\subsection{Debugging Exercise}
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Exercise~\thechapter.3:} A mobile telemetry app upgrades to HTTP/2 behind a carrier NAT. Whenever cellular packet loss reaches 1.5\%, p99 API latency jumps from 12\,ms to 5,400\,ms even though backend CPU is under 20\%. Explain the exact mechanism causing all concurrent requests to stall together and provide both immediate and long-term fixes.
+\end{enumerate}
+
+\subsection{Architecture Design Problem}
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Exercise~\thechapter.4:} Design a live market ticker feed serving 500,000 concurrent browser clients. Justify the transport protocol (WebSocket vs.\ SSE vs.\ HTTP/2 polling), horizontal gateway tier, reconnection/replay strategy, and backpressure mechanism when slow mobile clients fall behind.
+\end{enumerate}
+
+% ==========================================
+\section{Detailed Solutions}
+
+\subsection{Solution to Try It Yourself: Hand-Encoding 	exttt{OrderRequest}}
+\begin{enumerate}[leftmargin=15pt]
+  \item 	exttt{customer\_id = 150} (tag 1, wire type 0 $\rightarrow$ key 	exttt{0x08}): $150 = 10010110_2$. Lower 7 bits = $0010110_2$ (22); upper bits = $0000001_2$ (1). With continuation bits: 	exttt{10010110} (	exttt{0x96}), 	exttt{00000001} (	exttt{0x01}). Bytes: 	exttt{08 96 01}.
+  \item 	exttt{sku = "BK"} (tag 2, wire type 2 $\rightarrow$ key 	exttt{0x12}): length 	exttt{0x02}, ASCII 	exttt{'B'}=	exttt{0x42}, 	exttt{'K'}=	exttt{0x4B}. Bytes: 	exttt{12 02 42 4B}.
+  \item 	exttt{quantity = 2} (tag 3, wire type 0 $\rightarrow$ key 	exttt{0x18}): value 	exttt{0x02}. Bytes: 	exttt{18 02}.
+  \item 	exttt{discount\_delta = -3} (tag 4, wire type 0 $\rightarrow$ key 	exttt{0x20}): $\text{ZigZag32}(-3) = ((-3 \ll 1) \oplus (-3 \gg 31)) = 	exttt{0xFFFFFFFA} \oplus 	exttt{0xFFFFFFFF} = 5 = 	exttt{0x05}$. Bytes: 	exttt{20 05}.
+  \item Complete payload: 	exttt{08 96 01 12 02 42 4B 18 02 20 05}.
+\end{enumerate}
+
+\subsection{Solution~\thechapter.1: Protobuf Varint Encoding of 16,385}
+\begin{enumerate}[leftmargin=15pt]
+  \item $16{,}385 = 16{,}384 + 1 = 2^{14} + 1 = 100000000000001_2$ (15 bits).
+  \item Split into 7-bit chunks (least-significant first):
+  \begin{itemize}
+    \item Chunk 1 (bits 0..6): $0000001_2$ (1)
+    \item Chunk 2 (bits 7..13): $0000000_2$ (0)
+    \item Chunk 3 (bit 14): $0000001_2$ (1)
+  \end{itemize}
+  \item Add continuation bits (MSB = 1 on chunks 1 and 2; MSB = 0 on chunk 3):
+  \begin{itemize}
+    \item Byte 1: $10000001_2 = 	exttt{0x81}$
+    \item Byte 2: $10000000_2 = 	exttt{0x80}$
+    \item Byte 3: $00000001_2 = 	exttt{0x01}$
+  \end{itemize}
+  \item Final Varint bytes: 	exttt{0x81 0x80 0x01}.
+\end{enumerate}
+
+\subsection{Solution~\thechapter.2: HTTP/2 Stream Cancellation}
+The client sends a 	exttt{RST\_STREAM} frame (type 	exttt{0x03}) bearing the aborted stream's odd Stream ID and error code 	exttt{CANCEL (0x08)}. The server halts work on that stream, discards its per-stream buffers, and continues sending frames for all other active streams across the shared TCP connection uninterrupted.
+
+\subsection{Solution~\thechapter.3: TCP Head-of-Line Blocking Behind Lossy Links}
+\textbf{Root Cause:} HTTP/2 multiplexes all active requests over a single TCP socket. When 1.5\% of packets drop on the cellular link, the kernel detects a sequence gap and buffers every subsequent packet in its receive queue until retransmission completes. Every logical stream freezes simultaneously regardless of idle server CPU.
+
+\textbf{Fixes:}
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Long-term:} Enable HTTP/3 (QUIC over UDP) at the edge proxy so streams recover independently without stalling siblings and survive IP handoffs via Connection IDs.
+  \item \textbf{Immediate mitigation:} For server-to-server links over lossy WANs, use a small pool of 4--6 HTTP/2 connections rather than a single socket so packet loss on one TCP stream affects only a fraction of RPCs.
+\end{enumerate}
+
+\subsection{Solution~\thechapter.4: 500,000-Client Market Ticker Architecture}
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Transport Protocol:} Choose \textbf{SSE over HTTP/2 or HTTP/3}. Quotes flow strictly server $\rightarrow$ client, so WebSocket client-to-server framing and XOR masking add dead weight, whereas SSE gives built-in 	exttt{Last-Event-ID} recovery and shares HTTP/3's independent stream transport.
+  \item \textbf{Gateway Tier \& Fan-Out:} Terminate TLS/HTTP at stateless edge gateway instances (for example, 20 Envoy/Go edge nodes handling 25,000 open SSE streams each). Each gateway subscribes once to a Redis Pub/Sub or Kafka topic per symbol group rather than fanning out 500,000 database queries.
+  \item \textbf{Reconnection \& Replay:} Every emitted quote carries a monotonic sequence ID (	exttt{id: 984210}). A 60-second ring buffer in Redis Streams lets reconnecting clients sending 	exttt{Last-Event-ID} catch up immediately, falling back to a fresh snapshot if older than 60\,s.
+  \item \textbf{Slow-Client Backpressure:} Never let a slow cellular client block the shared broadcast loop. Allocate a small bounded per-connection send queue (e.g., 32 latest-price slots) at the gateway: if the client's socket write buffer is full (	exttt{EAGAIN}), overwrite stale intermediate ticks for the same symbol (conflation) and disconnect clients whose queue stays stalled past a hard threshold (e.g., 15\,s) so they reconnect cleanly to a fresh snapshot.
+\end{enumerate}
+
+\begin{labbridgebox}[Explore HTTP Framing \& APIs in Code]
+\begin{itemize}[leftmargin=15pt,itemsep=2pt]
+  \item 	exttt{projects/p02-php-webhook-receiver/src/WebhookReceiver.php}: Inspect raw HTTP body reading and header parsing.
+  \item 	exttt{projects/p03-python-fastapi-api/app/middleware.py}: Inspect HTTP response headers (	exttt{X-Request-ID}, 	exttt{X-Response-Time-Ms}) injected across requests.
+\end{itemize}
+\end{labbridgebox}
+
+\section*{Further Reading}
+Standard specifications and deep references: RFC 7540 (HTTP/2) \cite{rfc7540}, RFC 9000 (QUIC) \cite{rfc9000}, RFC 9114 (HTTP/3) \cite{rfc9114}, and Kleppmann's \textit{Designing Data-Intensive Applications} \cite{kleppmann2017designing}.

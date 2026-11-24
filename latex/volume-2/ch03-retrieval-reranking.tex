@@ -1,0 +1,414 @@
+\chapter{Retrieval Algorithms and Reranking: Sparse, Dense, and Hybrid Fusion}
+\label{chap:retrieval}
+
+\begin{chaptergoalsbox}
+\textbf{What You Will Learn:}
+\begin{itemize}[leftmargin=15pt]
+  \item Why pure dense vector search struggles with error codes, SKUs, and IP CIDRs.
+  \item Building Okapi BM25 step-by-step: from raw word counts to TF-IDF, saturation ($k_1$), and document length normalization ($b$).
+  \item Hybrid search fusion: why raw scores cannot be added directly and how Reciprocal Rank Fusion (RRF) merges ranked lists.
+  \item Transformer encoder mechanics from scratch (\texttt{[CLS]}, \texttt{[SEP]}, $Q/K/V$ self-attention) and why Bi-Encoders ($O(\log N \cdot D)$ via HNSW) differ from Cross-Encoders.
+  \item Two-stage retrieval cascades, Hypothetical Document Embeddings (HyDE), and Mean Reciprocal Rank (\texttt{MRR@K}).
+\end{itemize}
+
+\textbf{What You Should Already Understand:}
+\begin{itemize}[leftmargin=15pt]
+  \item Vectors, cosine similarity, and HNSW graph search (Chapter~1).
+  \item Chunking and subword tokenization (Chapter~2).
+\end{itemize}
+
+\textbf{Why This Topic Exists:}
+Dense vectors shine at paraphrases (\emph{``cardiac arrest''} $\leftrightarrow$ \emph{``heart attack''}), yet routinely fail when an engineer searches for an exact identifier such as \texttt{0x80070005}, \texttt{SKU-9921-X}, or \texttt{RFC 7540}. Production search combines exact lexical matching, semantic embeddings, and deep neural rerankers into a latency-budgeted cascade.
+
+\textbf{Motivating Practical Problem:}
+An internal SRE search portal indexes 250,000 incident post-mortems. During an outage, an on-call engineer searches \emph{``AWS ALB-502-BadGateway on subnet 10.240.12.0/24''}. Pure dense vector search returns generic documentation about HTTP 502 proxies and misses the exact post-mortem documenting the broken target-group health check on \texttt{10.240.12.0/24}, adding 45 minutes to Mean Time to Recovery (MTTR).
+\end{chaptergoalsbox}
+
+\section{Why Pure Dense Vectors Miss Exact Identifiers}
+
+Dense embeddings compress a 300-word chunk into a single point in $\mathbb{R}^{1536}$. That compression deliberately discards exact surface spelling to capture general meaning, causing three failure modes:
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Tokenizer Fragmentation}: Rare codes like \texttt{0x80070005} get sliced by BPE into generic fragments (\texttt{['0', 'x', '80', '07', '00', '05']}) whose vector looks like any other hex string.
+  \item \textbf{Near-Neighbor Collision}: In semantic space, \texttt{Product Model X-200} and \texttt{Product Model X-300} sit at cosine similarity $0.98$, even though their replacement parts are completely incompatible.
+  \item \textbf{Query-Document Asymmetry}: Queries are short fragments (3--7 words) while documents are long prose (300--1,000 tokens).
+\end{enumerate}
+
+To restore exact-match precision, production engines run \textbf{lexical (keyword) search} alongside dense search.
+
+\section{Building Okapi BM25 from First Principles}
+
+Instead of jumping straight to a intimidating formula, build the scoring function of \textbf{Okapi BM25} (Robertson \& Zaragoza, 2009) in four logical steps on a tiny 3-document corpus for the query \texttt{"alb 502"}:
+\begin{itemize}[leftmargin=18pt]
+  \item $d_1$ (9 tokens): \texttt{"alb 502 error on subnet 10 240 12 0"}
+  \item $d_2$ (8 tokens): \texttt{"http 502 gateway proxy overview and timeout guide"}
+  \item $d_3$ (9 tokens): \texttt{"alb alb alb alb health check failed on subnet"}
+\end{itemize}
+
+\subsection*{Step 1: Raw Word Counts (Fails on Spam and Common Words)}
+If we just count matching words, $d_1$ matches \texttt{alb} (1) + \texttt{502} (1) $= 2$, while $d_3$ matches \texttt{alb} (4) + \texttt{502} (0) $= 4$! Repeating one keyword four times lets $d_3$ outscore $d_1$, even though $d_3$ never mentions \texttt{502}.
+
+\subsection*{Step 2: Inverse Document Frequency (TF-IDF)}
+Common words appearing in almost every document (like \texttt{"the"} or \texttt{"error"}) carry less signal than rare words. \textbf{Inverse Document Frequency (IDF)} downweights ubiquitous words using the total document count $N$ and the number of documents $n(q)$ containing term $q$:
+\begin{equation}
+\text{IDF}(q) = \ln \left( \frac{N - n(q) + 0.5}{n(q) + 0.5} + 1 \right)
+\end{equation}
+In our 3-document corpus ($N = 3$), both \texttt{alb} and \texttt{502} appear in $n = 2$ documents, giving $\text{IDF} = \ln((3 - 2 + 0.5)/(2 + 0.5) + 1) = \ln(1.6) \approx 0.4700$. A stopword appearing in all 3 documents drops to $\ln(0.5/3.5 + 1) \approx 0.1335$, while a rare error code appearing in only 1 out of 1,000 documents jumps to $\approx 6.91$.
+
+\subsection*{Step 3: Term Frequency Saturation ($k_1$)}
+Mentioning \texttt{alb} twice tells us a little more than mentioning it once, but mentioning it 50 times is spam—not $50\times$ more relevant. BM25 caps the term-frequency bonus using a curve controlled by $k_1$ (typically $1.2 \le k_1 \le 2.0$):
+\[
+\text{TF\_sat}(f) = \frac{f \cdot (k_1 + 1)}{f + k_1}
+\]
+When $f = 1$, $\text{TF\_sat}(1) = 1.0$. As $f \to \infty$, $\text{TF\_sat}(f)$ flattens out at $k_1 + 1$ (Figure~\ref{fig:v2-ch03-bm25}). With $k_1 = 1.5$, seeing \texttt{alb} 4 times instead of 1 time lifts the term weight from $1.0$ to $\frac{4 \times 2.5}{4 + 1.5} = 1.818$ (not $4.0$!), neutralizing keyword stuffing.
+
+\subsection*{Step 4: Document Length Normalization ($b$)}
+A 2,000-word manual naturally accumulates more accidental word matches than a 40-word runbook. BM25 compares each document's length $|D|$ against the corpus average $\text{avgdl}$ using parameter $b \in [0, 1]$ (default $b = 0.75$):
+\begin{equation}
+\text{Score}_{\text{BM25}}(D, Q) = \sum_{i=1}^n \text{IDF}(q_i) \cdot \frac{f(q_i, D) \cdot (k_1 + 1)}{f(q_i, D) + k_1 \cdot \left(1 - b + b \cdot \frac{|D|}{\text{avgdl}}\right)}
+\end{equation}
+On our 3-document example ($\text{avgdl} = 8.667$, $k_1 = 1.5$, $b = 0.75$), $d_1$ scores $\mathbf{0.9240}$, $d_3$ scores $0.8479$, and $d_2$ scores $0.4869$—ranking $d_1$ first as desired!
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\draw[->, thick, color=headingblue] (0,0) -- (9,0) node[right, font=\sffamily\footnotesize] {Raw Term Frequency $f(q_i, D)$};
+\draw[->, thick, color=headingblue] (0,0) -- (0,4) node[above, font=\sffamily\footnotesize] {TF Component Weight};
+
+\draw[very thick, color=linkblue, domain=0:8.5, samples=100]
+  plot (\x, {(\x * 2.2) / (\x + 1.2)})
+  node[right, font=\tiny\sffamily, color=linkblue] {$k_1 = 1.2$ (Asymptote $2.2$)};
+
+\draw[thick, color=warningRed, domain=0:8.5, samples=100]
+  plot (\x, {(\x * 3.0) / (\x + 2.0)})
+  node[right, font=\tiny\sffamily, color=warningRed] {$k_1 = 2.0$ (Asymptote $3.0$)};
+
+\draw[dashed, color=gray!60, domain=0:7.5]
+  plot (\x, {0.45 * \x})
+  node[right, font=\tiny\sffamily, color=gray!80] {Linear TF-IDF (Unbounded)};
+
+\end{tikzpicture}
+\caption{BM25 Term Frequency Saturation: Unlike linear TF-IDF, BM25 approaches a horizontal ceiling $k_1 + 1$, preventing repeated-keyword spam from dominating results.}
+\label{fig:v2-ch03-bm25}
+\end{figure}
+
+Listing~\ref{lst:v2-ch03-bm25} implements BM25 cleanly with both a low-level \texttt{.score()} method and a \texttt{.search()} method returning ranked document IDs.
+
+\begin{lstlisting}[language=Python, label={lst:v2-ch03-bm25}, caption={Okapi BM25 Sparse Search Engine from First Principles}]
+import math
+import re
+from collections import Counter
+
+class ProductionBM25:
+    def __init__(self, docs: dict[str, str], k1: float = 1.5, b: float = 0.75):
+        self.k1 = k1
+        self.b = b
+        self.doc_ids = list(docs.keys())
+        self.corpus_size = len(self.doc_ids)
+        tokenized = [re.findall(r"\b\w+\b", docs[did].lower()) for did in self.doc_ids]
+        self.doc_lens = [len(toks) for toks in tokenized]
+        self.avgdl = sum(self.doc_lens) / max(1, self.corpus_size)
+
+        self.df: Counter[str] = Counter()
+        self.doc_freqs: list[Counter[str]] = []
+        for toks in tokenized:
+            counts = Counter(toks)
+            self.doc_freqs.append(counts)
+            for term in counts:
+                self.df[term] += 1
+
+        self.idf: dict[str, float] = {
+            term: math.log((self.corpus_size - freq + 0.5) / (freq + 0.5) + 1.0)
+            for term, freq in self.df.items()
+        }
+
+    def score(self, query_tokens: list[str]) -> list[float]:
+        scores = [0.0] * self.corpus_size
+        for term in query_tokens:
+            if term not in self.idf:
+                continue
+            term_idf = self.idf[term]
+            for idx, counts in enumerate(self.doc_freqs):
+                tf = counts.get(term, 0)
+                if tf == 0:
+                    continue
+                norm = 1.0 - self.b + self.b * (self.doc_lens[idx] / self.avgdl)
+                scores[idx] += term_idf * (tf * (self.k1 + 1.0)) / (tf + self.k1 * norm)
+        return scores
+
+    def search(self, query: str, k: int = 100) -> list[str]:
+        q_tokens = re.findall(r"\b\w+\b", query.lower())
+        raw_scores = self.score(q_tokens)
+        ranked = sorted(
+            zip(self.doc_ids, raw_scores), key=lambda item: item[1], reverse=True
+        )
+        return [doc_id for doc_id, s in ranked[:k] if s > 0.0]
+\end{lstlisting}
+
+\section{Hybrid Fusion: Reciprocal Rank Fusion (RRF)}
+
+Suppose BM25 returns unbounded positive scores like $14.2$ and $8.7$, while dense vector search returns cosine similarities in $[0.65, 0.89]$. Adding them directly ($\alpha S_{\text{dense}} + (1-\alpha) S_{\text{bm25}}$) is fragile because BM25 scores shift wildly depending on query length and IDF.
+
+\textbf{Reciprocal Rank Fusion (RRF)} (Cormack, Clarke, \& Büttcher, 2009) throws away raw scores and fuses purely by \textbf{1-based ordinal rank} $r_m(d)$ across each retriever $m \in M$:
+\begin{equation}
+\text{RRF}(d) = \sum_{m \in M} \frac{1}{k + r_m(d)}
+\end{equation}
+where $k \approx 60$ is a smoothing constant. If a document does not appear in retriever $m$'s list, it contributes $0$ for that list.
+
+\begin{intuitionbox}[Why $k = 60$ Rewards Consensus]
+With $k = 0$, rank 1 gets $1/1 = 1.0$ and rank 2 gets $1/2 = 0.5$—an aggressive 50\% drop after a single position. With $k = 60$, rank 1 gets $1/61 \approx 0.01639$ and rank 2 gets $1/62 \approx 0.01613$. Consequently, a document ranked 5th in \emph{both} BM25 and dense search ($\frac{2}{65} \approx 0.03077$) cleanly outscores a document ranked 1st in dense search only ($\frac{1}{61} \approx 0.01639$).
+\end{intuitionbox}
+
+\begin{lstlisting}[language=Python, label={lst:v2-ch03-rrf}, caption={Reciprocal Rank Fusion (RRF) Implementation}]
+def reciprocal_rank_fusion(
+    ranked_lists: list[list[str]],
+    k: int = 60
+) -> list[tuple[str, float]]:
+    """Fuses multiple ranked doc_id lists into a consensus ordering."""
+    rrf_scores: dict[str, float] = {}
+
+    for ranked_list in ranked_lists:
+        for rank, doc_id in enumerate(ranked_list, start=1):
+            rrf_scores[doc_id] = rrf_scores.get(doc_id, 0.0) + 1.0 / (k + rank)
+
+    return sorted(rrf_scores.items(), key=lambda item: item[1], reverse=True)
+\end{lstlisting}
+
+\textbf{Step-by-Step Trace:} Given \texttt{bm25\_hits = ["d1", "d2", "d3"]} and \texttt{dense\_hits = ["d3", "d1", "d4"]} with $k=60$:
+\begin{itemize}[leftmargin=18pt]
+  \item \texttt{"d1"}: rank 1 in BM25 + rank 2 in Dense $= \frac{1}{61} + \frac{1}{62} \approx 0.01639 + 0.01613 = 0.03252$.
+  \item \texttt{"d3"}: rank 3 in BM25 + rank 1 in Dense $= \frac{1}{63} + \frac{1}{61} \approx 0.01587 + 0.01639 = 0.03226$.
+  \item \texttt{"d2"}: rank 2 in BM25 only $= \frac{1}{62} \approx 0.01613$; \texttt{"d4"}: rank 3 in Dense only $= \frac{1}{63} \approx 0.01587$.
+\end{itemize}
+Consensus winners \texttt{d1} and \texttt{d3} rise cleanly to the top!
+
+\section{From Transformer Encoders to Bi-Encoders and Cross-Encoders}
+
+\subsection{How a Transformer Encoder Reads Text (1-Page Bridge)}
+Before comparing Bi-Encoders and Cross-Encoders, build a concrete mental model of an encoder Transformer (such as BERT or BGE):
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Special Tokens \texttt{[CLS]} and \texttt{[SEP]}}: Input text is tokenized and wrapped with special markers. \texttt{[CLS]} (classification token) sits at index 0 as a global summary slot, while \texttt{[SEP]} marks boundaries between sentences or between a query and a document: \texttt{[CLS] query tokens [SEP] doc tokens [SEP]}.
+  \item \textbf{Self-Attention with $Q, K, V$}: Inside each Transformer layer, every token creates three small vectors: a \textbf{Query ($Q$)} asking \emph{``what context am I looking for?''}, a \textbf{Key ($K$)} advertising \emph{``what do I contain?''}, and a \textbf{Value ($V$)} holding \emph{``what information do I pass along?''}. The layer scores how strongly every token $i$ should attend to every token $j$ via scaled dot products:
+  \begin{equation}
+  \text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right) V
+  \end{equation}
+  In simple terms, each word blends in context from related words around it (e.g., resolving \emph{``not''} next to \emph{``healthy''}, or linking \emph{``subnet''} to \texttt{10.240.12.0/24}).
+\end{enumerate}
+
+\subsection{Bi-Encoder vs Cross-Encoder Architectures}
+This leads directly to two search architectures (Figure~\ref{fig:v2-ch03-bi-cross}):
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  model/.style={draw=headingblue, fill=codebg, rounded corners=2pt, minimum width=3.8cm, minimum height=1.3cm, font=\sffamily\scriptsize, align=center},
+  input/.style={draw=gray!60, fill=white, rounded corners=1pt, minimum width=3.4cm, minimum height=0.6cm, font=\sffamily\tiny, align=center},
+  arrow/.style={-{Stealth[scale=0.8]}, thick, color=headingblue}
+]
+
+% Bi-Encoder
+\node[font=\sffamily\bfseries\footnotesize, color=linkblue] at (2.0, 3.6) {A. Bi-Encoder (Independent)};
+\node[input] (qin) at (0.2, 0) {\texttt{[CLS]} Query \texttt{[SEP]}};
+\node[input] (din) at (3.8, 0) {\texttt{[CLS]} Document \texttt{[SEP]}};
+\node[model] (encq) at (0.2, 1.4) {Encoder\\$\vec{u} = \text{Pool}(\text{Enc}(q))$};
+\node[model] (encd) at (3.8, 1.4) {Encoder\\$\vec{v} = \text{Pool}(\text{Enc}(d))$};
+\node[draw=linkblue, fill=exampleBg, rounded corners=2pt, font=\sffamily\scriptsize\bfseries] (dot) at (2.0, 2.7) {Dot Product: $\vec{u} \cdot \vec{v}$};
+
+\draw[arrow] (qin) -- (encq);
+\draw[arrow] (din) -- (encd);
+\draw[arrow] (encq.north) -- (dot.west);
+\draw[arrow] (encd.north) -- (dot.east);
+
+% Cross-Encoder
+\node[font=\sffamily\bfseries\footnotesize, color=warningRed] at (8.7, 3.6) {B. Cross-Encoder (Joint Attention)};
+\node[input, minimum width=5.6cm] (crossin) at (8.7, 0) {\texttt{[CLS]} Query \texttt{[SEP]} Candidate Document \texttt{[SEP]}};
+\node[model, minimum width=5.6cm, minimum height=1.5cm] (crossenc) at (8.7, 1.45) {
+  Joint Transformer Encoder\\
+  Every query token $q_i$ attends to every doc token $d_j$
+};
+\node[draw=warningRed, fill=warningBg, rounded corners=2pt, font=\sffamily\scriptsize\bfseries] (score) at (8.7, 2.75) {
+  \texttt{[CLS]} Linear Head $\to$ Score $\in [0, 1]$
+};
+
+\draw[arrow] (crossin) -- (crossenc);
+\draw[arrow] (crossenc) -- (score);
+
+\end{tikzpicture}
+\caption{Bi-Encoder vs Cross-Encoder: Bi-encoders pre-compute document vectors offline; cross-encoders run full token-level cross-attention jointly over each query-document pair.}
+\label{fig:v2-ch03-bi-cross}
+\end{figure}
+
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Bi-Encoder}: Encodes query and document \emph{separately}. Because document vectors $\vec{v}$ are computed once at ingestion time, query latency is a single query forward pass plus vector lookup: 	extbf{$O(N \cdot D)$} for a flat scan or 	extbf{$O(\log N \cdot D)$} with an HNSW index (fast, $<5$ ms in RAM—not $O(1)$, since HNSW still scales logarithmically with $N$ and linearly with $D$). However, query tokens never directly inspect document tokens during encoding.
+  \item \textbf{Cross-Encoder}: Concatenates \texttt{[CLS] query [SEP] document [SEP]} into one sequence. Every query token attends to every document token across $L$ layers ($O((|Q|+|D|)^2 \cdot L)$ per pair). It catches negations, exact clauses, and subtle modifiers that Bi-Encoders compress away—at the cost of 10--50 ms of GPU inference per batch of pairs.
+\end{itemize}
+
+\section{The Two-Stage Retrieval Cascade, HyDE, and MRR@K}
+
+Because a Cross-Encoder cannot score 10 million documents in real time, production search uses a \textbf{two-stage cascade} (Figure~\ref{fig:v2-ch03-cascade}): Stage 1 uses fast Hybrid RRF (BM25 + Dense HNSW) to narrow 10M docs down to $\sim 50\text{--}100$ candidates in $<5$ ms; Stage 2 uses a Cross-Encoder to re-score only those top candidates in $\sim 25$ ms and keep the top 5 for the LLM.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  cascadestep/.style={draw=headingblue, fill=codebg, rounded corners=2pt, font=\sffamily\scriptsize, minimum height=0.9cm, align=center},
+  arrow/.style={-{Stealth[scale=0.8]}, thick, color=headingblue}
+]
+
+\node[cascadestep, minimum width=2.8cm] (corpus) at (0, 0) {Corpus: 10M Docs};
+\node[cascadestep, minimum width=3.6cm, fill=intuitionBg] (cands) at (4.1, 0) {Stage 1: Hybrid RRF\\(BM25 + HNSW) $\to$ Top 100};
+\node[cascadestep, minimum width=3.5cm, fill=warningBg] (rerank) at (8.5, 0) {Stage 2: Cross-Encoder\\(BGE-Reranker) $\to$ Top 5};
+\node[cascadestep, minimum width=2.2cm, fill=exampleBg] (llm) at (12.1, 0) {LLM Context};
+
+\draw[arrow] (corpus) -- (cands) node[midway, above, font=\tiny\sffamily] {$<5$ ms};
+\draw[arrow] (cands) -- (rerank) node[midway, above, font=\tiny\sffamily] {$\approx 25$ ms};
+\draw[arrow] (rerank) -- (llm);
+
+\end{tikzpicture}
+\caption{Two-Stage Hybrid Retrieval Cascade: Fast recall in Stage 1 followed by high-precision cross-attention reranking in Stage 2.}
+\label{fig:v2-ch03-cascade}
+\end{figure}
+
+Listing~\ref{lst:v2-ch03-cascade} shows the complete two-stage retriever. Notice that \texttt{retrieve} returns structured dictionaries matching its type annotation \texttt{list[dict[str, object]]}.
+
+\begin{lstlisting}[language=Python, label={lst:v2-ch03-cascade}, caption={Two-Stage Hybrid Retrieval Cascade with Cross-Encoder Reranking}]
+from sentence_transformers import CrossEncoder
+
+class TwoStageRetriever:
+    def __init__(
+        self,
+        bm25_index: ProductionBM25,
+        vector_index,
+        doc_store: dict[str, str],
+        reranker_model: str = "BAAI/bge-reranker-large",
+    ):
+        self.bm25 = bm25_index
+        self.vector_index = vector_index
+        self.doc_store = doc_store
+        self.reranker = CrossEncoder(reranker_model)
+
+    def retrieve(self, query: str, top_k: int = 5) -> list[dict[str, object]]:
+        # Stage 1: Fast candidate generation (100 lexical + 100 dense)
+        sparse_hits = self.bm25.search(query, k=100)
+        dense_hits = self.vector_index.search(query, k=100)
+
+        fused = reciprocal_rank_fusion([sparse_hits, dense_hits], k=60)[:100]
+        candidate_ids = [doc_id for doc_id, _ in fused]
+        candidate_texts = [self.doc_store[did] for did in candidate_ids]
+        if not candidate_texts:
+            return []
+
+        # Stage 2: Joint cross-encoder scoring
+        pairs = [[query, text] for text in candidate_texts]
+        scores = self.reranker.predict(pairs)
+
+        ranked = sorted(
+            zip(candidate_ids, candidate_texts, scores),
+            key=lambda item: float(item[2]),
+            reverse=True,
+        )
+        return [
+            {"doc_id": did, "text": txt, "score": float(sc)}
+            for did, txt, sc in ranked[:top_k]
+        ]
+\end{lstlisting}
+
+\textbf{Step-by-Step Code Walkthrough:} On \texttt{query = "ALB-502 subnet 10.240.12.0/24"}:
+\begin{enumerate}[leftmargin=18pt]
+  \item Lines 18--19 fetch up to 100 exact-keyword \texttt{doc\_id}s via \texttt{self.bm25.search()} and 100 semantic \texttt{doc\_id}s via \texttt{self.vector\_index.search()}.
+  \item Lines 21--23 merge both lists with \texttt{reciprocal\_rank\_fusion}, take the top 100 unique IDs, and fetch their text strings from \texttt{self.doc\_store}.
+  \item Lines 28--29 pass all 100 \texttt{[query, text]} pairs in one GPU batch to \texttt{CrossEncoder.predict()}.
+  \item Lines 31--39 sort descending by cross-encoder relevance logit and return the top 5 structured hit dictionaries.
+\end{enumerate}
+
+\subsection{Hypothetical Document Embeddings (HyDE)}
+When user queries look nothing like formal manuals (e.g., \emph{``why do my ankles feel puffy when standing?''} vs clinical notes mentioning \emph{``bilateral peripheral edema''}), \textbf{HyDE} (Gao et al., 2022) prompts an LLM to draft a short hypothetical answer $\hat{D}$, embeds $\hat{D}$ instead of the raw question, and searches the vector index. Even if $\hat{D}$ guesses wrong specifics, its vocabulary and phrasing sit inside the target technical manifold.
+
+\subsection{Measuring Rank Quality: Mean Reciprocal Rank (\texttt{MRR@K})}
+To test whether hybrid fusion and reranking actually improve rank order, search engineers measure \textbf{Mean Reciprocal Rank at $K$ (\texttt{MRR@K})}. For each query $q \in \{1, \dots, Q\}$, find the rank $r_q \le K$ of the \emph{first} relevant document (if none appears in the top $K$, its reciprocal rank is $0$):
+\begin{equation}
+\text{MRR@K} = \frac{1}{|Q|} \sum_{q=1}^{|Q|} \frac{1}{r_q}
+\end{equation}
+For example, across 2 queries—if Query 1 finds its answer at rank 1 ($1/1 = 1.0$) and Query 2 finds its answer at rank 3 ($1/3 \approx 0.333$)—then $\text{MRR@10} = (1.0 + 0.333)/2 \approx 0.667$.
+
+\begin{realworldbox}[Debugging SRE Post-Mortem Search Misses]
+An internal incident-search service returned generic proxy docs for \emph{``ALB-502-BadGateway 10.240.12.0/24''}. Retrieval telemetry showed:
+\begin{lstlisting}[basicstyle=\ttfamily\scriptsize]
+dense_only_top3: ["http-502-guide"(0.84), "nginx-timeout"(0.81), "alb-intro"(0.79)]
+bm25_top3:       ["inc-4412-subnet"(18.4), "vpc-cidr-map"(11.2), "http-502-guide"(6.1)]
+hybrid_rrf_rerank_top1: "inc-4412-subnet" (cross_score=0.974)
+\end{lstlisting}
+Dense search fragmented \texttt{ALB-502-BadGateway} and \texttt{10.240.12.0/24} into subwords, ranking the real incident (\texttt{inc-4412-subnet}) at rank 47. Adding BM25 + RRF promoted \texttt{inc-4412-subnet} into the top 10, and the cross-encoder placed it at rank 1, raising team \texttt{MRR@10} from $0.41$ to $0.86$.
+\end{realworldbox}
+
+\begin{tryityourselfbox}[Computing Hybrid RRF + MRR@10 by Hand]
+Suppose two test queries are run against a search index:
+\begin{itemize}
+  \item \textbf{Query 1} (answer is \texttt{doc\_X}): Dense ranks \texttt{[doc\_A, doc\_X, doc\_B]}; BM25 ranks \texttt{[doc\_X, doc\_C, doc\_A]}.
+  \item \textbf{Query 2} (answer is \texttt{doc\_Y}): Dense ranks \texttt{[doc\_D, doc\_E, doc\_Y]}; BM25 misses \texttt{doc\_Y} entirely: \texttt{[doc\_D, doc\_F, doc\_G]}.
+\end{itemize}
+Compute the RRF ($k=60$) ranking for both queries, then calculate \texttt{MRR@10} for Dense alone vs Hybrid RRF. (Worked solution in Section~3.8.)
+\end{tryityourselfbox}
+
+\section{Chapter Summary \protect\& Key Takeaways}
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Dense Limits}: Subword tokenization and latent compression erase exact error codes, SKUs, and CIDRs.
+  \item \textbf{Okapi BM25}: Combines IDF rarity weighting, term-frequency saturation ($k_1$, asymptote $k_1+1$), and length normalization ($b$).
+  \item \textbf{Reciprocal Rank Fusion}: Merges uncalibrated sparse and dense rankings via $\sum 1/(k + r_m(d))$ with $k \approx 60$.
+  \item \textbf{Bi-Encoder vs Cross-Encoder}: Bi-encoders scale as $O(\log N \cdot D)$ via HNSW because document vectors are precomputed; cross-encoders run full token-to-token cross-attention ($O((|Q|+|D|)^2 L)$) on top candidates.
+  \item \textbf{Two-Stage Cascade \& HyDE}: Generate $\sim 50\text{--}100$ candidates via Hybrid RRF, rerank with a Cross-Encoder, and evaluate rank quality with \texttt{MRR@K}.
+\end{itemize}
+
+\section{Exercises}
+
+\subsection*{Mechanics}
+\textbf{Exercise \thechapter.1}: Document $d_1$ ranks 2nd in BM25 and 14th in Dense search. Document $d_2$ ranks 6th in both systems. Compute the RRF scores of $d_1$ and $d_2$ with $k = 60$ and determine which ranks higher.
+
+\textbf{Exercise \thechapter.2}: In the BM25 equation, prove what happens to document length $|D|$ when $b = 0$.
+
+\subsection*{Debugging}
+\textbf{Exercise \thechapter.3}: After adding a Cross-Encoder reranker, chatbot $p99$ latency jumps from 800 ms to 6.2 s. Profiling shows the reranker evaluates 500 candidate chunks of 512 tokens on every request. Propose two concrete changes to bring $p99$ under 1.2 s.
+
+\subsection*{Architecture}
+\textbf{Exercise \thechapter.4}: Design a multi-lingual e-commerce search engine spanning English, Japanese, and Arabic catalogs that supports cross-language queries while preserving exact SKU lookup accuracy.
+
+\section{Detailed Solutions}
+
+\subsection*{Solution \thechapter.1}
+Using $\text{RRF}(d) = \frac{1}{60 + r_{\text{bm25}}} + \frac{1}{60 + r_{\text{dense}}}$:
+\[
+\text{RRF}(d_1) = \frac{1}{62} + \frac{1}{74} \approx 0.016129 + 0.013514 = 0.029643
+\]
+\[
+\text{RRF}(d_2) = \frac{1}{66} + \frac{1}{66} = \frac{2}{66} \approx 0.030303
+\]
+Since $0.030303 > 0.029643$, $d_2$ outranks $d_1$ because RRF rewards balanced consensus across both retrievers.
+
+\subsection*{Solution \thechapter.2}
+In the denominator $f(q_i, D) + k_1 \cdot \left(1 - b + b \cdot \frac{|D|}{\text{avgdl}}\right)$, setting $b = 0$ gives:
+\[
+f(q_i, D) + k_1 \cdot (1 - 0 + 0) = f(q_i, D) + k_1
+\]
+The document length $|D|$ vanishes completely; length normalization is disabled.
+
+\subsection*{Solution \thechapter.3}
+1. \textbf{Shrink the Stage-1 candidate pool}: Passing 40--60 RRF candidates instead of 500 cuts cross-encoder compute by $\sim 90\%$ while retaining $>95\%$ of relevant hits. 2. \textbf{Distilled/Quantized Reranker}: Switch from a large 560M-parameter model to a distilled FP16/INT8 ONNX or TensorRT model (e.g., \texttt{bge-reranker-base} or \texttt{FlashRank}), cutting per-batch latency by 3--4$\times$.
+
+\subsection*{Solution \thechapter.4}
+1. \textbf{Language-specific BM25 analyzers}: Apply morphological tokenizers (e.g., Kuromoji for Japanese) alongside whitespace/Arabic normalizers in OpenSearch/Elasticsearch. 2. \textbf{Multilingual Bi-Encoder}: Use a shared-space multilingual embedding model (\texttt{multilingual-e5-large} or \texttt{text-embedding-3}). 3. \textbf{Exact SKU Regex Fast-Path}: Detect SKU patterns (e.g., \verb|^[A-Z]{2,5}-\d{3,}|) and route directly to an exact B-tree index lookup before hybrid fusion.
+
+\subsection*{Solution (Try It Yourself)}
+\textbf{Query 1}: \texttt{doc\_X} gets $\frac{1}{62} + \frac{1}{61} = 0.03252$ (rank 1); \texttt{doc\_A} gets $\frac{1}{61} + \frac{1}{63} = 0.03226$ (rank 2). \textbf{Query 2}: \texttt{doc\_D} gets $\frac{2}{61} = 0.03279$ (rank 1); \texttt{doc\_E}, \texttt{doc\_F} tie at $\frac{1}{62} = 0.01613$ (ranks 2--3); \texttt{doc\_Y} and \texttt{doc\_G} tie at $\frac{1}{63} = 0.01587$ (ranks 4--5).
+\begin{itemize}
+  \item \textbf{Dense alone}: Query 1 relevant at rank 2 ($1/2 = 0.50$); Query 2 relevant at rank 3 ($1/3 \approx 0.333$) $\implies \text{MRR@10} = (0.50 + 0.333)/2 = 0.417$.
+  \item \textbf{Hybrid RRF}: Query 1 relevant at rank 1 ($1.0$); Query 2 relevant at rank 4 or 5 ($\approx 0.20$--$0.25$) $\implies \text{MRR@10} \approx (1.0 + 0.22)/2 = 0.61$.
+\end{itemize}
+
+\begin{labbridgebox}[Hands-On Exercises \& Project Bridge]
+Implement BM25 and RRF directly in \texttt{exercises/volume2/ex02\_bm25\_tf\_idf\_search.py} and \texttt{exercises/volume2/ex03\_reciprocal\_rank\_fusion.py}, then run the full two-stage cascade in \texttt{projects/p06-rag-hybrid-rerank/} (\texttt{rag/dense.py}, \texttt{rag/sparse.py}, \texttt{rag/fusion.py}, \texttt{rag/reranker.py}, \texttt{rag/pipeline.py}, tested via \texttt{tests/test\_hybrid\_rag.py}).
+\end{labbridgebox}
+
+\section{Further Reading \protect\& Citations}
+\begin{itemize}[leftmargin=18pt]
+  \item Robertson, S., \& Zaragoza, H. (2009). \emph{The Probabilistic Relevance Framework: BM25 and Beyond}. Foundations and Trends in Information Retrieval, 3(4), 333--389.
+  \item Cormack, G. V., Clarke, C. L., \& Büttcher, S. (2009). \emph{Reciprocal Rank Fusion Outperforms Condorcet and Individual Rank Learning Methods}. ACM SIGIR.
+  \item Gao, L., et al. (2022). \emph{Precise Zero-Shot Dense Retrieval without Relevance Labels (HyDE)}. arXiv:2212.10496.
+\end{itemize}

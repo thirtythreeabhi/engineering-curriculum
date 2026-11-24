@@ -1,0 +1,303 @@
+\chapter{Enterprise Azure OpenAI and Azure AI Search}
+\label{chap:azure-ai}
+
+\begin{chaptergoalsbox}
+\textbf{What You Will Learn:}
+\begin{itemize}[leftmargin=12pt]
+  \item Azure OpenAI capacity governance: Tokens Per Minute (TPM), Requests Per Minute (RPM), and the Token Bucket rate-limiting algorithm.
+  \item Provisioned Throughput Units (PTU) vs.\ Pay-As-You-Go economics, with worked PTU sizing arithmetic.
+  \item Azure AI Content Safety guardrails, severity thresholds, and prompt-injection shields.
+  \item Network-isolated AI deployments via Private Endpoints (Chapter~\ref{chap:azure-fundamentals}), Key Vault CMK, and Managed Identity IMDS (\texttt{169.254.169.254}, Chapter~\ref{chap:infra-security}).
+  \item Azure AI Search pipeline configuration (Data Sources, Skillsets, Indexers), HNSW/BM25/RRF tuning knobs, and L2 Semantic Ranking via \texttt{SearchClient}.
+\end{itemize}
+
+\textbf{What You Should Already Understand:}
+\begin{itemize}[leftmargin=12pt]
+  \item Azure Private Endpoints and split-brain Private DNS (Chapter~\ref{chap:azure-fundamentals}).
+  \item Entra Managed Identities, IMDS, RBAC, and Key Vault CMK (Chapter~\ref{chap:infra-security}).
+  \item Vector embeddings, HNSW skip-graphs, BM25, Reciprocal Rank Fusion (RRF), and cross-encoder reranking (covered mathematically in Volume~II's chapters on \emph{Embeddings and Vector Databases} and \emph{Retrieval Algorithms and Reranking}).
+\end{itemize}
+
+\textbf{Why This Topic Exists:}
+Calling a public LLM endpoint with an API key works for a weekend prototype, but breaks immediately in enterprise production: bursty traffic triggers cascading HTTP 429 errors, raw API keys leak, corporate data cannot traverse the public internet, and pure vector embeddings blur exact product codes or medical identifiers. Integrating Azure OpenAI and Azure AI Search brings together the networking, container, and Zero Trust primitives from Chapters~\ref{chap:azure-fundamentals}--\ref{chap:devsecops}.
+
+\textbf{Motivating Practical Problem:}
+A legal and medical claims assistant indexes 10 million proprietary documents. Under Pay-As-You-Go quotas, peak morning traffic hits HTTP 429 throttling, while pure vector search retrieves documents for billing code \texttt{E10.9} (Type 1 diabetes) when a physician queries \texttt{E11.9} (Type 2 diabetes). Meanwhile, security requires zero API keys and zero public internet egress. How do you size PTU capacity, wire private Managed Identity authentication, and configure hybrid + semantic search in Azure AI Search?
+\end{chaptergoalsbox}
+
+\section{Enterprise Provisioning and Token Bucket Rate Limiting}
+
+Because LLM inference runs on memory-bandwidth-bound GPU clusters, Azure OpenAI governs shared and reserved capacity using two rolling 60-second quotas: 	extbf{Tokens Per Minute (TPM)} (input prompt tokens + generated completion tokens) and 	extbf{Requests Per Minute (RPM)}.
+
+\subsection{The Token Bucket Algorithm}
+Rate limiting at the Azure OpenAI gateway uses a 	extbf{Token Bucket} algorithm (not to be confused with a fixed-outflow Leaky Bucket). Think of a bucket with maximum burst capacity $B_{\max}$ that fills continuously at rate $r = \text{Configured TPM} / 60$ tokens per second:
+\begin{equation}
+B(t) = \min\left( B_{\max},\; B(t-\Delta t) + r \cdot \Delta t \right)
+\end{equation}
+When an incoming API call arrives, the gateway estimates the maximum tokens the request could reserve before inference starts:
+\begin{equation}
+\text{Estimated Cost} = \text{Input Token Count} + \text{Requested \texttt{max\_tokens}}
+\end{equation}
+Notice why setting \texttt{max\_tokens=4096} unnecessarily hurts concurrency: even if the model only ends up generating 120 tokens, the gateway deducts all $4{,}096$ upfront! If $\text{Estimated Cost} > B(t)$, Azure immediately rejects the call with 	extbf{HTTP 429 (Too Many Requests)} and returns a \texttt{Retry-After} header (Figure~\ref{fig:v3-ch08-token-bucket}).
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1.0cm and 1.2cm,
+  bucket/.style={cylinder, draw=headingblue, fill=headingblue!10, shape border rotate=90, minimum height=2.1cm, minimum width=2.4cm, aspect=0.25, font=\sffamily\scriptsize\bfseries, align=center},
+  req/.style={rectangle, draw=exampleBlue, fill=exampleBg, rounded corners=2pt, text width=3.0cm, minimum height=0.95cm, align=center, font=\sffamily\scriptsize},
+  action/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, text width=3.0cm, minimum height=0.95cm, align=center, font=\sffamily\scriptsize},
+  rej/.style={rectangle, draw=warningRed, fill=warningBg, rounded corners=2pt, text width=3.0cm, minimum height=0.95cm, align=center, font=\sffamily\scriptsize},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=headingblue}
+]
+\node[req] (in) {Incoming Request\\Prompt: 1,200 tokens\\\texttt{max\_tokens}: 800\\Est.\ Cost: 2,000};
+\node[bucket, right=1.3cm of in] (buck) {Token Bucket\\Budget $B(t)$\\Refills $r = \frac{\text{TPM}}{60}$};
+\node[action, above right=0.25cm and 1.3cm of buck] (accept) {Deduct 2,000 Tokens\\Dispatch to GPU};
+\node[rej, below right=0.25cm and 1.3cm of buck] (reject) {HTTP 429 Rejected\\\texttt{Retry-After: 4s}};
+
+\draw[arrow] (in) -- node[above, font=\tiny\sffamily]{Check} (buck);
+\draw[arrow] (buck) |- node[above, font=\tiny\sffamily]{Cost $\le B(t)$} (accept);
+\draw[arrow] (buck) |- node[below, font=\tiny\sffamily]{Cost $> B(t)$} (reject);
+\end{tikzpicture}
+\caption{Token Bucket Rate Limiting in Azure OpenAI}
+\label{fig:v3-ch08-token-bucket}
+\end{figure}
+
+\begin{intuitionbox}[Why Input + \texttt{max\_tokens} Both Count]
+If you specify a tiny \texttt{max\_tokens} matching your actual expected answer (e.g., \texttt{300} instead of \texttt{4096}), the Token Bucket reserves fewer tokens per call, allowing far more concurrent requests under the same TPM quota—and after generation finishes, any unused reserved tokens return to your effective budget.
+\end{intuitionbox}
+
+\subsection{Pay-As-You-Go vs.\ Provisioned Throughput Units (PTU)}
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lp{6.0cm}p{6.0cm}}
+\toprule
+\textbf{Dimension} & \textbf{Pay-As-You-Go (Standard)} & \textbf{Provisioned Throughput Units (PTU)} \\
+\midrule
+\textbf{Compute Pool} & Shared multi-tenant GPU clusters. & Reserved GPU compute capacity pinned to your deployment. \\
+\textbf{Latency \& 429s} & Higher P99 variance under regional load; strict TPM caps. & Predictable P99 latency SLA; deterministic continuous throughput. \\
+\textbf{Billing} & Per 1,000 input/output tokens. & Hourly or 1-month/1-year reserved capacity fee. \\
+\bottomrule
+\end{tabular}
+\caption{Pay-As-You-Go vs.\ Provisioned Throughput Units (PTU)}
+\label{tab:v3-ch08-ptu}
+\end{table}
+
+\begin{underthehoodbox}[Worked PTU Sizing Math]
+Generating output tokens is autoregressive (one token per GPU memory-bandwidth pass), making output tokens roughly $3\times$ more expensive in GPU capacity than ingesting input prompt tokens in parallel ($w_{\text{in}} = 1$, $w_{\text{out}} \approx 3$; exact weights vary by model family). Using an illustrative model benchmark of $\text{CapacityPerPTU} = 2{,}500$ weighted tokens/sec:
+\begin{equation}
+\text{PTUs Required} = \left\lceil \frac{Q_{\text{peak}} \times \left( T_{\text{input}} \cdot w_{\text{in}} + T_{\text{output}} \cdot w_{\text{out}} \right)}{\text{CapacityPerPTU}} \right\rceil
+\end{equation}
+Suppose peak load is $Q_{\text{peak}} = 10\text{ req/s}$, with average prompts of $T_{\text{input}} = 1{,}000$ tokens and completions of $T_{\text{output}} = 250$ tokens:
+\begin{equation*}
+\text{Weighted Load} = 10 \times (1{,}000 \cdot 1 + 250 \cdot 3) = 10 \times 1{,}750 = 17{,}500\text{ weighted tokens/s}.
+\end{equation*}
+Dividing by $2{,}500$ gives $\lceil 17{,}500 / 2{,}500 \rceil = \mathbf{7\text{ PTUs}}$.
+\end{underthehoodbox}
+
+\section{Azure AI Content Safety and Prompt Shields}
+
+Azure OpenAI evaluates prompts and completions through 	extbf{Azure AI Content Safety} across four categories—	extbf{Hate}, 	extbf{Sexual}, 	extbf{Violence}, and 	extbf{Self-Harm}—scoring each at discrete severity levels $\{0, 2, 4, 6\}$ (\texttt{safe}, \texttt{low}, \texttt{medium}, \texttt{high}). If any category exceeds the deployment's configured cutoff, generation halts with HTTP 400:
+
+\begin{lstlisting}[language=bash, caption={Azure OpenAI Content Filter HTTP 400 Error Payload}]
+{
+  "error": {
+    "message": "The response was filtered due to Azure OpenAI's content management policy.",
+    "type": "invalid_request_error",
+    "code": "content_filter",
+    "innererror": {
+      "code": "ResponsibleAIPolicyViolation",
+      "content_filter_result": {
+        "hate":      { "filtered": false, "severity": "safe" },
+        "self_harm": { "filtered": false, "severity": "safe" },
+        "sexual":    { "filtered": false, "severity": "safe" },
+        "violence":  { "filtered": true,  "severity": "medium" }
+      }
+    }
+  }
+}
+\end{lstlisting}
+
+Alongside category classifiers, 	extbf{Prompt Shields} score incoming user turns and retrieved RAG documents for adversarial jailbreak or indirect prompt-injection attempts before they reach the LLM context window.
+
+\section{Private Network Isolation and Managed Identity via IMDS}
+
+Connecting Chapters~\ref{chap:azure-fundamentals} and~\ref{chap:infra-security}, production Azure OpenAI and Azure AI Search deployments disable public network access completely, expose Private Endpoints (\texttt{10.2.2.15} and \texttt{10.2.2.16}) inside a private subnet with split-brain Private DNS Zones, encrypt data at rest with Key Vault Customer-Managed Keys (CMK), and authenticate with zero static API keys (Figure~\ref{fig:v3-ch08-private-ai}).
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.85, every node/.style={scale=0.85},
+  node distance=1.0cm and 1.3cm,
+  comp/.style={rectangle, draw=exampleBlue, fill=exampleBg, rounded corners=2pt, text width=3.6cm, minimum height=1.05cm, align=center, font=\sffamily\scriptsize\bfseries},
+  pe/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, text width=3.4cm, minimum height=1.05cm, align=center, font=\sffamily\scriptsize\bfseries},
+  paas/.style={rectangle, draw=gray!70, fill=gray!10, rounded corners=2pt, text width=3.8cm, minimum height=1.05cm, align=center, font=\sffamily\scriptsize\bfseries},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=headingblue}
+]
+\node[comp] (app) {Backend API Pod / VM\\(\texttt{10.2.1.10})};
+\node[pe, right=1.5cm of app] (pe_aoai) {Private Endpoint\\\texttt{pe-openai} (\texttt{10.2.2.15})};
+\node[pe, below=1.0cm of pe_aoai] (pe_search) {Private Endpoint\\\texttt{pe-search} (\texttt{10.2.2.16})};
+\node[paas, right=1.5cm of pe_aoai] (aoai) {Azure OpenAI\\Public Ingress Disabled\\CMK via Key Vault};
+\node[paas, right=1.5cm of pe_search] (search) {Azure AI Search\\Public Ingress Disabled\\Entra RBAC Auth};
+
+\draw[arrow] (app) -- node[above, font=\tiny\sffamily]{TLS + Bearer Token} (pe_aoai);
+\draw[arrow] (app) |- node[below, font=\tiny\sffamily]{Hybrid Queries} (pe_search);
+\draw[arrow, dashed] (pe_aoai) -- node[above, font=\tiny\sffamily]{Private Link} (aoai);
+\draw[arrow, dashed] (pe_search) -- node[above, font=\tiny\sffamily]{Private Link} (search);
+\end{tikzpicture}
+\caption{Zero-Public-Ingress Azure OpenAI and Azure AI Search Topology}
+\label{fig:v3-ch08-private-ai}
+\end{figure}
+
+When running on an Azure VM or via AKS Workload Identity, \texttt{DefaultAzureCredential()} obtains an Entra OAuth token without static secrets: on an Azure VM, it calls the link-local 	extbf{Azure Instance Metadata Service (IMDS)} at 	extbf{\texttt{http://169.254.169.254/metadata/identity/oauth2/token}} with the required header \texttt{Metadata: true} (recall from Chapter~\ref{chap:infra-security} that \texttt{169.254.169.254} is IMDS, whereas \texttt{168.63.129.16} is Azure's WireServer for DNS/health probes). Azure OpenAI then authorizes the Bearer token against Entra RBAC (requiring role \texttt{Cognitive Services OpenAI User}).
+
+\section{Azure AI Search Configuration and Hybrid/Semantic Queries}
+
+Azure AI Search orchestrates four ingestion objects: 	extbf{Data Sources} (Blob/SQL/Cosmos connectors), 	extbf{Skillsets} (OCR, chunking, embedding enrichment), 	extbf{Indexers} (scheduled crawlers), and the sharded 	extbf{Search Index} storing both inverted text terms and vector graphs.
+
+The mathematical foundations of 	extbf{HNSW skip-graphs}, 	extbf{BM25 lexical scoring}, 	extbf{Reciprocal Rank Fusion (RRF)} ($\text{RRF}(d) = \sum_{m} \frac{1}{k + r_m(d)}$ with $k=60$), and 	extbf{Transformer Cross-Encoders} are derived in detail in Volume~II (the \emph{Embeddings and Vector Databases} and \emph{Retrieval Algorithms and Reranking} chapters). Here we focus on 	extbf{Azure AI Search's configuration surface}:
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{HNSW Knobs:} Inside the index's \texttt{vectorSearch} profile, tune \texttt{m} (bi-directional links per node, default 4, range 4--10), \texttt{efConstruction} (index-build candidate queue, default 400), and \texttt{efSearch} (query-time queue, default 500) to trade memory/ingestion time for recall.
+  \item \textbf{Hybrid Mode:} Sending both \texttt{search\_text} (BM25) and \texttt{vector\_queries} (HNSW) in a single \texttt{search()} call tells Azure AI Search to fuse the top candidates with RRF ($k=60$), preventing pure vector embeddings from smoothing away exact alphanumeric identifiers like \texttt{E11.9} or \texttt{CORP-98421-X}.
+  \item \textbf{L2 Semantic Ranker:} Passing \texttt{query\_type=QueryType.SEMANTIC} runs Microsoft's cross-encoder over the top ~50 RRF candidates, returning calibrated relevance scores in $[0.0, 4.0]$ (\texttt{@search.reranker\_score}) and extractive highlights (\texttt{@search.captions}).
+\end{itemize}
+
+\begin{lstlisting}[language=Python, caption={Safe Hybrid + Semantic Query Using Managed Identity in Python}, label={lst:v3-ch08-search-client}]
+from azure.identity import DefaultAzureCredential
+from azure.search.documents import SearchClient
+from azure.search.documents.models import (
+    QueryAnswerType,
+    QueryCaptionType,
+    QueryType,
+    VectorizedQuery,
+)
+
+credential = DefaultAzureCredential()
+search_client = SearchClient(
+    endpoint="https://srch-enterprise-prod.search.windows.net",
+    index_name="legal-contracts-index",
+    credential=credential,
+)
+
+query_text = "indemnification liabilities under Section 14 CORP-98421-X"
+query_vector = [0.0124, -0.0451, 0.0892]  # Truncated illustration (1536-dim in prod)
+
+vector_query = VectorizedQuery(
+    vector=query_vector,
+    k_nearest_neighbors=50,
+    fields="content_vector",
+)
+
+results = search_client.search(
+    search_text=query_text,
+    vector_queries=[vector_query],
+    query_type=QueryType.SEMANTIC,
+    semantic_configuration_name="legal-semantic-config",
+    query_caption=QueryCaptionType.EXTRACTIVE,
+    query_answer=QueryAnswerType.EXTRACTIVE,
+    top=5,
+)
+
+for result in results:
+    reranker_score = result.get("@search.reranker_score")
+    score_str = f"{reranker_score:.4f}" if reranker_score is not None else "N/A"
+    print(f"Reranker Score: {score_str} | Document ID: {result['id']}")
+    for caption in result.get("@search.captions") or []:
+        print(f"  Extractive Caption: {caption.text}")
+\end{lstlisting}
+
+\textbf{Step-by-step walkthrough of Listing~\ref{lst:v3-ch08-search-client}:}
+\begin{enumerate}[leftmargin=15pt]
+  \item Lines 10--15 initialize \texttt{SearchClient} using \texttt{DefaultAzureCredential()}—which automatically reads Workload Identity tokens in AKS or queries IMDS (\texttt{169.254.169.254}) on an Azure VM, authenticating via RBAC (\texttt{Search Index Data Reader}).
+  \item Lines 17--24 pair the raw lexical string \texttt{query\_text} (containing exact contract ID \texttt{CORP-98421-X}) with the pre-computed dense embedding \texttt{VectorizedQuery} requesting top 50 HNSW neighbors from \texttt{content\_vector}.
+  \item Lines 26--34 execute Hybrid L1 (BM25 + HNSW $\to$ RRF) followed by L2 Semantic Ranking using \texttt{legal-semantic-config}, returning the top 5 documents.
+  \item Lines 36--41 iterate results defensively: guarding both \texttt{@search.reranker\_score} against \texttt{None} (line 38) and \texttt{result.get("@search.captions") or []} (line 40) prevents a \texttt{TypeError: 'NoneType' object is not iterable} crash when a matched document has no extracted caption.
+\end{enumerate}
+
+\begin{productionwarningbox}[Pinning Embedding Model Versions]
+Never swap an embedding deployment (e.g., \texttt{text-embedding-ada-002} $\to$ \texttt{text-embedding-3-small}) without re-vectorizing your entire search index. Embeddings from different models live in unrelated vector coordinate spaces, turning cosine similarity into random noise.
+\end{productionwarningbox}
+
+\begin{realworldbox}[Diagnosing Exact-Code Recall Failures (\texttt{E11.9} vs.\ \texttt{E10.9})]
+\textbf{Symptom:} A clinical claims assistant returns Type 1 diabetes (\texttt{E10.9}) policy chunks when asked about Type 2 diabetes code \texttt{ICD-10-CM E11.9}, causing automated claim review errors.
+
+\textbf{Diagnostic Steps:}
+\begin{enumerate}[leftmargin=12pt]
+  \item Query the Azure AI Search index directly via the REST/Python SDK with \texttt{search\_text=None} (pure vector mode) vs.\ \texttt{search\_text="E11.9"} (hybrid mode) and compare \texttt{@search.score} and \texttt{@search.reranker\_score}.
+  \item Pure vector mode scores both \texttt{E11.9} and \texttt{E10.9} near $0.91$ cosine similarity because single-digit code differences barely shift dense embeddings.
+  \item Enabling Hybrid Mode (BM25 + Vector via RRF) plus \texttt{QueryType.SEMANTIC} boosts documents containing the exact inverted-index token \texttt{E11.9} to Rank 1 in BM25 and elevates them via RRF before the cross-encoder checks context, fixing exact-code precision.
+\end{enumerate}
+\end{realworldbox}
+
+\begin{tryityourselfbox}[Hand-Computing Hybrid RRF Scores]
+Two retrieval channels return the following top-3 rankings for documents $\{D_A, D_B, D_C\}$:
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{BM25 Sparse Search:} Rank 1: $D_A$, Rank 2: $D_B$, Rank 3: $D_C$.
+  \item \textbf{HNSW Vector Search:} Rank 1: $D_B$, Rank 2: $D_C$, Rank 3: $D_A$.
+\end{itemize}
+(1) Using $\text{RRF\_Score}(d) = \sum_{m} \frac{1}{k + r_m(d)}$ with $k=60$, calculate the exact RRF score for $D_A$, $D_B$, and $D_C$, and state which document wins.\\
+(2) Now suppose $D_A$ drops completely out of HNSW's top-50 results ($r_{\text{HNSW}}(D_A) \to \infty$). Recompute $\text{Score}(D_A)$ and verify whether $D_A$ can still beat $D_B$ or $D_C$.
+\end{tryityourselfbox}
+
+\begin{labbridgebox}[Connecting Cloud Security and Hybrid RAG Labs]
+Combine the infrastructure and retrieval implementations across two reference projects:
+\begin{itemize}[leftmargin=12pt]
+  \item \texttt{projects/p08-azure-secure-app/} --- shows \texttt{DefaultAzureCredential()} Managed Identity auth (\texttt{src/credentials.py}), Key Vault access (\texttt{src/keyvault.py}), and Private Endpoint network validation (\texttt{src/network.py}).
+  \item \texttt{projects/p06-rag-hybrid-rerank/} (from Volume~II) --- implements BM25 + dense vector hybrid search, RRF fusion, and cross-encoder reranking end-to-end in Python.
+\end{itemize}
+\end{labbridgebox}
+
+\section{Chapter Summary \protect\& Key Takeaways}
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{Rate Limits \& PTU:} Azure OpenAI enforces TPM/RPM via a Token Bucket reserving \texttt{input + max\_tokens}; PTUs reserve dedicated GPU capacity calculated from weighted input/output token rates.
+  \item \textbf{Content Safety \& Isolation:} Category filters ($0,2,4,6$) + Prompt Shields guard inputs/outputs; Private Endpoints, CMK, and IMDS (\texttt{169.254.169.254} with \texttt{Metadata: true}) remove public exposure and static keys.
+  \item \textbf{Azure AI Search:} Combines BM25 inverted indexes with HNSW vectors ($m$, \texttt{efConstruction}, \texttt{efSearch}) via RRF and L2 Semantic Ranking (\texttt{@search.reranker\_score}), guarding optional \texttt{@search.captions} against \texttt{None}.
+\end{itemize}
+
+\section{Exercises}
+
+\subsection{Mechanics}
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Exercise~\thechapter.1:} An Azure OpenAI deployment has a TPM quota of 120,000. Starting from an empty Token Bucket at $t=0$, compute the refill rate $r$ in tokens/second and how many seconds are needed before a request with estimated cost 4,000 tokens is accepted.
+  \item \textbf{Exercise~\thechapter.2:} In BM25, $D_1$ ranks \#1 and $D_2$ ranks \#15. In HNSW, $D_1$ is absent from top-50 ($r \to \infty$) while $D_2$ ranks \#2. Compute both RRF scores ($k=60$) and identify the winner.
+\end{enumerate}
+
+\subsection{Debugging}
+\begin{enumerate}[leftmargin=18pt]
+  \setcounter{enumi}{2}
+  \item \textbf{Exercise~\thechapter.3:} A clinical assistant begins failing 60\% of legitimate patient injury queries with HTTP 400 \texttt{ResponsibleAIPolicyViolation}. Outline a 4-step diagnostic and remediation workflow using Azure logs and Azure AI Foundry/Studio Content Filter thresholds.
+\end{enumerate}
+
+\subsection{Architecture}
+\begin{enumerate}[leftmargin=18pt]
+  \setcounter{enumi}{3}
+  \item \textbf{Exercise~\thechapter.4:} Design a multi-region active-active RAG architecture across \texttt{eastus2} and \texttt{centralus} with zero public PaaS endpoints, covering global L7 failover, dual-region Azure AI Search index synchronization, PTU deployments, and regional split-brain Private DNS resolution.
+\end{enumerate}
+
+\section{Detailed Solutions}
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Solution~\thechapter.1 (Mechanics):}\\
+  Refill rate $r = 120{,}000 / 60 = \mathbf{2{,}000\text{ tokens/sec}}$. Wait time $= 4{,}000 / 2{,}000 = \mathbf{2.0\text{ seconds}}$.
+
+  \item \textbf{Solution~\thechapter.2 (Mechanics):}\\
+  $\text{Score}(D_1) = \frac{1}{60+1} + 0 = \frac{1}{61} \approx 0.016393$.\\
+  $\text{Score}(D_2) = \frac{1}{60+15} + \frac{1}{60+2} = \frac{1}{75} + \frac{1}{62} \approx 0.013333 + 0.016129 = \mathbf{0.029462}$.\\
+  $D_2$ wins because balanced presence in both channels beats appearing in only one.
+
+  \item \textbf{Solution~\thechapter.3 (Debugging):}\\
+  (1) Query Azure Monitor \texttt{RequestResponse} logs for HTTP 400 and inspect \texttt{innererror.content\_filter\_result}. (2) Identify which category triggered (e.g., \texttt{violence: medium} on injury descriptions). (3) In Azure AI Studio (\emph{Safety + Security $\to$ Content Filters}), raise that category's threshold from \texttt{Medium} to \texttt{High} in a custom filter policy. (4) Bind the custom policy to the clinical deployment and verify against representative test prompts.
+
+  \item \textbf{Solution~\thechapter.4 (Architecture):}\\
+  Deploy symmetric stacks in \texttt{eastus2} and \texttt{centralus} (ACA/AKS backend, Azure AI Search, Azure OpenAI PTU behind Private Endpoints). Front both with 	extbf{Azure Front Door} probing \texttt{/healthz} for automated priority/latency failover. Synchronize document ingestion via Event Hub fanning out to indexers/Functions in both regions. Link regional Private DNS Zones so local backends always resolve their local regional Private Endpoints without cross-region round-trips.
+
+  \item \textbf{Try-It-Yourself Verification:}\\
+  (1) $\text{Score}(D_A) = \frac{1}{61} + \frac{1}{63} \approx 0.03226$; $\text{Score}(D_B) = \frac{1}{62} + \frac{1}{61} \approx \mathbf{0.03252}$; $\text{Score}(D_C) = \frac{1}{63} + \frac{1}{62} \approx 0.03200$. 	extbf{$D_B$ wins} ($0.03252$).\\
+  (2) If $D_A$ drops out of HNSW, $\text{Score}(D_A) = \frac{1}{61} + 0 \approx 0.01639$, falling well behind both $D_B$ and $D_C$.
+\end{enumerate}
+
+\section{Further Reading \protect\& Citations}
+\begin{itemize}[leftmargin=15pt]
+  \item Malkov, Y. A., and Yashunin, D. A. \emph{Efficient and robust approximate nearest neighbors using HNSW graphs}. IEEE TPAMI, 2020.
+  \item Cormack, G. V., Clarke, C. L., and Buettcher, S. \emph{Reciprocal Rank Fusion Outperforms Condorcet and Individual Learning Methods}. SIGIR, 2009.
+  \item Microsoft Learn. \emph{Azure OpenAI PTU Sizing, Content Safety, and Azure AI Search Semantic Ranking}, 2025.
+\end{itemize}

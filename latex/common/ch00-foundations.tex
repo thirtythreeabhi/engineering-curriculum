@@ -1,0 +1,77 @@
+\chapter*{Foundations Primer: How Software, Networks, and Cryptography Work}
+\addcontentsline{toc}{chapter}{Foundations Primer: How Software, Networks, and Cryptography Work}
+\label{chap:foundations-primer}
+
+If you have built or deployed software alongside AI coding agents, you have already seen terms like \emph{process}, \emph{thread}, \emph{AST}, \emph{bytecode}, \emph{TCP socket}, \emph{TLS}, and \emph{HMAC}. Encountering a term in a config file or error message is not the same as knowing how the machine actually carries it out. This short primer builds four foundational mental models from scratch so every subsequent volume stands on solid ground.
+
+\section*{1. How a Running Program Uses CPU and Memory}
+\label{sec:primer-os}
+
+When you double-click a file or run \texttt{python app.py}, your source file is just inert text sitting on disk. To run it, the operating system (OS) kernel---the privileged core program managing hardware---creates a \textbf{process}.
+
+\begin{intuitionbox}[The Office Building Analogy]
+Think of a \textbf{process} as a locked office suite with its own private filing cabinets (memory) and telephone line (network sockets). One suite cannot reach into another suite's filing cabinets without going through building security (the OS kernel). Inside a suite, a \textbf{thread} is an individual worker following a checklist step by step. A single process can have one worker (single-threaded) or many workers sharing the same filing cabinets (multi-threaded).
+\end{intuitionbox}
+
+Inside a process's private memory (its \textbf{virtual address space}), two regions matter most for backend engineering:
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{The Call Stack:} A neat scratchpad belonging to a single thread. Whenever function \texttt{A()} calls function \texttt{B()}, a small block (\textbf{stack frame}) holding \texttt{B}'s local variables and return address is placed on top. When \texttt{B()} returns, its frame is popped off immediately. Stack allocation is fast and automatic, but small (typically 1--8 MB per thread).
+  \item \textbf{The Heap:} A large, shared storage room where objects that outlive a single function call (user records, HTTP payloads, caches) live. Languages like C ask the programmer to allocate (\texttt{malloc}) and free (\texttt{free}) heap memory manually; languages like Python, PHP, and Go track references automatically and reclaim unused objects via \textbf{garbage collection}.
+\end{itemize}
+
+Because application code runs in unprivileged \textbf{user space}, it cannot touch disk drives, network cards, or other processes directly. Whenever your program wants to read a file, open a network connection, or ask for the time, it must make a \textbf{system call (syscall)}---knocking on the kernel's door. The kernel hands back an integer handle called a \textbf{file descriptor (FD)} (for example, \texttt{3} for an open file or \texttt{4} for a network socket). Your code reads and writes bytes using that integer handle, and the kernel mediates the hardware underneath.
+
+\section*{2. How Source Code Becomes Execution: Tokens, Trees, Lowering, and Bytecode}
+\label{sec:primer-compilers}
+
+A CPU only understands raw binary machine instructions (like ``add register 1 to register 2''). It cannot read Python or PHP directly. Different languages bridge that gap in different ways, and understanding four distinct stages clears up most runtime jargon:
+
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Tokenizing (Lexing):} Before understanding grammar, the compiler chops raw characters into labeled pieces (\textbf{tokens}). For \texttt{total = price + 5}, the tokenizer produces: \texttt{NAME("total")}, \texttt{EQUAL("=")}, \texttt{NAME("price")}, \texttt{PLUS("+")}, \texttt{NUMBER(5)}.
+  \item \textbf{Parsing into a Tree (CST vs.\ AST):} Flat tokens don't show grouping (does \texttt{1 + 2 * 3} mean \texttt{(1+2)*3} or \texttt{1+(2*3)}?). A parser applies grammar rules to build a tree:
+  \begin{itemize}
+    \item A \textbf{Concrete Syntax Tree (CST)} keeps \emph{every} punctuation mark, parenthesis, whitespace, and colon from the original file. Code formatters (like \texttt{black} or linters) love CSTs because they can reconstruct the exact original text.
+    \item An \textbf{Abstract Syntax Tree (AST)} throws away syntactic punctuation like parentheses and colons, keeping only the \emph{meaning} and structure: an \texttt{Assign} node targeting \texttt{total}, whose value is a \texttt{BinOp(Add, Name("price"), Constant(5))}.
+  \end{itemize}
+  \item \textbf{Lowering:} High-level AST nodes express human conveniences (\texttt{for x in items:}, \texttt{with open(...) as f:}, \texttt{async/await}) that have no direct single instruction in a virtual machine. \textbf{Lowering} translates high-level AST structures down into simpler, explicit control-flow steps---such as turning a \texttt{for} loop into ``get iterator, jump to check, get next item or jump to exit'' inside a \textbf{Control Flow Graph (CFG)}.
+  \item \textbf{Bytecode and Virtual Machine (VM):} Rather than emitting CPU-specific x86/ARM machine code directly, runtimes like CPython and PHP's Zend Engine compile lowered instructions into compact \textbf{bytecode} (numbered instructions like \texttt{LOAD\_FAST}, \texttt{BINARY\_OP}, \texttt{RETURN\_VALUE}). A C program called the \textbf{virtual machine} loops over those bytecodes one by one and executes them.
+\end{enumerate}
+
+A language like Python is defined by a written specification (syntax rules and behavior). The official implementation written in C by the Python core team is called \textbf{CPython}---and it is called the \textbf{reference implementation} because other implementations (like PyPy, MicroPython, or RustPython) treat CPython's behavior as the gold standard to match.
+
+\section*{3. How Machines Talk Over a Network}
+\label{sec:primer-network}
+
+Every server on the internet or a private cloud network is reached via an \textbf{IP address} (e.g., \texttt{10.0.1.25} in IPv4). Because humans prefer names like \texttt{api.bank.internal}, \textbf{DNS (Domain Name System)} translates hostnames into IP addresses and caches those answers for a \textbf{TTL (Time To Live)} in seconds.
+
+Once your client knows the destination IP and a \textbf{port} (an integer from 1 to 65535 identifying which program on that machine should receive the data, such as \texttt{443} for HTTPS or \texttt{5432} for PostgreSQL), it chooses a transport protocol:
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{TCP (Transmission Control Protocol):} Opens a reliable, ordered byte stream via a three-step handshake (\texttt{SYN} $\to$ \texttt{SYN-ACK} $\to$ \texttt{ACK}). If a packet is dropped on the wire, TCP detects the missing sequence number and retransmits it, pausing later bytes until the gap is filled.
+  \item \textbf{UDP (User Datagram Protocol):} Sends independent packets (\textbf{datagrams}) with no handshake and no automatic retransmission. Protocols like DNS and HTTP/3 (QUIC) build custom reliability on top of UDP when TCP's strict ordering slows things down.
+\end{itemize}
+
+Raw TCP sends bytes in plaintext---anyone on the Wi-Fi network or an intermediate router could read or alter them. \textbf{TLS (Transport Layer Security)} wraps the connection in cryptography: the server proves its identity using a signed \textbf{X.509 certificate}, both sides agree on a temporary session key, and all HTTP traffic inside (\textbf{HTTPS}) is encrypted and tamper-proof.
+
+\section*{4. Cryptography Primitives: Encoding, Hashing, Encryption, and Signatures}
+\label{sec:primer-crypto}
+
+Security bugs often come from mixing up four operations that look superficially similar because they all produce unreadable strings:
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{p{3.0cm}p{3.4cm}p{3.2cm}p{4.0cm}}
+\toprule
+\textbf{Operation} & \textbf{Purpose} & \textbf{Reversible?} & \textbf{Example} \\
+\midrule
+\textbf{Encoding} (Base64, JSON) & Represent binary safely as text & Yes, by anyone (no key) & JWT header/payload \\
+\textbf{Cryptographic Hash} (SHA-256) & Fixed-size fingerprint of data & No (one-way) & Detecting file tampering \\
+\textbf{Symmetric Encryption} (AES-GCM) & Hide data with a shared secret key & Yes, with the same secret key & Encrypting database backups \\
+\textbf{HMAC} (HMAC-SHA256) & Prove integrity + authenticity with a shared secret & No (verify by recomputing) & Webhook signatures, HS256 JWTs \\
+\textbf{Asymmetric Signature} (RSA, ECDSA) & Sign with a private key; anyone verifies with public key & No (verify with public key) & HTTPS certs, RS256 JWTs \\
+\bottomrule
+\end{tabular}
+\caption{Five distinct data transformations commonly confused in backend systems.}
+\label{tab:primer-crypto}
+\end{table}
+
+Keep one rule permanently sharp: \textbf{Base64 encoding is not encryption}, and \textbf{encryption alone does not always guarantee who sent a message}. With these four foundations---processes/memory, compilation stages, network transport, and cryptographic primitives---you are ready to trace real systems from top to bottom.

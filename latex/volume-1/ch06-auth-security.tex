@@ -1,430 +1,438 @@
-\chapter{Authentication, Authorization, and Defensive Backend Security}
+\chapter{Authentication, Cryptography, Webhooks, and Defensive Security}
 \label{chap:auth-security}
 
-\begin{chaptergoalsbox}
-\textbf{What You Will Learn:}
-\begin{itemize}[leftmargin=12pt,itemsep=2pt]
-  \item Modern password hashing mechanics: Argon2id (RFC 9106) vs. bcrypt, memory-hard resistance against GPU/ASIC arrays, and runtime re-hashing transitions.
-  \item Hardened session engineering: session fixation defenses, modern cookie security flags (\texttt{HttpOnly}, \texttt{Secure}, \texttt{SameSite}), and \texttt{\_\_Host-} prefixes.
-  \item JSON Web Token (JWT) architecture and cryptographic exploit paths: \texttt{alg: none} stripping, RS256-to-HS256 key-confusion attacks, and revocation mechanics.
-  \item OAuth 2.0 and OpenID Connect (OIDC) with PKCE (RFC 7636): cryptographic code verifiers, $S256$ challenges, and refresh token rotation.
-  \item Access control topologies: Role-Based (RBAC), Attribute-Based (ABAC), and Google Zanzibar Relationship-Based Access Control (ReBAC).
-  \item OWASP Top 10 deep dive: SQL injection mechanics, Insecure Direct Object References (IDOR), and Server-Side Request Forgery (SSRF) cloud metadata bypasses.
-\end{itemize}
+Suppose an attacker intercepts this HTTP request on a public coffee-shop network---or sends a forged copy straight to your API endpoint:
 
-\textbf{What You Should Already Understand:}
-\begin{itemize}[leftmargin=12pt,itemsep=2pt]
-  \item Basic cryptography (symmetric AES encryption vs. asymmetric RSA/ECC keypairs, cryptographic hashes).
-  \item HTTP header exchange mechanics and stateless token passing.
-\end{itemize}
-
-\textbf{Why This Topic Exists:}
-Security is not a feature layered on at the end of a project; it is an architectural property woven into every line of backend code. Security breaches rarely occur because of broken mathematical algorithms; they occur because of flawed implementation assumptions—such as trusting user-supplied JWT header algorithms, naively trusting client IP addresses, or failing to validate tenant ownership in database queries.
-
-\textbf{Motivating Practical Problem:}
-A healthcare technology platform exposes a patient portal and medical record API. An external security audit discovers three catastrophic vulnerabilities: (1) an attacker can forge admin JWTs by exploiting an RS256/HS256 algorithm confusion flaw using the platform's public certificate, (2) an IDOR flaw in the prescription download endpoint allows any authenticated patient to read arbitrary patient records, and (3) an SSRF vulnerability in the profile avatar importer allows exfiltrating AWS IAM credentials from the EC2 instance metadata service (\texttt{169.254.169.254}). Hardening this platform demands a comprehensive, defense-in-depth engineering overhaul.
-\end{chaptergoalsbox}
-
-\section{Modern Password Hashing: Argon2id vs. bcrypt}
-
-Storing plaintext passwords or simple cryptographic hashes (such as MD5, SHA-1, or SHA-256) is catastrophic negligence. Cryptographic hash functions are engineered for speed, enabling an attacker with an array of modern GPUs to compute over 100 billion SHA-256 hashes per second.
-
-\subsection{bcrypt: Architecture and 72-Byte Truncation Limitation}
-
-Introduced in 1999 by Niels Provos and David Mazières, **bcrypt** is based on the Blowfish block cipher. It introduces an adaptive work factor (cost) $2^{\text{cost}}$, scaling computation time exponentially.
-
-\subsubsection{The 72-Byte Truncation Flaw}
-The Blowfish cipher key schedule accepts keys up to 448 bits (56 bytes), expanded in bcrypt to a maximum password length of **72 bytes**. If a user enters a 100-character passphrase:
-\begin{lstlisting}[language=sh]
-password = "a" * 72 + "completely_different_ending_12345"
+\begin{lstlisting}[language=sh,caption={An Intercepted Webhook / API Request}]
+POST /webhooks/stripe HTTP/1.1
+Host: api.healthportal.example
+X-Webhook-Signature: t=1735689600,v1=5257a869e7ec...
+Authorization: Bearer eyJhbGciOiJSUzI1NiJ9.eyJ1c2VyX2lkIjo0Miwicm9sZSI6InBhdGllbnQifQ.sig
 \end{lstlisting}
-bcrypt silently truncates the password at byte 72, completely discarding all subsequent characters!
 
-Furthermore, bcrypt requires only 4KB of RAM, making it highly vulnerable to mass hardware parallelization on Field-Programmable Gate Arrays (FPGAs) and Application-Specific Integrated Circuits (ASICs).
+Three distinct security questions jump off the screen: (1) Can anyone read that 	exttt{Bearer} payload? (2) How does the receiver prove the webhook signature wasn't forged or replayed an hour later? (3) Once the server knows the caller is 	exttt{user\_id = 42}, how does it stop them from downloading 	exttt{patient\_id = 43}'s records or tricking the server into reading internal cloud credentials? Answering those questions requires building from cryptographic primitives upward into sessions, JWTs, OAuth 2.0, webhooks, access control, and OWASP defenses.
 
-\subsection{Argon2id (RFC 9106): The Memory-Hard Standard}
+% ==========================================
+\section{Cryptographic Primitives: Choosing the Right Tool}
 
-Winner of the Password Hashing Competition (PHC), **Argon2** is the modern gold standard. It is fundamentally **memory-hard**, designed to demand gigabytes of memory access bandwidth, neutralizing GPU and ASIC cracking rigs.
+From the Foundations Primer (Table~\ref{tab:primer-crypto}), remember never to confuse \textbf{encoding}, \textbf{hashing}, \textbf{encryption}, \textbf{HMACs}, and \textbf{asymmetric signatures}:
 
-Argon2 provides three variants:
-\begin{enumerate}[leftmargin=15pt]
-  \item \textbf{Argon2d (Data-Dependent):} Accesses memory in an order determined by password and salt. Maximizes resistance against GPU cracking, but is vulnerable to cache side-channel timing attacks.
-  \item \textbf{Argon2i (Data-Independent):} Accesses memory in a fixed, password-independent sequence, eliminating side-channel timing attacks, but requires more iterations to deter GPUs.
-  \item \textbf{Argon2id (Hybrid):} The recommended production variant. Operates as Argon2i during the first half of the first pass over memory to eliminate side-channel leaks, and transitions to Argon2d for the remainder to defeat GPU cracking.
-\end{enumerate}
-
-\subsubsection{Configuring Argon2id Parameters}
-Argon2id relies on three tunable dimensions:
 \begin{itemize}[leftmargin=15pt]
-  \item \textbf{Memory Cost ($m$):} RAM allocated to the hash in kibibytes (e.g., $65,536\text{ KiB} = 64\text{ MB}$).
-  \item \textbf{Time Cost ($t$):} Number of linear passes over the memory matrix (e.g., $t = 3$ or $4$).
-  \item \textbf{Parallelism ($p$):} Number of concurrent execution threads/lanes (e.g., $p = 1$ to $4$).
+  \item \textbf{Cryptographic Hash (	exttt{SHA-256}):} Maps any input to a fixed 256-bit fingerprint. One-way and deterministic, with \emph{no secret key}. Great for file checksums, terrible for passwords (too fast!) and terrible for API authentication on its own (an attacker who knows the message can recompute 	exttt{SHA-256(secret + msg)} via length-extension attacks if concatenated naively).
+  \item \textbf{Symmetric Encryption (	exttt{AES-256-GCM}):} Scrambles plaintext using one shared secret key so only holders of that key can decrypt it. Encryption hides data; an \emph{authenticated} mode like GCM also attaches an integrity tag.
+  \item \textbf{HMAC (	exttt{HMAC-SHA256}):} Combines a cryptographic hash with a shared secret key in a two-pass construction that prevents length-extension attacks. Any holder of the shared secret can verify authenticity and integrity, without hiding the message body.
+  \item \textbf{Asymmetric Signatures (	exttt{RSA / ECDSA}) \& X.509:} One party signs with a \textbf{private key}; anyone can verify using the matching \textbf{public key} (often distributed inside a CA-signed \textbf{X.509 certificate} as in TLS 1.3).
 \end{itemize}
 
-\begin{lstlisting}[language=PHP,caption={Production Password Hashing and Seamless Upgrades in PHP}]
+\begin{intuitionbox}[Locked Envelope vs.\ Tamper-Proof Wax Seal]
+\textbf{AES encryption} is a locked opaque envelope: nobody in transit can read what is inside. \textbf{HMAC / RSA signing} is a tamper-proof wax seal stamped on a clear envelope: anyone can read the letter, yet everyone immediately detects if a single comma was altered or if the stamp came from an impostor.
+\end{intuitionbox}
+
+% ==========================================
+\section{Modern Password Hashing: Argon2id vs.\ bcrypt}
+
+A single modern GPU rig can test over $10^{11}$ raw SHA-256 hashes per second. If a database leaks, fast hashes crack almost every human password in minutes. Password storage therefore requires intentionally slow, salted, \textbf{memory-hard} key derivation functions.
+
+\subsection{Why Argon2id Replaced bcrypt}
+
+\textbf{bcrypt} (1999) uses Blowfish's key schedule with an adjustable work factor $2^{\text{cost}}$, but suffers two limitations: it uses only $\approx 4\text{\,KB}$ of RAM (making parallel FPGA/ASIC cracking cheap) and silently \textbf{truncates passwords at 72 bytes}---meaning two different 90-character passphrases sharing the first 72 bytes produce the exact same bcrypt hash!
+
+\textbf{Argon2id (RFC 9106)} demands large amounts of RAM per hash, neutralizing GPU/ASIC arrays:
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{Argon2d} accesses memory depending on the password (maximum GPU resistance, vulnerable to cache-timing leaks).
+  \item \textbf{Argon2i} accesses memory in a fixed pattern (immune to side-channels, weaker against GPUs).
+  \item \textbf{Argon2id (Recommended)} runs Argon2i on the first half of pass 1 and Argon2d afterward, combining side-channel safety with GPU resistance. Tune memory cost $m$ (e.g., $65{,}536\text{\,KiB} = 64\text{\,MB}$), time iterations $t$ (e.g., $3\text{--}4$), and lanes $p$ (e.g., $1$).
+\end{itemize}
+
+\begin{lstlisting}[language=PHP,caption={Argon2id Hashing and Transparent Re-Hashing in PHP 8.3}]
 <?php
 declare(strict_types=1);
 
-// Hash using Argon2id with 64MB memory cost
-$options = [
-    'memory_cost' => 65536, // 64 MB
-    'time_cost'   => 4,     // 4 iterations
-    'threads'     => 1,     // 1 lane
-];
-
+$options = ['memory_cost' => 65536, 'time_cost' => 4, 'threads' => 1];
 $hash = password_hash($rawPassword, PASSWORD_ARGON2ID, $options);
 
-// On user login: Verify and seamlessly rehash if parameters changed
 if (password_verify($inputPassword, $storedHash)) {
     if (password_needs_rehash($storedHash, PASSWORD_ARGON2ID, $options)) {
         $newHash = password_hash($inputPassword, PASSWORD_ARGON2ID, $options);
-        $userRepository->updatePasswordHash($user->id, $newHash);
+        $userRepo->updatePasswordHash($user->id, $newHash);
     }
 }
 \end{lstlisting}
 
 % ==========================================
-\section{Hardened Session Management and Cookie Security}
+\section{Sessions, XSS, CSRF, and Hardened Cookies}
 
-Session-based authentication stores state on the server (e.g., in Redis) and identifies the user via a cryptographically random session token stored in an HTTP cookie.
-
-\subsection{Session Fixation and Regeneration}
-
-In a **session fixation attack**, an attacker obtains a valid session identifier (e.g., by visiting the login page), tricks a victim into authenticating using that identifier (via a crafted link), and then uses the now-authenticated session ID to hijack the victim's account.
-
-\begin{productionwarningbox}[Mandatory Session ID Regeneration]
-Whenever a user's privilege level changes—such as successful login, password change, or multi-factor authentication (MFA) verification—the backend **must immediately regenerate the session ID** and invalidate the old session:
-\begin{lstlisting}[language=PHP]
-session_regenerate_id(true); // true deletes the old session file/record
-\end{lstlisting}
-\end{productionwarningbox}
-
-\subsection{Defensive Cookie Flags and Modern Prefixes}
-
-Cookies must be configured with defense-in-depth flags to prevent theft via Cross-Site Scripting (XSS) or Cross-Site Request Forgery (CSRF):
-
+Before configuring cookie flags, you must understand the two browser attacks those flags defend against:
 \begin{itemize}[leftmargin=15pt]
-  \item \textbf{\texttt{HttpOnly}:} Blocks JavaScript access via \texttt{document.cookie}. Even if the application has an XSS vulnerability, the attacker cannot read the session cookie.
-  \item \textbf{\texttt{Secure}:} Restricts cookie transmission exclusively to encrypted TLS (HTTPS) connections, preventing plaintext sniffing over unencrypted networks.
-  \item \textbf{\texttt{SameSite=Lax / Strict}:} Controls whether cookies are attached to cross-site requests:
-  \begin{itemize}
-    \item \texttt{Strict}: Never sent on cross-site requests (e.g., clicking a link from an external website).
-    \item \texttt{Lax}: Sent on top-level cross-site navigations using safe HTTP methods (\texttt{GET}), but withheld from cross-site \texttt{POST} requests, image loads, and iframes, neutralizing CSRF attacks.
-  \end{itemize}
-  \item \textbf{The \texttt{\_\_Host-} Cookie Prefix:} A browser security standard. A cookie named \texttt{\_\_Host-SessionId} is accepted by the browser **only if**:
-  \begin{enumerate}
-    \item It is marked with the \texttt{Secure} flag.
-    \item It originates from an HTTPS origin.
-    \item It has \texttt{Path=/}.
-    \item It has **no Domain attribute** specified (preventing malicious subdomains from overwriting parent domain session cookies!).
-  \end{enumerate}
+  \item \textbf{Cross-Site Scripting (XSS):} An attacker injects malicious JavaScript into a page rendered by your site (for example, an unescaped comment 	exttt{<script>...</script>}). That script runs inside the victim's browser origin and tries to read 	exttt{document.cookie} to steal session tokens.
+  \item \textbf{Cross-Site Request Forgery (CSRF):} A victim is logged into 	exttt{bank.example} (holding a session cookie) and visits 	exttt{evil.example}. A hidden HTML form on 	exttt{evil.example} submits 	exttt{POST https://bank.example/transfer}; the victim's browser \emph{automatically attaches} 	exttt{bank.example}'s session cookie unless instructed otherwise!
+\end{itemize}
+
+\subsection{Session Fixation \protect\& Cookie Defense-in-Depth}
+
+In a \textbf{session fixation} attack, an attacker fetches an unauthenticated session ID, tricks the victim into logging in with that ID, and hijacks the now-authenticated session. Always regenerate the session ID at every privilege change (	exttt{session\_regenerate\_id(true)} in PHP).
+
+Lock down session cookies with four browser flags:
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{	exttt{HttpOnly}:} Hides the cookie from 	exttt{document.cookie}, blocking cookie theft even if XSS occurs.
+  \item \textbf{	exttt{Secure}:} Sends the cookie exclusively over HTTPS, preventing plaintext Wi-Fi sniffing.
+  \item \textbf{	exttt{SameSite=Lax} (or 	exttt{Strict}):} 	exttt{Lax} attaches the cookie on top-level safe 	exttt{GET} link navigations, while withholding it from cross-site 	exttt{POST} forms, iframes, and background fetches---blocking classic CSRF. 	exttt{Strict} blocks cross-site sending altogether.
+  \item \textbf{	exttt{\_\_Host-} Prefix:} A browser-enforced rule: a cookie named 	exttt{\_\_Host-sid} is accepted \emph{only} if 	exttt{Secure} is set, 	exttt{Path=/}, origin is HTTPS, and \textbf{no 	exttt{Domain} attribute} is present (stopping compromised subdomains from overwriting parent cookies!).
 \end{itemize}
 
 % ==========================================
-\section{JWT Mechanics and Cryptographic Vulnerabilities}
+\section{JSON Web Tokens (JWT) and Cryptographic Exploits}
 
-A **JSON Web Token (JWT, RFC 7519)** is a compact, URL-safe means of representing claims between two parties. It consists of three Base64URL-encoded strings separated by dots:
-$$\text{JWT} = \text{Header} \;.\; \text{Payload} \;.\; \text{Signature}$$
+A 	extbf{JWT (RFC 7519)} \cite{rfc7519} is three 	extbf{Base64URL-encoded} segments separated by dots:
+$$\text{JWT} = \underbrace{\text{Header}}_{\text{Base64URL(JSON)}} \;.\; \underbrace{\text{Payload}}_{\text{Base64URL(JSON)}} \;.\; \underbrace{\text{Signature}}_{\text{Base64URL(MAC or Sig)}}$$
+Remember: Base64URL is \textbf{encoding, not encryption}---anyone who sees the token can decode the header and payload!
 
-\subsection{The \texttt{alg: none} Stripping Attack}
+\subsection{The 	exttt{alg: none} Attack and RS256 $\to$ HS256 Key Confusion}
 
-The JWT specification includes an algorithm identifier: \texttt{"alg": "none"}, intended for unauthenticated debugging. 
-
-In vulnerable implementations, an attacker modifies the token header:
-\begin{lstlisting}[language=sh]
-{"alg": "none", "typ": "JWT"}
-\end{lstlisting}
-Modifies the payload to grant admin privileges:
-\begin{lstlisting}[language=sh]
-{"user_id": 42, "role": "admin"}
-\end{lstlisting}
-And removes the signature entirely (leaving the trailing dot):
-\begin{lstlisting}[language=sh]
-eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJ1c2VyX2lkIjo0Miwicm9sZSI6ImFkbWluIn0.
-\end{lstlisting}
-If the backend library naively inspects the token header to determine how to verify the signature, it treats the token as valid without verifying anything!
-
-\begin{commonmistakebox}[Never Let the Untrusted Token Dictate the Algorithm]
-Production JWT verification code must **never** let the token header select the algorithm. Always enforce the expected algorithm on the server:
-\begin{lstlisting}[language=Python]
-# SECURE: Explicitly whitelist the algorithm on the verifier
-jwt.decode(token, PUBLIC_KEY, algorithms=["RS256"])
-\end{lstlisting}
-\end{commonmistakebox}
-
-\subsection{The RS256 vs. HS256 Key Confusion Attack}
-
-This is one of the most severe cryptographic bugs in token-based systems. It occurs when a server expects an asymmetric RSA signature (**RS256**), but uses a library that accepts symmetric HMAC signatures (**HS256**).
+Two classic bugs defeat naive JWT verifiers:
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{	exttt{alg: none} Stripping:} An attacker changes the header to 	exttt{\{"alg": "none"\}}, edits 	exttt{"role": "admin"}, strips the signature leaving a trailing dot (	exttt{header.payload.}), and tricks a library that trusts the untrusted header's 	exttt{alg} field.
+  \item \textbf{RS256-to-HS256 Key Confusion:} A server signs tokens with an asymmetric private RSA key (	exttt{RS256}) and verifies with its public RSA key (published openly at 	exttt{/.well-known/jwks.json}). An attacker grabs that public PEM key, changes the header to 	exttt{\{"alg": "HS256"\}}, and computes an 	exttt{HMAC-SHA256} signature using the \textbf{public RSA PEM string as the HMAC secret}. If a vulnerable verifier passes 	exttt{public\_key} into a multi-algorithm 	exttt{verify(token, public\_key)} function without restricting 	exttt{algorithms=["RS256"]}, it runs HMAC with the public key and accepts the forged admin token!
+\end{enumerate}
 
 \begin{figure}[htbp]
 \centering
 \begin{tikzpicture}[
-  scale=0.9, transform shape,
-  node distance=0.8cm and 1.5cm,
-  box/.style={rectangle, draw=headingblue, fill=codebg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily},
-  accent/.style={rectangle, draw=warningRed, fill=warningBg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily\bfseries},
-  line/.style={draw=headingblue, -{Stealth[length=2.5mm]}, thick}
+  scale=0.86, transform shape,
+  node distance=0.8cm and 1.2cm,
+  box/.style={rectangle, draw=headingblue, fill=codebg, rounded corners=2pt, thick, align=center, inner sep=5pt, font=\small\sffamily},
+  accent/.style={rectangle, draw=warningRed, fill=warningBg, rounded corners=2pt, thick, align=center, inner sep=5pt, font=\small\sffamily\bfseries},
+  line/.style={draw=headingblue, -{Stealth[length=2.3mm]}, thick}
 ]
-  \node[box] (pubkey) {\textbf{Server Public RSA Key}\\\small Publicly available at \texttt{/.well-known/jwks.json}};
-  \node[accent, right=of pubkey] (atk) {\textbf{Attacker Forges Token}\\\small Changes header to \texttt{alg: HS256}\\Signs with Public RSA Key as HMAC Secret};
-  \node[accent, below=1.2cm of atk] (srv) {\textbf{Vulnerable Server}\\\small Passes public key to generic \texttt{verify(token, key)}\\Library treats RSA public key string as HMAC secret!};
-  \node[box, left=of srv] (bypass) {\textbf{Authentication Bypassed}\\\small Signature matches! Attacker is Admin};
+  \node[box] (pubkey) {\textbf{Public RSA Key (PEM)}\\\small Fetched from 	exttt{jwks.json}};
+  \node[accent, right=of pubkey] (atk) {\textbf{Attacker Forges Token}\\\small Sets 	exttt{alg: HS256}, signs HMAC\\using Public Key bytes as secret};
+  \node[accent, below=0.95cm of atk] (srv) {\textbf{Vulnerable Verifier}\\\small Calls 	exttt{decode(tok, pub\_key)}\\without 	exttt{algorithms=["RS256"]}};
+  \node[box, left=of srv] (bypass) {\textbf{Auth Bypassed}\\\small HMAC matches! Attacker is Admin};
 
   \draw[line] (pubkey) -- (atk);
   \draw[line] (atk) -- (srv);
   \draw[line] (srv) -- (bypass);
 \end{tikzpicture}
-\caption{The RS256 vs HS256 key confusion exploit flow.}
-\label{fig:jwt-confusion}
+\caption{RS256-to-HS256 algorithm confusion exploit.}
+\label{fig:v1-ch06-jwt-confusion}
 \end{figure}
 
-\subsubsection{Exploitation Mechanics}
-\begin{enumerate}[leftmargin=15pt]
-  \item In RS256, the server signs with an asymmetric private key and verifies with a public key. The public key is public knowledge.
-  \item In HS256, both signing and verification use the **same shared secret**.
-  \item The attacker grabs the server's public RSA key (PEM format).
-  \item The attacker crafts an administrative JWT, changes the header to \texttt{\{"alg": "HS256"\}}, and signs the token using standard HMAC-SHA256, providing the **public RSA key string as the secret**.
-  \item When the backend receives the token, it fetches its public RSA key and calls \texttt{jwt.decode(token, public\_key)}.
-  \item If the library supports multiple algorithms, it sees \texttt{"HS256"}, uses the public key string as the HMAC secret, computes HMAC-SHA256, finds an exact signature match, and logs the attacker in as super-admin!
-\end{enumerate}
+\begin{commonmistakebox}[Always Pin Allowed Algorithms on the Server]
+Never let an untrusted token header choose the verification algorithm:
+\begin{lstlisting}[language=Python]
+# SECURE: Explicitly pin asymmetric RS256 on the verifier
+claims = jwt.decode(token, PUBLIC_KEY, algorithms=["RS256"], audience="api")
+\end{lstlisting}
+\end{commonmistakebox}
 
 % ==========================================
-\section{OAuth 2.0 and OpenID Connect (OIDC) with PKCE}
+\section{OAuth 2.0 Authorization Code Flow and PKCE}
 
-**OAuth 2.0 (RFC 6749)** is a delegation framework; **OpenID Connect (OIDC)** is an identity authentication layer built directly on top of OAuth 2.0.
+	extbf{OAuth 2.0 (RFC 6749)} delegates limited API access without sharing passwords across four roles:
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Resource Owner:} The user who owns the account/data.
+  \item \textbf{Client:} The web or mobile app requesting access.
+  \item \textbf{Authorization Server:} The identity provider (Keycloak, Auth0, Entra ID) that authenticates the user and issues tokens.
+  \item \textbf{Resource Server:} The backend API that accepts access tokens to serve protected data.
+\end{enumerate}
 
-\subsection{Proof Key for Code Exchange (PKCE, RFC 7636)}
+In the base 	extbf{Authorization Code Flow}, the Client redirects the user's browser to the Authorization Server; after login, the browser redirects back to the Client with a short-lived 	exttt{code}; finally, the Client's backend exchanges 	exttt{code} + 	exttt{client\_secret} over a private server-to-server 	exttt{POST /token} call for an 	exttt{access\_token} (and OIDC 	exttt{id\_token}).
 
-Historically, single-page applications (SPAs) and mobile native apps used the insecure **Implicit Grant Flow**, which returned access tokens directly in URL hash fragments. This exposed tokens to browser history, referrer logs, and malicious browser extensions.
+\subsection{Why Public Clients Need PKCE (RFC 7636)}
 
-Modern security standards deprecate the Implicit Grant and enforce the **Authorization Code Flow with PKCE**:
+Mobile apps and browser SPAs cannot keep a 	exttt{client\_secret} hidden inside distributed binaries/JS. 	extbf{PKCE (Proof Key for Code Exchange)} \cite{rfc7636} replaces the static secret with a per-login cryptographic proof:
+\begin{enumerate}[leftmargin=15pt]
+  \item The app generates a random 43--128 character 	exttt{code\_verifier} in memory and computes:
+  $$\text{code\_challenge} = \text{Base64URL}(\text{SHA-256}(\text{code\_verifier}))$$
+  \item The app sends 	exttt{code\_challenge} and 	exttt{code\_challenge\_method=S256} in the browser redirect.
+  \item When redeeming the returned 	exttt{code} at 	exttt{POST /token}, the app submits the raw 	exttt{code\_verifier}. The server verifies $\text{Base64URL}(\text{SHA-256}(\text{code\_verifier})) == \text{code\_challenge}$. An attacker intercepting the redirect 	exttt{code} cannot redeem it without the secret 	exttt{code\_verifier}.
+\end{enumerate}
 
 \begin{figure}[htbp]
 \centering
 \begin{tikzpicture}[
-  scale=0.85, transform shape,
+  scale=0.84, transform shape,
   node distance=0.8cm and 1.2cm,
   party/.style={rectangle, draw=headingblue, fill=codebg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily\bfseries},
-  line/.style={draw=headingblue, -{Stealth[length=2.5mm]}, thick}
+  line/.style={draw=headingblue, -{Stealth[length=2.3mm]}, thick}
 ]
-  \node[party] (client) {Client App\\(Mobile / SPA)};
-  \node[party, right=4.5cm of client] (auth) {Authorization Server\\(Auth0 / Okta / Keycloak)};
+  \node[party] (client) {Client App\\(SPA / Mobile)};
+  \node[party, right=5.2cm of client] (auth) {Authorization Server\\(IdP)};
 
-  \draw[line] (client.north east) -- node[above, font=\scriptsize\sffamily] {1. Generate \texttt{code\_verifier} \& \texttt{code\_challenge} (S256)} ++(0,0) -- node[below, font=\scriptsize\sffamily] {Redirect with \texttt{challenge}} (auth.north west);
-  \draw[line] (auth.west) -- node[above, font=\scriptsize\sffamily] {2. User Authenticates $\rightarrow$ Returns \texttt{authorization\_code}} (client.east);
-  \draw[line] (client.south east) -- node[above, font=\scriptsize\sffamily] {3. POST \texttt{/token} with \texttt{code} + \texttt{code\_verifier}} (auth.south west);
-  \draw[line] (auth.south) -- ++(0,-0.8) -| node[pos=0.25, below, font=\scriptsize\sffamily] {4. Verify $\text{SHA-256}(\text{verifier}) == \text{challenge} \rightarrow$ Returns \texttt{access\_token} + \texttt{id\_token}} (client.south);
+  \draw[line] (client.north east) -- node[above, font=\scriptsize\sffamily] {1. Send 	exttt{code\_challenge} ($S256$)} (auth.north west);
+  \draw[line] (auth.west) -- node[above, font=\scriptsize\sffamily] {2. User logs in $\rightarrow$ returns 	exttt{code}} (client.east);
+  \draw[line] (client.south east) -- node[above, font=\scriptsize\sffamily] {3. 	exttt{POST /token} (	exttt{code} + 	exttt{code\_verifier})} (auth.south west);
+  \draw[line] (auth.south) -- ++(0,-0.75) -| node[pos=0.25, below, font=\scriptsize\sffamily] {4. Verify $\text{SHA-256}(\text{verifier}) == \text{challenge} \rightarrow$ issue tokens} (client.south);
 \end{tikzpicture}
-\caption{The OAuth 2.0 Authorization Code flow with PKCE.}
-\label{fig:pkce-flow}
+\caption{OAuth 2.0 Authorization Code flow with PKCE (RFC 7636).}
+\label{fig:v1-ch06-pkce-flow}
 \end{figure}
 
-\subsubsection{PKCE Cryptographic Equations}
-\begin{enumerate}[leftmargin=15pt]
-  \item The client generates a high-entropy cryptographically random string: the \texttt{code\_verifier} (43 to 128 characters).
-  \item The client computes the \texttt{code\_challenge}:
-  $$\text{code\_challenge} = \text{Base64URL}(\text{SHA-256}(\text{code\_verifier}))$$
-  \item The client sends \texttt{code\_challenge} and \texttt{code\_challenge\_method=S256} during the initial authorization request.
-  \item When exchanging the returned authorization code for tokens, the client provides the raw \texttt{code\_verifier}.
-  \item The authorization server hashes the verifier using SHA-256 and compares it against the stored challenge. Even if an attacker intercepts the authorization code in a custom mobile URI scheme, they cannot redeem it without the \texttt{code\_verifier}!
-\end{enumerate}
-
 % ==========================================
-\section{Access Control Architectures: RBAC, ABAC, and ReBAC}
+\section{Production Webhooks: HMAC Rotation, Replay Defense, and Redis Idempotency}
+
+Webhooks (from Stripe, GitHub, or Adyen) reverse the normal API direction: an external provider sends 	exttt{POST} events to your server whenever payments settle or fail. Four failure modes break naive webhook handlers: forged requests, timing side-channels, replay attacks, and duplicate retries.
 
 \begin{figure}[htbp]
 \centering
 \begin{tikzpicture}[
-  scale=0.9, transform shape,
-  node distance=0.8cm and 1.2cm,
-  node/.style={rectangle, draw=headingblue, fill=codebg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily},
-  accent/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily\bfseries}
+  scale=0.86, transform shape,
+  node distance=0.8cm and 1.1cm,
+  box/.style={rectangle, draw=headingblue, fill=codebg, rounded corners=2pt, thick, align=center, inner sep=5pt, font=\small\sffamily},
+  accent/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, thick, align=center, inner sep=5pt, font=\small\sffamily\bfseries},
+  line/.style={draw=headingblue, -{Stealth[length=2.3mm]}, thick}
 ]
-  \node[node, minimum width=4cm] (rbac) {\textbf{RBAC}\\\small User $\rightarrow$ Role $\rightarrow$ Permissions};
-  \node[accent, right=1.2cm of rbac, minimum width=4cm] (abac) {\textbf{ABAC}\\\small $P = f(\text{Subject}, \text{Resource}, \text{Env})$};
-  \node[node, right=1.2cm of abac, minimum width=4cm] (rebac) {\textbf{ReBAC (Zanzibar)}\\\small Graph Tuples: \texttt{doc\#viewer@user}};
+  \node[box] (sender) {\textbf{Webhook Sender}};
+  \node[accent, right=of sender] (verify) {\textbf{Multi-	exttt{v1} HMAC}\\\small Constant-time 	exttt{hash\_equals}};
+  \node[box, right=of verify] (replay) {\textbf{Replay Filter}\\\small $|t_{\text{now}} - t| \le 300\text{s}$};
+  \node[accent, below=0.95cm of replay] (idem) {\textbf{Redis Idempotency}\\\small 	exttt{SET key 1 NX EX 86400}};
+  \node[box, left=of idem] (queue) {\textbf{Durable Queue}\\\small Async Worker};
+  \node[box, left=of queue] (ack) {\textbf{HTTP 200 OK}\\\small Fast ACK};
+
+  \draw[line] (sender) -- (verify);
+  \draw[line] (verify) -- (replay);
+  \draw[line] (replay) -- (idem);
+  \draw[line] (idem) -- (queue);
+  \draw[line] (queue) -- (ack);
 \end{tikzpicture}
-\caption{The evolution of authorization models: RBAC to ABAC to Google Zanzibar ReBAC.}
-\label{fig:access-models}
+\caption{Production webhook ingestion pipeline with multi-	exttt{v1} HMAC, replay window, and Redis idempotency.}
+\label{fig:v1-ch06-webhook-pipeline}
 \end{figure}
 
-\subsection{Role-Based Access Control (RBAC) and Role Explosion}
+\subsection{Constant-Time HMAC Verification and Multi-	exttt{v1} Secret Rotation}
 
-In RBAC, permissions are assigned to roles, and roles are assigned to users (e.g., \texttt{User $\rightarrow$ Manager $\rightarrow$ approve\_expense}).
-\textbf{The Flaw:} RBAC cannot handle fine-grained context. What if a manager can only approve expenses under \$5,000 within their own department? Teams invent hundreds of hyper-specific roles (\texttt{DEPT\_MARKETING\_MANAGER\_TIER\_2}), resulting in catastrophic **Role Explosion**.
+Comparing strings with 	exttt{===} stops at the very first mismatched byte, leaking timing clues an attacker can average statistically. Always use 	exttt{hash\_equals()} in PHP (or 	exttt{hmac.compare\_digest()} in Python).
 
-\subsection{Attribute-Based Access Control (ABAC)}
+Furthermore, providers like Stripe support zero-downtime secret rotation by sending 	extbf{multiple 	exttt{v1=} signatures} in the header (e.g., 	exttt{t=1735689600,v1=sig\_old,v1=sig\_new}). If your parser stores 	exttt{\$parts[\$key] = \$value}, it overwrites earlier 	exttt{v1} entries and drops half of your webhooks during rotation! Collect \emph{all} 	exttt{v1} signatures into a list and accept if any matches:
 
-ABAC evaluates policies dynamically based on four attribute dimensions:
-$$P = f(\text{Subject Attributes}, \; \text{Resource Attributes}, \; \text{Action}, \; \text{Environment Attributes})$$
-Example policy: ``Allow \texttt{Action: READ} on \texttt{Resource: MedicalRecord} IF \texttt{Subject.department == Resource.department} AND \texttt{Environment.time} is between 08:00 and 18:00.''
+\begin{lstlisting}[language=PHP,caption={Stripe-Style Multi-	exttt{v1} HMAC Validator with Replay Window}]
+<?php
+declare(strict_types=1);
 
-\subsection{Relationship-Based Access Control (ReBAC / Google Zanzibar)}
+final readonly class WebhookSignatureValidator {
+    private const int MAX_DRIFT_SEC = 300;
 
-Published by Google in 2019, **Zanzibar** models authorization as a Directed Acyclic Graph (DAG) of relationships. Permissions are expressed as relation tuples:
-$$\langle\text{object}\rangle \# \langle\text{relation}\rangle @ \langle\text{user / object\#relation}\rangle$$
-Example:
-\begin{lstlisting}[language=sh]
-document:quarterly_report#parent@folder:finance
-folder:finance#viewer@group:auditors#member
+    public function __construct(private string $webhookSecret) {}
+
+    public function validate(string $rawPayload, string $sigHeader, ?int $now = null): void {
+        $timestamp = null;
+        $signatures = [];
+        foreach (explode(',', $sigHeader) as $item) {
+            [$k, $v] = explode('=', trim($item), 2) + ['', ''];
+            if ($k === 't' \&\& ctype_digit($v)) {
+                $timestamp = (int) $v;
+            } elseif ($k === 'v1' \&\& $v !== '') {
+                $signatures[] = $v; // Preserve ALL v1 signatures during secret rotation
+            }
+        }
+        if ($timestamp === null || $signatures === []) {
+            throw new RuntimeException('Malformed signature header');
+        }
+        if (abs(($now ?? time()) - $timestamp) > self::MAX_DRIFT_SEC) {
+            throw new RuntimeException('Webhook timestamp outside 300s replay window');
+        }
+        $expected = hash_hmac('sha256', $timestamp . '.' . $rawPayload, $this->webhookSecret);
+        foreach ($signatures as $candidate) {
+            if (hash_equals($expected, $candidate)) {
+                return;
+            }
+        }
+        throw new RuntimeException('Invalid webhook signature');
+    }
+}
 \end{lstlisting}
-Authorization checks execute as high-speed graph traversals: ``Is Alice a viewer of Document 101?'' Zanzibar scales to millions of checks per second with sub-10ms latency across global datacenters.
+
+\textbf{Walkthrough:} Given 	exttt{t=1735689600,v1=deadbeef,v1=5257a8...}, lines 11--18 collect 	exttt{\$timestamp = 1735689600} and both candidate signatures in 	exttt{\$signatures}. Line 22 rejects replayed requests older (or newer) than 300 seconds. Line 25 computes 	exttt{HMAC-SHA256} over 	exttt{"1735689600." . \$rawPayload} (always verifying the exact raw request bytes, never re-serialized JSON!), and lines 26--30 check every 	exttt{v1} candidate via constant-time 	exttt{hash\_equals()}.
+
+\subsection{Atomic Redis Idempotency Locks}
+
+Even with valid signatures, network timeouts cause providers to deliver the same 	exttt{event\_id} twice. Use Redis's atomic 	exttt{SET key val NX EX ttl} command so only the first worker claims the event (and delete the key on transient enqueue failure so the provider's retry can succeed later):
+
+\begin{lstlisting}[language=PHP,caption={Atomic Redis Idempotency Guard}]
+final readonly class WebhookIdempotencyGuard {
+    public function __construct(private Redis $redis) {}
+
+    public function claim(string $eventId, int $ttlSeconds = 86400): bool {
+        $key = 'webhook:seen:' . $eventId;
+        // SET NX EX succeeds ONLY if key did not exist
+        return (bool) $this->redis->set($key, 'CLAIMED', ['NX', 'EX' => $ttlSeconds]);
+    }
+
+    public function releaseOnFailure(string $eventId): void {
+        $this->redis->del('webhook:seen:' . $eventId);
+    }
+}
+\end{lstlisting}
 
 % ==========================================
-\section{OWASP Top 10 Deep Dive: Injection, IDOR, and SSRF}
+\section{Access Control: RBAC, ABAC, and Zanzibar ReBAC}
+
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{RBAC (Role-Based):} 	exttt{User $\to$ Role $\to$ Permissions}. Simple, until contextual rules (	exttt{manager\_of\_department\_A}) trigger \textbf{Role Explosion}.
+  \item \textbf{ABAC (Attribute-Based):} Evaluates dynamic rules $P = f(\text{Subject}, \text{Resource}, \text{Action}, \text{Env})$, such as allowing medical reads only when 	exttt{user.dept == record.dept} during clinic hours.
+  \item \textbf{ReBAC (Google Zanzibar):} Models permissions as a graph of relation tuples $\langle\text{object}\rangle\#\langle\text{relation}\rangle@\langle\text{subject}\rangle$.
+\end{itemize}
+
+\textbf{Step-by-step Zanzibar graph walk:} Suppose Zanzibar stores three tuples:
+\begin{enumerate}[leftmargin=15pt]
+  \item 	exttt{document:q1\_report\#parent@folder:finance}
+  \item 	exttt{folder:finance\#viewer@group:auditors\#member}
+  \item 	exttt{group:auditors\#member@user:alice}
+\end{enumerate}
+To answer ``Can 	exttt{user:alice} view 	exttt{document:q1\_report}?'', Zanzibar walks backward from the target: 	exttt{document:q1\_report\#viewer} inherits from its 	exttt{parent} (	exttt{folder:finance}), whose 	exttt{viewer} relation points to 	exttt{group:auditors\#member}, which directly contains 	exttt{user:alice} $\rightarrow$ \textbf{ALLOW}.
+
+% ==========================================
+\section{OWASP Top 10: SQLi, IDOR, and SSRF with DNS Rebinding}
 
 \subsection{SQL Injection (SQLi) and Parameterized Queries}
-
-SQLi occurs when untrusted user input alters the syntactic structure of an SQL query:
-\begin{lstlisting}[language=PHP]
-// VULNERABLE: Direct string interpolation
-$sql = "SELECT * FROM users WHERE email = '" . $_POST['email'] . "'";
-\end{lstlisting}
-If input is \texttt{' OR '1'='1}, the parser parses \texttt{'1'='1'} as a boolean literal condition, bypassing authentication.
-
-\begin{underthehoodbox}[How Parameterized Queries Neutralize SQLi]
-When using parameterized queries (\texttt{PDO::prepare} or ORM bindings), the database engine compiles the SQL string into an execution tree **before** binding user values. The user input is transmitted over the wire protocol as raw data literals. Even if the input contains SQL syntax (\texttt{'; DROP TABLE users;--}), the database treats it strictly as literal string characters, never as executable instructions!
-\end{underthehoodbox}
+Concatenating 	exttt{\$email} directly into SQL lets input 	exttt{' OR '1'='1} rewrite query syntax. Parameterized queries (	exttt{PDO::prepare}, SQLAlchemy bind parameters) separate the compiled SQL query plan from literal parameter values on the wire protocol, making syntax injection impossible.
 
 \subsection{Insecure Direct Object References (IDOR)}
+An IDOR happens when 	exttt{GET /prescriptions/8451} checks only that the user is logged in, not that they own record 	exttt{8451}. Always scope ownership directly in the SQL predicate---including both the tenant/clinic ID and the authenticated patient's own ID:
 
-An IDOR occurs when an application exposes a direct reference to an internal database identifier (e.g., \texttt{GET /api/documents/8451}) without verifying that the authenticated user possesses authorization to access that specific entity.
-
-\subsubsection{Defensive Rule: Enforce Tenant and Owner Scoping in the Query}
-Never fetch an entity by ID alone and perform an authorization check in userland memory. Enforce ownership directly in the database query:
-\begin{lstlisting}[language=SQL]
--- SECURE: Query scopes access by authenticated user_id
-SELECT * FROM documents 
-WHERE id = :document_id 
-  AND organization_id = :auth_user_organization_id;
+\begin{lstlisting}[language=SQL,caption={Enforcing Both Tenant and Patient Ownership Against IDOR}]
+SELECT id, medication, dosage
+FROM prescriptions
+WHERE id = :prescription_id
+  AND organization_id = :auth_org_id
+  AND patient_id = :auth_patient_id;
 \end{lstlisting}
 
-\subsection{Server-Side Request Forgery (SSRF) and Cloud Metadata Exfiltration}
+\subsection{SSRF, DNS Rebinding TOCTOU, and AWS IMDSv2}
 
-SSRF occurs when an attacker tricks the server into making an outbound HTTP request to an unintended destination (e.g., an avatar image importer that fetches a user-supplied URL).
-
-In cloud environments (AWS, GCP, Azure), the internal **Instance Metadata Service (IMDS)** runs at the non-routable link-local IP address:
-$$\texttt{http://169.254.169.254/latest/meta-data/}$$
-An attacker supplying this URL can exfiltrate temporary IAM role credentials, gaining full control over the cloud environment!
+\textbf{Server-Side Request Forgery (SSRF)} lets an attacker supply a URL (such as an avatar importer) that tricks your backend into calling internal services, notably the cloud 	extbf{Instance Metadata Service (IMDS)} at 	exttt{http://169.254.169.254/latest/meta-data/} to steal temporary IAM role credentials.
 
 \begin{figure}[htbp]
 \centering
 \begin{tikzpicture}[
-  scale=0.9, transform shape,
-  node distance=0.8cm and 1.5cm,
-  box/.style={rectangle, draw=headingblue, fill=codebg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily},
-  accent/.style={rectangle, draw=warningRed, fill=warningBg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily\bfseries},
-  line/.style={draw=headingblue, -{Stealth[length=2.5mm]}, thick}
+  scale=0.86, transform shape,
+  node distance=0.8cm and 1.2cm,
+  box/.style={rectangle, draw=headingblue, fill=codebg, rounded corners=2pt, thick, align=center, inner sep=5pt, font=\small\sffamily},
+  accent/.style={rectangle, draw=warningRed, fill=warningBg, rounded corners=2pt, thick, align=center, inner sep=5pt, font=\small\sffamily\bfseries},
+  line/.style={draw=headingblue, -{Stealth[length=2.3mm]}, thick}
 ]
-  \node[box] (atk) {\textbf{Attacker}\\\small Supplies \texttt{avatar\_url = http://169.254.169.254/...}};
-  \node[box, right=of atk] (app) {\textbf{Application Server}\\\small Downloads URL without IP validation};
-  \node[accent, right=of app] (imds) {\textbf{Cloud IMDS}\\\small \texttt{169.254.169.254}\\Returns IAM Access Keys};
+  \node[box] (atk) {\textbf{Attacker}\\\small Supplies 	exttt{http://169.254.169.254/...}};
+  \node[box, right=of atk] (app) {\textbf{App Server}\\\small Fetches URL blindly};
+  \node[accent, right=of app] (imds) {\textbf{Cloud IMDS}\\\small 	exttt{169.254.169.254}\\Leaks IAM Credentials};
 
   \draw[line] (atk) -- node[above, font=\tiny\sffamily] {POST /avatar} (app);
   \draw[line, warningRed] (app) -- node[above, font=\tiny\sffamily] {Outbound GET} (imds);
-  \draw[line, warningRed] (imds) -- node[below, font=\tiny\sffamily] {AWS Secret Keys} (app);
-  \draw[line, warningRed] (app) -- node[below, font=\tiny\sffamily] {Leaked Credentials} (atk);
+  \draw[line, warningRed] (imds) -- node[below, font=\tiny\sffamily] {Temp Keys} (app);
+  \draw[line, warningRed] (app) -- node[below, font=\tiny\sffamily] {Exposed} (atk);
 \end{tikzpicture}
-\caption{SSRF attack chain targeting Cloud Instance Metadata Service (IMDS).}
-\label{fig:ssrf-imds}
+\caption{SSRF exfiltrating cloud credentials from IMDS.}
+\label{fig:v1-ch06-ssrf-imds}
 \end{figure}
 
-\subsubsection{SSRF Defenses}
+\subsubsection{Why Naive IP Checks Fail: DNS Rebinding TOCTOU}
+Checking 	exttt{socket.gethostbyname(host)} and then calling 	exttt{requests.get(url)} suffers a 	extbf{Time-of-Check to Time-of-Use (TOCTOU)} race: an attacker's DNS server with 	exttt{TTL=0} returns a public IP (	exttt{93.184.216.34}) during the check, and returns 	exttt{169.254.169.254} milliseconds later when 	exttt{requests.get()} resolves the hostname a second time!
+
+\textbf{Two-part defense:}
 \begin{enumerate}[leftmargin=15pt]
-  \item \textbf{Resolve and Validate IP Addresses:} Resolve the hostname via DNS, check that the IP does not belong to private/internal ranges (\texttt{10.0.0.0/8}, \texttt{172.16.0.0/12}, \texttt{192.168.0.0/16}, \texttt{127.0.0.0/8}, \texttt{169.254.169.254}), and open the socket directly to the validated IP.
-  \item \textbf{Enforce IMDSv2:} Enforce AWS IMDSv2, which mandates a session token obtained via a \texttt{PUT} request with a custom header (\texttt{X-aws-ec2-metadata-token}), neutralizing simple GET-based SSRF.
+  \item \textbf{Pin the Validated IP:} Resolve DNS once, block private/loopback/link-local CIDRs (	exttt{10.0.0.0/8}, 	exttt{172.16.0.0/12}, 	exttt{192.168.0.0/16}, 	exttt{127.0.0.0/8}, 	exttt{169.254.0.0/16}, IPv6 	exttt{::1}, 	exttt{fe80::/10}), disable HTTP redirects, and connect directly to the validated IP (passing the 	exttt{Host} header and SNI).
+  \item \textbf{Enforce AWS IMDSv2:} IMDSv2 blocks simple GET-based SSRF by requiring a session token obtained via a two-step exchange: first a 	exttt{PUT} to 	exttt{/latest/api/token} carrying header 	exttt{X-aws-ec2-metadata-token-ttl-seconds: 21600}, and then 	exttt{GET /latest/meta-data/...} carrying 	exttt{X-aws-ec2-metadata-token: <token>}.
 \end{enumerate}
 
+\begin{realworldbox}[Triaging a Multi-Bug Healthcare API Audit]
+\textbf{Symptom:} Penetration testers gain admin access on a staging portal, read arbitrary patients' lab PDFs, and print AWS IAM keys in error logs.
+
+\textbf{Diagnostic Steps:}
+\begin{enumerate}[leftmargin=15pt,itemsep=2pt]
+  \item Inspect JWT middleware logs: 	exttt{jwt.decode(tok, pub\_pem)} lacks 	exttt{algorithms=["RS256"]}, allowing HS256 key confusion.
+  \item Audit prescription SQL queries: 	exttt{WHERE id = :id} omits 	exttt{AND patient\_id = :auth\_patient\_id}.
+  \item Inspect 	exttt{curl} / HTTP client flags in avatar import: follows HTTP 302 redirects and resolves DNS twice, bypassing IP checks; enable IMDSv2 on EC2 instances immediately while pinning resolved IPs.
+\end{enumerate}
+\end{realworldbox}
+
+\begin{tryityourselfbox}[Spot the Bug in a Multi-	exttt{v1} Webhook Header]
+A Stripe webhook arrives with 	exttt{Stripe-Signature: t=1700000000,v1=old\_sig,v1=valid\_new\_sig}. What happens if your validator parses the header into a PHP associative array 	exttt{\$parts[\$k] = \$v} and checks only 	exttt{\$parts['v1']}? How does 	exttt{WebhookSignatureValidator} above avoid this?
+\end{tryityourselfbox}
+
 % ==========================================
-\section{Chapter Summary \& Key Takeaways}
+\section{Chapter Summary \protect\& Key Takeaways}
 
 \begin{itemize}[leftmargin=15pt]
-  \item \textbf{Argon2id Memory Hardness:} Neutralizes GPU/ASIC cracking rigs through tunable memory cost, time iterations, and parallelism. Replaces vulnerable bcrypt with its 72-byte truncation flaw.
-  \item \textbf{Session Hardening:} Regenerate session IDs on every privilege boundary. Enforce \texttt{HttpOnly}, \texttt{Secure}, \texttt{SameSite=Lax/Strict}, and the \texttt{\_\_Host-} prefix.
-  \item \textbf{JWT Pitfalls:} Never trust token headers to select cryptographic algorithms. Whitelist explicit algorithms to eliminate \texttt{alg: none} and RS256/HS256 key confusion exploits.
-  \item \textbf{OAuth 2.0 PKCE:} Deprecates Implicit Grants. Secures public and confidential clients using high-entropy \texttt{code\_verifier} strings and $S256$ SHA-256 challenges.
-  \item \textbf{Access Control Models:} Move beyond rigid RBAC to dynamic ABAC policies or relationship-driven Google Zanzibar graph models.
-  \item \textbf{OWASP Defensive Engineering:} Neutralize SQLi via parameterized query literals; eliminate IDOR via database-level ownership scoping; defeat SSRF via strict DNS resolution and link-local IP filtering.
+  \item \textbf{Crypto \& Passwords:} Never confuse Base64 encoding with encryption or SHA-256 with HMAC/signatures. Store passwords with memory-hard \textbf{Argon2id}.
+  \item \textbf{Sessions \& JWTs:} Regenerate session IDs on privilege changes; use 	exttt{HttpOnly}, 	exttt{Secure}, 	exttt{SameSite}, and 	exttt{\_\_Host-} cookies. Pin expected JWT algorithms server-side to block 	exttt{alg: none} and RS256/HS256 confusion.
+  \item \textbf{OAuth 2.0 \& Webhooks:} Public clients use Authorization Code + PKCE ($S256$). Webhook consumers verify raw payloads with constant-time 	exttt{hash\_equals()}, preserve all 	exttt{v1} rotation signatures, enforce $\pm 300\text{\,s}$ replay windows, and deduplicate atomically with Redis 	exttt{SET NX EX}.
+  \item \textbf{Access Control \& OWASP:} Use Zanzibar relation tuples for graph permissions, parameterized SQL for SQLi, query-level tenant+user scoping for IDOR, and single-resolution IP pinning + IMDSv2 for SSRF.
 \end{itemize}
 
 % ==========================================
 \section{Exercises and Real-World Scenarios}
 
 \subsection{Mechanics Exercises}
-\begin{enumerate}
-  \item \textbf{Exercise 6.1:} Given an RSA public key in PEM format, demonstrate how an attacker constructs a forged JWT with payload \texttt{\{"user": "admin"\}} using the RS256/HS256 key confusion attack in Python.
-  \item \textbf{Exercise 6.2:} Explain the exact difference between the \texttt{\_\_Secure-} cookie prefix and the \texttt{\_\_Host-} cookie prefix. Under what specific architectural scenario will a browser reject a \texttt{\_\_Host-} cookie?
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Exercise~\thechapter.1:} Given an RSA public key string in PEM format, show in Python how an attacker constructs a forged 	exttt{HS256} JWT with payload 	exttt{\{"user\_id": 1, "role": "admin"\}} using 	exttt{hmac} (and explain why PyJWT $\ge 2.4$ rejects passing a PEM string directly to 	exttt{jwt.encode(..., algorithm="HS256")}).
+  \item \textbf{Exercise~\thechapter.2:} Contrast 	exttt{\_\_Secure-} and 	exttt{\_\_Host-} cookie prefixes. Under what exact 	exttt{Set-Cookie} attribute will a browser silently discard a 	exttt{\_\_Host-} cookie?
 \end{enumerate}
 
-\subsection{Debugging Exercises}
-\begin{enumerate}
-  \item \textbf{Exercise 6.3:} A developer attempts to prevent SSRF in an image downloader using the following validation logic:
+\subsection{Debugging Exercise}
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Exercise~\thechapter.3:} Identify the TOCTOU vulnerability in this URL safety validator and trace how DNS Rebinding bypasses it:
 \begin{lstlisting}[language=Python]
 import socket
 from urllib.parse import urlparse
 
 def is_safe_url(url: str) -> bool:
-    hostname = urlparse(url).hostname
-    ip = socket.gethostbyname(hostname)
-    if ip.startswith("127.") or ip.startswith("169.254."):
-        return False
-    return True
-
-# If safe: requests.get(url)
+    ip = socket.gethostbyname(urlparse(url).hostname)
+    return not (ip.startswith("127.") or ip.startswith("169.254."))
+# Caller then runs: requests.get(url)
 \end{lstlisting}
-Identify the critical security vulnerability (hint: Time-of-Check to Time-of-Use) and demonstrate how an attacker bypasses this check using **DNS Rebinding**.
 \end{enumerate}
 
 \subsection{Architecture Design Problem}
-\begin{enumerate}
-  \item \textbf{Exercise 6.4:} Architect an enterprise-grade multi-tenant authorization gateway for a SaaS application. The system must support role hierarchies, fine-grained object ownership, tenant data isolation, and low-latency token revocation (under 500ms propagation) across 50 microservices.
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Exercise~\thechapter.4:} Architect a multi-tenant SaaS authorization and webhook gateway supporting fine-grained object ownership, sub-500\,ms token/session revocation across 50 microservices, and exactly-once inbound Stripe webhook ingestion.
 \end{enumerate}
 
 % ==========================================
 \section{Detailed Solutions}
 
-\subsection{Solution 6.1: RS256/HS256 Key Confusion Forgery}
-\begin{lstlisting}[language=Python]
-import jwt
+\subsection{Solution to Try It Yourself: Multi-	exttt{v1} Rotation Parsing}
+Storing 	exttt{\$parts[\$k] = \$v} overwrites 	exttt{\$parts['v1']} with the last 	exttt{v1} value---if Stripe emits the new valid signature first and the retiring signature second (or vice versa), half of rotations fail with 401! Collecting all 	exttt{v1} values into an array 	exttt{\$signatures[]} and returning as soon as any entry matches 	exttt{hash\_equals(\$expected, \$candidate)} guarantees zero-downtime secret rotation.
 
-# Attacker loads victim server's public key (retrieved from /.well-known/jwks.json)
-with open("server_public_key.pem", "r") as f:
+\subsection{Solution~\thechapter.1: RS256/HS256 Key Confusion Forgery in Python}
+Modern PyJWT ($\ge 2.4$) raises 	exttt{jwt.exceptions.InvalidKeyError} if you pass an asymmetric PEM header (	exttt{-----BEGIN PUBLIC KEY-----}) to 	exttt{jwt.encode(..., algorithm="HS256")} specifically to stop accidental misuse. An attacker forging a token against an unpatched/vulnerable server builds the Base64URL signing input and computes the raw HMAC-SHA256 bytes directly:
+\begin{lstlisting}[language=Python]
+import base64, hashlib, hmac, json
+
+def b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+with open("server_public_key.pem", "r", encoding="utf-8") as f:
     public_key_pem = f.read()
 
-# Forged administrative payload
-payload = {"user_id": 1, "role": "admin"}
+header = b64url(json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode())
+payload = b64url(json.dumps({"user_id": 1, "role": "admin"}, separators=(",", ":")).encode())
+signing_input = f"{header}.{payload}".encode("ascii")
 
-# Attacker signs token using HS256 with the PUBLIC key as HMAC secret!
-forged_token = jwt.encode(
-    payload,
-    key=public_key_pem, # Treated as raw HMAC secret string!
-    algorithm="HS256"
-)
+sig = b64url(hmac.new(public_key_pem.encode("utf-8"), signing_input, hashlib.sha256).digest())
+forged_jwt = f"{header}.{payload}.{sig}"
 \end{lstlisting}
 
-\subsection{Solution 6.2: Cookie Prefixes Comparison}
-\begin{itemize}[leftmargin=15pt]
-  \item \textbf{\texttt{\_\_Secure-}:} Requires the \texttt{Secure} flag and an HTTPS origin. May include a \texttt{Domain} attribute and arbitrary \texttt{Path}.
-  \item \textbf{\texttt{\_\_Host-}:} Strictly more secure. Requires \texttt{Secure}, HTTPS, must have \texttt{Path=/}, and **must NOT include a Domain attribute**. If an application attempts to set \texttt{Set-Cookie: \_\_Host-id=123; Domain=example.com; Secure; Path=/}, modern browsers **reject and discard the cookie entirely** because the \texttt{Domain} attribute would allow subdomains to manipulate it!
+\subsection{Solution~\thechapter.2: Cookie Prefixes}
+	exttt{\_\_Secure-} requires 	exttt{Secure} and HTTPS, while allowing 	exttt{Domain} and any 	exttt{Path}. 	exttt{\_\_Host-} requires 	exttt{Secure}, HTTPS, 	exttt{Path=/}, and \textbf{forbids any 	exttt{Domain} attribute}. Sending 	exttt{Set-Cookie: \_\_Host-sid=abc; Domain=example.com; Secure; Path=/} causes compliant browsers to reject and discard the cookie completely.
+
+\subsection{Solution~\thechapter.3: DNS Rebinding TOCTOU Exploit \protect\& Fix}
+\textbf{Diagnosis:} 	exttt{socket.gethostbyname()} resolves DNS during validation, and 	exttt{requests.get(url)} resolves DNS a second time later. With 	exttt{TTL=0}, an attacker's DNS server returns 	exttt{93.184.216.34} on query 1 (passing 	exttt{is\_safe\_url}) and 	exttt{169.254.169.254} on query 2 (hitting IMDS). Also, 	exttt{is\_safe\_url} misses 	exttt{10.0.0.0/8}, 	exttt{172.16.0.0/12}, 	exttt{192.168.0.0/16}, IPv6, and redirects.
+
+\textbf{Fix:} Resolve once with 	exttt{socket.getaddrinfo()}, verify every returned IP via Python's 	exttt{ipaddress.ip\_address(ip).is\_global} (rejecting private, loopback, and link-local ranges), disable automatic redirects, and open the TCP connection directly to that validated IP with the original 	exttt{Host} header.
+
+\subsection{Solution~\thechapter.4: Multi-Tenant Auth \protect\& Webhook Gateway Architecture}
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Short-Lived RS256 Access Tokens + Sub-500\,ms Revocation:} The Auth Gateway signs 5-minute 	exttt{RS256} JWTs containing 	exttt{sub}, 	exttt{tenant\_id}, and 	exttt{jti} (token ID). All 50 microservices pin 	exttt{algorithms=["RS256"]} using the gateway's public JWKS. When a user logs out or is suspended, the gateway writes 	exttt{SET revoked:<jti> 1 EX 300} in Redis and publishes 	exttt{jti} over Redis Pub/Sub so every microservice updates an in-memory revocation set within $<50\text{\,ms}$.
+  \item \textbf{Object Ownership \& Tenant Isolation:} Fine-grained sharing (	exttt{doc\#viewer@group\#member}) is checked against a Zanzibar-style ReBAC service; every SQL query still enforces 	exttt{WHERE tenant\_id = :jwt\_tenant\_id} (or PostgreSQL RLS with 	exttt{SET LOCAL}) as defense-in-depth.
+  \item \textbf{Exactly-Once Webhook Ingestion:} An edge receiver verifies multi-	exttt{v1} HMAC-SHA256 signatures via 	exttt{hash\_equals()} and checks $|t_{\text{now}} - t| \le 300\text{\,s}$, runs atomic 	exttt{SET webhook:seen:<event\_id> 1 NX EX 86400} in Redis, pushes the verified event onto a durable queue (releasing the Redis key only if enqueuing throws), and returns 	exttt{200 OK} within 50\,ms.
+\end{enumerate}
+
+\begin{labbridgebox}[Verify JWTs \& Webhooks Hands-On]
+\begin{itemize}[leftmargin=15pt,itemsep=2pt]
+  \item 	exttt{exercises/volume1/ex05\_jwt\_timing\_safe\_verifier.py}: Inspect constant-time HMAC comparison (	exttt{hmac.compare\_digest}) and strict 	exttt{alg} enforcement.
+  \item 	exttt{projects/p02-php-webhook-receiver/}: Trace 	exttt{SignatureVerifier.php}, 	exttt{RedisIdempotencyLock.php}, and 	exttt{WebhookReceiver.php}.
+  \item 	exttt{projects/p03-python-fastapi-api/app/auth.py}: Inspect OAuth2 Bearer JWT verification and scope enforcement in FastAPI.
 \end{itemize}
+\end{labbridgebox}
 
-\subsection{Solution 6.3: DNS Rebinding SSRF Exploit}
-\textbf{Diagnosis:} The code suffers from a **Time-of-Check to Time-of-Use (TOCTOU)** race condition. It performs DNS resolution during \texttt{socket.gethostbyname(hostname)}, but \texttt{requests.get(url)} performs a **second independent DNS lookup** moments later!
-
-\textbf{Exploit:} The attacker configures a custom DNS server with a TTL of 0 seconds. On the first DNS query (\texttt{is\_safe\_url}), the server returns a benign public IP (\texttt{93.184.216.34}). On the second DNS query executed by \texttt{requests.get()}, the server returns \texttt{169.254.169.254}. The check passes, but the request hits the cloud metadata service!
-
-\textbf{Remedy:} Resolve the IP once, validate it against all private/link-local ranges, and make the HTTP connection directly to that specific IP address, passing the original hostname inside the HTTP \texttt{Host} header.
-
-\subsection{Solution 6.4: SaaS Authorization Gateway Architecture}
-See Section 6.5 and Section 6.2. Microservices validate short-lived (5-minute) asymmetric JWTs issued by the Auth Gateway. For immediate revocation, the gateway publishes revocation events to a Redis Pub/Sub channel connected to all microservice nodes, updating an in-memory token blacklist filter. All database queries enforce tenant isolation at the SQL query level (\texttt{WHERE tenant\_id = :tenant\_id}).
-
-% ==========================================
-\section{Further Reading \& Citations}
-
-\begin{itemize}[leftmargin=15pt]
-  \item Biryukov, A., Dinu, D., \& Khovratovich, D. (2016). \textit{Argon2: New Generation of Memory-Hard Functions for Password Hashing and Other Applications}. RFC 9106.
-  \item Jones, M., Bradley, J., \& Sakimura, N. (2015). \textit{JSON Web Token (JWT)}. RFC 7519.
-  \item Sakimura, N., et al. (2015). \textit{Proof Key for Code Exchange by OAuth Public Clients (PKCE)}. RFC 7636.
-  \item Pang, R., et al. (2019). \textit{Zanzibar: Google's Consistent, Global Authorization System}. USENIX ATC.
-  \item OWASP Foundation. (2021). \textit{OWASP Top 10: 2021 The Ten Most Critical Web Application Security Risks}. \url{https://owasp.org/Top10/}
-\end{itemize}
+\section*{Further Reading}
+See RFC 7519 (JWT) \cite{rfc7519}, RFC 7636 (PKCE) \cite{rfc7636}, and Shostack's \textit{Threat Modeling} \cite{shostack2014threat}.

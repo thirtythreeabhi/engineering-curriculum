@@ -1,27 +1,107 @@
 \documentclass[11pt,oneside]{book}
 \input{../common/preamble.tex}
 
-\title{\Huge\sffamily\bfseries Software Architecture and Engineering Economics\\[14pt]
-\Large\sffamily System Modeling, Design Documents, Threat Analysis, Reliability Engineering, and Cloud FinOps}
-\author{\sffamily Modern Engineering Curriculum --- Volume V}
-\date{\sffamily 2026 Edition}
-
 \begin{document}
 \frontmatter
-\maketitle
 
+% Title Page
+\begin{titlepage}
+\begin{center}
+  \vspace*{2.0cm}
+  {\Huge\sffamily\bfseries\color{headingblue} Software Architecture\\and Engineering Economics}\\[14pt]
+  {\Large\sffamily\color{gray} Requirements, System Modeling, Threat Analysis, Reliability, Design Governance, and AI FinOps}\\[24pt]
+  {\normalsize\sffamily\scshape Volume V of the Modern Engineering Curriculum}\\[30pt]
+  \hrule height 1.2pt
+  \vspace*{30pt}
+
+  {\large\sffamily\bfseries Modern Engineering Curriculum Initiative}\\[10pt]
+  {\small\sffamily First-Principles Architecture and Production Economics for Software Engineers}
+
+  \vfill
+
+  \begin{tcolorbox}[
+    enhanced,
+    colback=white,
+    colframe=gray!30!white,
+    boxrule=0.8pt,
+    arc=2pt,
+    left=15pt,right=15pt,top=12pt,bottom=12pt
+  ]
+  \sffamily\footnotesize\centering
+  \textbf{Volume V Overview: From Ambiguous Business Goals to Sustainable Production Systems}\\
+  Synthesizing FURPS+ Requirements, C4 Architecture Modeling, UML Sequence Concurrency,\\
+  STRIDE Threat Modeling, SRE Error Budgets, Architecture Decision Records, Technical Design Documents,\\
+  Cloud FinOps (AWS \& Azure), and LLM Inference Economics.
+  \end{tcolorbox}
+
+  \vspace*{1.5cm}
+\end{center}
+\end{titlepage}
+
+% Copyright Page
+\newpage
+\thispagestyle{empty}
+\vspace*{\fill}
+\begin{minipage}{\textwidth}
+\sffamily\footnotesize\color{gray!80!black}
+\textbf{Modern Engineering Curriculum: Volume V -- Software Architecture and Engineering Economics}\\
+\copyright\ 2026 Modern Engineering Curriculum Initiative. All rights reserved.\\[10pt]
+Published in the United States of America.\\[10pt]
+\textbf{Colophon:} Typeset in \LaTeX\ using Bitstream Charter, Helvetica, and Courier typefaces.
+All Python examples and mathematical models in this volume are self-contained and verified against Python 3.\\[10pt]
+\textbf{Edition:} November 2026
+\end{minipage}
+
+% Table of Contents
+\newpage
+\pagestyle{fancy}
 \tableofcontents
+
+% Preface
+\newpage
+\chapter*{Preface}
+\addcontentsline{toc}{chapter}{Preface}
+
+Welcome to \textbf{Volume V: Software Architecture and Engineering Economics}, the capstone synthesis of the \emph{Modern Engineering Curriculum}.
+
+If you have previously coordinated software projects---writing feature specifications, reviewing pull requests, debugging integrations, or managing cloud deployments---you have already felt the tension between moving quickly and building systems that survive real traffic. Modern tools can generate boilerplate code in seconds, but they cannot decide what guarantees a system must uphold, where security boundaries belong, how much downtime a business can afford, or why a dedicated GPU cluster might quietly cost ten times more than an API endpoint.
+
+\section*{How This Volume Teaches}
+Every chapter in Volume V builds from first principles:
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Problem Before Notation:} We never drop a diagramming standard, threat matrix, or equation cold. We start with a concrete failure---an oversold ticket flash sale, a silent 1.8\% error leak, or an OOM-crashing language model---and derive the engineering tool needed to diagnose and prevent it.
+  \item \textbf{No Assumed Specialist Prerequisites:} Whenever a topic touches database locks, TLS, Prometheus counters, Kubernetes cgroups, or Transformer attention, the chapter builds the exact mental model and small numerical trace you need right on the page.
+  \item \textbf{Step-by-Step Verification:} Every non-trivial code listing, PromQL rule, DSL model, and cost calculation is walked through line by line on concrete inputs.
+\end{enumerate}
+
+\section*{The Nine-Chapter Progression}
+The chapters are ordered to mirror how real systems are conceived, verified, governed, and funded:
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{Chapter 1: Requirements Engineering} -- Translating vague stakeholder wishes into testable FURPS+ constraints, discrete latency histograms, availability nines, Little's Law concurrency bounds, and RPO/RTO recovery targets.
+  \item \textbf{Chapter 2: C4 Architecture Modeling} -- Zooming cleanly across System Context, Containers, Components, and Code, plus Architecture-as-Code with Structurizr DSL.
+  \item \textbf{Chapter 3: UML and Sequence Diagrams} -- Tracing time, synchronous vs.\ asynchronous calls, combined fragments, concurrency races, and OAuth 2.0 PKCE flows.
+  \item \textbf{Chapter 4: Threat Modeling} -- Drawing Data Flow Diagrams and trust boundaries, applying STRIDE-per-Element, mapping cryptographic mitigations, and automating checks in code.
+  \item \textbf{Chapter 5: SLOs, SLIs, and SLAs} -- Building Prometheus counters and \texttt{rate()} mechanics from scratch, formulating valid availability SLIs, deriving error budget burn rates, and replacing noisy alerts.
+  \item \textbf{Chapter 6: Architecture Decision Records} -- Preserving architectural rationale in Git with Nygard/MADR records, superseding chains, PostgreSQL RLS pooling rules, and AST fitness tests.
+  \item \textbf{Chapter 7: Technical Design Documents} -- Synthesizing Chapters 1--6 in one end-to-end mini-TDD walkthrough, including \texttt{ALTER TABLE} lock safety, Expand-and-Contract migrations, and FMEA.
+  \item \textbf{Chapter 8: Cloud FinOps and Engineering Economics} -- Bridging Azure and AWS cost primitives, unit economics, Savings Plan break-even math, Spot resilience, S3/Blob lifecycles, and Kubernetes bin-packing.
+  \item \textbf{Chapter 9: AI Inference Economics and Cost Optimization} -- Explaining GPU memory hierarchies, floating-point formats, and Transformer KV caches from first principles before applying the Roofline model, PagedAttention, continuous batching, and realistic utilization break-even math.
+\end{itemize}
+
+\begin{labbridgebox}[Companion Exercises and Capstone Project]
+Every chapter ends with a bridge to the hands-on Python exercises in \texttt{exercises/volume5/} (\texttt{ex01\_slo\_error\_budget\_burn.py} through \texttt{ex04\_cloud\_finops\_optimizer.py}) and the multi-service reference platform in \texttt{projects/p12-end-to-end-platform/}.
+\end{labbridgebox}
 
 \mainmatter
 
-\include{ch01-c4-architecture}
-\include{ch02-uml-sequence}
-\include{ch03-technical-design-docs}
-\include{ch04-adrs}
-\include{ch05-requirements-engineering}
-\include{ch06-threat-modeling}
-\include{ch07-slos-slis-slas}
-\include{ch08-finops}
-\include{ch09-ai-inference-economics}
+\input{ch01-requirements-engineering.tex}
+\input{ch02-c4-architecture.tex}
+\input{ch03-uml-sequence.tex}
+\input{ch04-threat-modeling.tex}
+\input{ch05-slos-slis-slas.tex}
+\input{ch06-adrs.tex}
+\input{ch07-technical-design-docs.tex}
+\input{ch08-finops.tex}
+\input{ch09-ai-inference-economics.tex}
 
 \end{document}

@@ -35,6 +35,23 @@ final class PdoConnection implements ConnectionInterface
 
     public function beginTransaction(?IsolationLevel $level = null): bool
     {
+        $driver = strtolower((string)$this->pdo->getAttribute(\PDO::ATTR_DRIVER_NAME));
+
+        if ($driver === 'pgsql') {
+            // PostgreSQL requires SET TRANSACTION ISOLATION LEVEL *after* BEGIN inside the tx block.
+            $started = $this->pdo->beginTransaction();
+            if ($started && $level !== null) {
+                $this->pdo->exec("SET TRANSACTION ISOLATION LEVEL {$level->value}");
+            }
+            return $started;
+        }
+
+        if ($driver === 'sqlite') {
+            // SQLite uses file-level locking and does not support SET TRANSACTION ISOLATION LEVEL.
+            return $this->pdo->beginTransaction();
+        }
+
+        // MySQL / MariaDB / ANSI SQL apply SET TRANSACTION to the upcoming transaction.
         if ($level !== null) {
             $this->pdo->exec("SET TRANSACTION ISOLATION LEVEL {$level->value}");
         }

@@ -1,0 +1,351 @@
+\chapter{Kubernetes Internals: Control Plane, Networking, Storage, and Autoscaling}
+\label{chap:kubernetes}
+
+\begin{chaptergoalsbox}
+\textbf{What You Will Learn:}
+\begin{itemize}[leftmargin=12pt]
+  \item End-to-end control-plane reconciliation from \texttt{kubectl apply} through \texttt{kube-apiserver}, \texttt{etcd} (Raft quorum \& MVCC), \texttt{kube-scheduler}, and \texttt{kubelet} (\texttt{syncLoop} and PLEG).
+  \item CNI networking internals: why every Pod gets a unique IP, \texttt{veth} pairs, Services (\texttt{ClusterIP}/\texttt{kube-proxy} DNAT), and L7 Ingress controllers.
+  \item Persistent storage via the Container Storage Interface (CSI): \texttt{StorageClass}, \texttt{PVC}/\texttt{PV} binding, CSI Controller vs.\ Node plugins, and \texttt{RWO} vs.\ \texttt{RWX}.
+  \item Pod \texttt{requests}/\texttt{limits}, Quality of Service (QoS) classes, and autoscaling with HPA and KEDA.
+  \item Node-level failure diagnosis using \texttt{iostat}, \texttt{crictl}, Linux \texttt{D}-state processes, and \texttt{cgroups v2} Pressure Stall Information (\texttt{memory.pressure}).
+\end{itemize}
+
+\textbf{What You Should Already Understand:}
+\begin{itemize}[leftmargin=12pt]
+  \item IPv4/CIDR, Layer-3/4/7 routing, and NAT (covered in Chapter~\ref{chap:azure-fundamentals}).
+  \item Linux namespaces, \texttt{cgroups v2}, \texttt{overlay2}, and \texttt{containerd}/\texttt{runc} (covered in Chapter~\ref{chap:containers}).
+\end{itemize}
+
+\textbf{Why This Topic Exists:}
+On a single server, you run \texttt{docker run} and hope the machine never dies. Across ten or a thousand servers, you need a distributed control loop that places containers onto healthy machines, wires up private IPs across nodes, reattaches disks after crashes, and scales replicas automatically. When a Pod hangs in \texttt{ContainerCreating} or a worker node flips to \texttt{NotReady}, knowing the exact components inside that loop is the only way to pinpoint whether the fault lies in \texttt{etcd}, the scheduler, CNI, CSI, or \texttt{containerd}.
+
+\textbf{Motivating Practical Problem:}
+You deploy a stateful order-ledger service with \texttt{kubectl apply -f order-ledger.yaml}. Moments later, two replicas are serving HTTP traffic behind a single stable virtual IP, a third replica hangs in \texttt{ContainerCreating} waiting on a cloud disk attachment, and one worker node drops to \texttt{NotReady} with \texttt{PLEG is not healthy}. How did the control plane schedule, wire, and mount the healthy Pods—and how do you isolate why the third Pod and worker node stalled?
+\end{chaptergoalsbox}
+
+\section{The Control Plane Reconciliation Loop}
+
+Kubernetes is not a script runner that executes commands once and forgets them; it is a 	extbf{state reconciliation machine}. You declare your *desired state* (for example, ``keep 3 replicas of \texttt{order-ledger} running''), and asynchronous controllers continuously watch the *actual state* and nudge the cluster until reality matches your declaration.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.86, every node/.style={scale=0.86},
+  node distance=0.8cm and 1.1cm,
+  cli/.style={rectangle, draw=gray!70, fill=gray!10, rounded corners=2pt, text width=2.4cm, minimum height=0.9cm, align=center, font=\sffamily\scriptsize\bfseries},
+  api/.style={rectangle, draw=headingblue, fill=headingblue!10, rounded corners=2pt, text width=3.2cm, minimum height=1.1cm, align=center, font=\sffamily\scriptsize\bfseries},
+  etcd/.style={cylinder, draw=intuitionTeal, fill=intuitionBg, shape border rotate=90, minimum height=1.6cm, minimum width=2.3cm, aspect=0.25, align=center, font=\sffamily\scriptsize\bfseries},
+  ctrl/.style={rectangle, draw=exampleBlue, fill=exampleBg, rounded corners=2pt, text width=3.1cm, minimum height=0.9cm, align=center, font=\sffamily\scriptsize\bfseries},
+  node/.style={rectangle, draw=warningRed, fill=warningBg, rounded corners=2pt, text width=3.1cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  arrow/.style={-{Stealth[scale=0.85]}, thick, color=headingblue}
+]
+\node[cli] (kubectl) {\texttt{kubectl apply}};
+\node[api, right=1.3cm of kubectl] (apiserver) {\texttt{kube-apiserver}\\AuthN $\to$ AuthZ $\to$ Admission};
+\node[etcd, right=1.4cm of apiserver] (etcd) {\texttt{etcd}\\(Raft + MVCC)};
+
+\node[ctrl, below left=1.4cm and -0.4cm of apiserver] (cm) {\texttt{kube-controller-mgr}\\Creates ReplicaSet + Pods};
+\node[ctrl, below right=1.4cm and -0.4cm of apiserver] (sched) {\texttt{kube-scheduler}\\Filter $\to$ Score $\to$ Bind};
+
+\node[node, below=1.4cm of sched] (kubelet) {\texttt{kubelet} (Worker Node)\\\texttt{syncLoop} + PLEG};
+\node[cli, left=1.4cm of kubelet] (cri) {\texttt{containerd} (CRI)\\+ CNI + CSI};
+
+\draw[arrow] (kubectl) -- node[above, font=\tiny\sffamily]{1. HTTPS} (apiserver);
+\draw[arrow, <->] (apiserver) -- node[above, font=\tiny\sffamily]{2. Commit / Watch} (etcd);
+\draw[arrow, <->] (apiserver) -- node[left, font=\tiny\sffamily]{3. Watch / Create Pods} (cm);
+\draw[arrow, <->] (apiserver) -- node[right, font=\tiny\sffamily]{4. Bind \texttt{nodeName}} (sched);
+\draw[arrow] (apiserver) to [bend left=22] node[right, font=\tiny\sffamily]{5. Pod Watch} (kubelet);
+\draw[arrow] (kubelet) -- node[above, font=\tiny\sffamily]{6. gRPC CRI} (cri);
+\end{tikzpicture}
+\caption{End-to-End Kubernetes Control Plane Reconciliation Flow}
+\label{fig:v3-ch03-control-plane}
+\end{figure}
+
+Trace what happens step by step when you run \texttt{kubectl apply -f deployment.yaml} (Figure~\ref{fig:v3-ch03-control-plane}):
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{\texttt{kube-apiserver} Admission Pipeline:} \texttt{kube-apiserver} is the *only* component allowed to talk to \texttt{etcd}. Every request passes through six gates in order:
+  \begin{enumerate}[label=\alph*., leftmargin=12pt]
+    \item \emph{Authentication:} Verifies identity via X.509 client certificates, Bearer tokens, or OIDC JWTs.
+    \item \emph{Authorization (RBAC):} Checks $\langle \text{Subject}, \text{Verb}, \text{Resource}, \text{Namespace} \rangle$.
+    \item \emph{Mutating Admission Webhooks:} Controllers that modify the incoming YAML before storage (for example, injecting an Envoy sidecar).
+    \item \emph{Schema Validation:} Confirms fields match the OpenAPI/CRD schema.
+    \item \emph{Validating Admission Webhooks:} Policy engines (such as Kyverno in Chapter~\ref{chap:devsecops}) reject non-compliant Pods (for example, unsigned images or missing memory limits).
+    \item \emph{Persistence:} Writes the accepted \texttt{Deployment} object into \texttt{etcd}.
+  \end{enumerate}
+  \item \textbf{\texttt{etcd} (Raft Consensus \& MVCC):} \texttt{etcd} is a strongly consistent key-value store running the \textbf{Raft} consensus protocol across an odd number of nodes $N$ (typically 3 or 5). A write commits only after a strict majority quorum acknowledges it:
+  \begin{equation}
+  Q = \left\lfloor \frac{N}{2} \right\rfloor + 1
+  \end{equation}
+  So a 3-node \texttt{etcd} cluster tolerates 1 failure ($Q=2$); a 5-node cluster tolerates 2 ($Q=3$). Internally, \texttt{etcd} uses 	extbf{Multi-Version Concurrency Control (MVCC)}: every write increments a global 64-bit revision number rather than overwriting old data in place. That revision number lets \texttt{kube-apiserver} stream live Watch events over HTTP/2 gRPC starting from any past revision without locking reads.
+  \item \textbf{\texttt{kube-controller-manager}:} Watching \texttt{kube-apiserver}, the Deployment controller sees the new Deployment and creates a \texttt{ReplicaSet}; the ReplicaSet controller creates three \texttt{Pod} objects with \texttt{spec.nodeName} initially empty.
+  \item \textbf{\texttt{kube-scheduler}:} Watches for unscheduled Pods and places each one onto a worker node in two phases:
+  \begin{itemize}[leftmargin=10pt]
+    \item \emph{Filtering (Predicates):} Drops unqualified nodes using hard constraints: \texttt{NodeResourcesFit} (enough unreserved CPU/memory for the Pod's \texttt{requests}), \texttt{NodePorts}, \texttt{NodeAffinity}/\texttt{PodTopologySpread}, and \texttt{TaintsAndTolerations}.
+    \item \emph{Scoring (Priorities):} Grades surviving nodes from 0 to 100 using plugins like \texttt{NodeResourcesBalancedAllocation} (prefers balanced CPU/RAM usage) and \texttt{ImageLocality} (prefers nodes that already cached the container image layers). The top-scoring node receives a \texttt{Binding} write setting \texttt{spec.nodeName}.
+  \end{itemize}
+  \item \textbf{\texttt{kubelet} (\texttt{syncLoop} \& PLEG):} On the chosen worker node, \texttt{kubelet} runs an infinite \texttt{syncLoop} listening to three inputs: API Pod assignments (Config channel), static manifests in \texttt{/etc/kubernetes/manifests} (File channel), and the 	extbf{Pod Lifecycle Event Generator (PLEG)}. Once assigned a Pod, \texttt{kubelet} invokes \texttt{containerd} over the 	extbf{Container Runtime Interface (CRI)} gRPC socket (\texttt{RunPodSandbox}, then \texttt{CreateContainer} and \texttt{StartContainer}).
+\end{enumerate}
+
+\begin{underthehoodbox}[How PLEG Works---and Why It Triggers \texttt{NotReady}]
+Early Kubernetes polled \texttt{containerd} individually for every single container every second, creating an $O(N)$ CPU storm on dense nodes. PLEG replaced that with a single periodic relist loop: roughly once per second, PLEG asks \texttt{containerd} over CRI for the list of all containers on the node, diffs it against PLEG's in-memory cache, and emits events (\texttt{ContainerStarted}, \texttt{ContainerDied}). If \texttt{containerd} or \texttt{overlay2} hangs on slow disk I/O or a stalled network storage driver, the relist call blocks. After 3 minutes without a completed relist, \texttt{kubelet} reports \texttt{PLEG is not healthy} and the control plane flips the node to \texttt{NotReady}.
+\end{underthehoodbox}
+
+\subsection{Node Diagnostic Tooling Primer}
+Before debugging a stuck node or Pod, know the four Linux tools platform engineers reach for first:
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{\texttt{iostat -xz 1 5}:} Prints per-disk I/O statistics every second. Watch \texttt{\%util} (near 100\% means disk saturation) and \texttt{await} (average I/O wait in milliseconds; jumping from 2\,ms to 500\,ms stalls \texttt{overlay2}).
+  \item \textbf{\texttt{crictl --runtime-endpoint unix:///run/containerd/containerd.sock ps}:} Talks directly to \texttt{containerd} over CRI, bypassing \texttt{kubelet}. If \texttt{crictl ps} itself hangs, the bottleneck is inside \texttt{containerd} or kernel I/O, not \texttt{kubelet}.
+  \item \textbf{\texttt{D}-state processes (\texttt{ps aux | awk '\$8 \textasciitilde{} /D/'}):} In Linux, state \texttt{D} means *uninterruptible sleep*---a thread waiting inside a kernel disk or NFS/CSI I/O call that cannot even be killed with \texttt{kill -9} until the storage driver unblocks.
+  \item \textbf{PSI \texttt{memory.pressure} (\texttt{/sys/fs/cgroup/memory.pressure}):} Linux Pressure Stall Information reports the percentage of time tasks stalled waiting for memory reclaim (\texttt{some} vs.\ \texttt{full}). Rising \texttt{full} values above 20--30\% mean thrashing is starving \texttt{kubelet} and \texttt{containerd} of CPU time.
+\end{itemize}
+
+\section{Kubernetes Networking: CNI, Services, and Ingress}
+
+In Chapter~\ref{chap:containers}, we saw that every container receives an isolated \texttt{NET} namespace. If Pod~A runs on Worker Node~1 and Pod~B runs on Worker Node~2, how do they talk?
+
+\begin{intuitionbox}[The Kubernetes Network Model Contract]
+Kubernetes forbids port-mapping hacks like Docker's \texttt{-p 8081:80}. Instead, it enforces one strict contract: 	extbf{every Pod gets its own cluster-routable IP address, and any Pod on any node can reach any other Pod's IP directly without NAT.}
+\end{intuitionbox}
+
+\subsection{How CNI Wires a Pod: \texttt{veth} Pairs and IPAM}
+When \texttt{kubelet} starts a Pod, \texttt{containerd} first launches a tiny \texttt{pause} container solely to hold open the Pod's shared \texttt{NET} namespace, then invokes a 	extbf{Container Network Interface (CNI)} plugin binary (such as Azure CNI, Calico, or Cilium) in \texttt{/opt/cni/bin/}. To connect the isolated Pod namespace to the host node's root network stack, CNI creates a 	extbf{\texttt{veth} (virtual Ethernet) pair}---think of a virtual patch cable with two ends:
+\begin{enumerate}[leftmargin=15pt]
+  \item One end (\texttt{eth0}) is moved inside the Pod's \texttt{NET} namespace and assigned a Pod IP from the CNI's IP Address Management (IPAM) pool (e.g., \texttt{10.244.1.5}).
+  \item The other end (\texttt{veth8a3f}) stays in the host's root \texttt{NET} namespace, plugged into a Linux bridge (e.g., \texttt{cbr0}) or routed directly via host eBPF/routing tables.
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.86, every node/.style={scale=0.86},
+  node distance=0.8cm and 1.2cm,
+  nodebox/.style={rectangle, draw=headingblue!60, fill=headingblue!3, dashed, rounded corners=4pt, inner sep=10pt, minimum width=5.6cm, minimum height=3.8cm},
+  pod/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, text width=4.6cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  hostnet/.style={rectangle, draw=exampleBlue, fill=exampleBg, rounded corners=2pt, text width=4.6cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  arrow/.style={-{Stealth[scale=0.85]}, thick, color=headingblue}
+]
+\node[nodebox] (n1) {};
+\node[above=0.1cm of n1.north, font=\sffamily\footnotesize\bfseries\color{headingblue}] {Worker Node 1 (\texttt{10.0.1.10})};
+\node[pod] at ($(n1.north)+(0,-0.95)$) (p1) {Pod A (\texttt{NET} NS)\\\texttt{eth0: 10.244.1.5}};
+\node[hostnet] at ($(n1.south)+(0,0.95)$) (h1) {Host Root \texttt{NET} NS\\\texttt{veth8a3f} $\to$ CNI Bridge / VNet Route};
+
+\node[nodebox, right=1.6cm of n1] (n2) {};
+\node[above=0.1cm of n2.north, font=\sffamily\footnotesize\bfseries\color{headingblue}] {Worker Node 2 (\texttt{10.0.1.11})};
+\node[pod] at ($(n2.north)+(0,-0.95)$) (p2) {Pod B (\texttt{NET} NS)\\\texttt{eth0: 10.244.2.8}};
+\node[hostnet] at ($(n2.south)+(0,0.95)$) (h2) {Host Root \texttt{NET} NS\\\texttt{vethc21b} $\to$ CNI Bridge / VNet Route};
+
+\draw[arrow, <->] (p1) -- node[right, font=\tiny\sffamily]{\texttt{veth} pair} (h1);
+\draw[arrow, <->] (h1) -- node[above, font=\tiny\sffamily]{Overlay (VXLAN) or Azure VNet Direct} (h2);
+\draw[arrow, <->] (h2) -- node[right, font=\tiny\sffamily]{\texttt{veth} pair} (p2);
+\end{tikzpicture}
+\caption{CNI Pod-to-Pod Packet Flow Across Worker Nodes via \texttt{veth} Pairs}
+\label{fig:v3-ch03-cni-veth}
+\end{figure}
+
+In 	extbf{overlay CNI} mode (e.g., Flannel/Calico VXLAN), Node~1 wraps Pod~A's packet inside a UDP packet addressed to Node~2's VM IP. In 	extbf{Azure CNI} mode, every Pod receives a real IP from the Azure VNet subnet directly, so Azure's VFP fabric routes Pod-to-Pod packets across nodes with zero overlay encapsulation overhead.
+
+\subsection{Services, \texttt{EndpointSlice}, and \texttt{kube-proxy}}
+Pod IPs are ephemeral: whenever a Pod crashes or scales, the replacement gets a brand-new IP. A Kubernetes 	extbf{\texttt{Service}} provides a stable DNS name (e.g., \texttt{order-ledger.prod.svc.cluster.local}) and a virtual IP called a 	extbf{\texttt{ClusterIP}} (e.g., \texttt{10.96.40.12}) that never changes.
+
+No real network card holds \texttt{10.96.40.12}. Instead:
+\begin{enumerate}[leftmargin=15pt]
+  \item A control-plane controller watches Pod labels and readiness probes, maintaining an 	extbf{`EndpointSlice`} list of healthy backend Pod IPs (e.g., \texttt{10.244.1.5:8080}, \texttt{10.244.2.8:8080}).
+  \item On every node, 	extbf{`kube-proxy`} (or an eBPF dataplane like Cilium) watches `EndpointSlice` updates and programs Linux kernel 	extbf{`iptables` or `IPVS` DNAT rules}. When a client sends a packet to \texttt{10.96.40.12:80}, the kernel intercepts it before leaving the node and rewrites the destination IP/port via DNAT straight to one of the healthy Pod IPs at random.
+\end{enumerate}
+Building on \texttt{ClusterIP}, 	extbf{`NodePort`} opens a static high port (`30000--32767`) on every node's VM IP forwarding into the \texttt{ClusterIP}, and 	extbf{`LoadBalancer`} provisions an external cloud load balancer (such as Azure Load Balancer) targeting those `NodePort`s or Pod IPs directly.
+
+\subsection{Ingress Controllers (Layer 7 Routing)}
+Services operate at Layer 4 (IP and TCP/UDP port); they cannot inspect HTTP paths (\texttt{/v1/orders} vs.\ \texttt{/v1/health}) or terminate TLS certificates for multiple hostnames on port 443. An 	extbf{Ingress} resource (or the newer 	extbf{Gateway API}) configures an in-cluster Layer-7 reverse proxy—an 	extbf{Ingress Controller} such as NGINX or Envoy. Rather than bouncing through \texttt{kube-proxy}'s `iptables` DNAT, the Ingress Controller watches `EndpointSlice` directly and forwards decrypted HTTP requests straight to healthy Pod IPs.
+
+\section{Stateful Workloads and CSI Storage}
+
+Container \texttt{overlay2} layers vanish when a Pod dies. Databases and message queues need persistent disks that outlive individual Pods and reattach across nodes.
+
+\subsection{\texttt{StorageClass}, \texttt{PVC}, \texttt{PV}, and CSI Plugins}
+Kubernetes decouples storage requests from underlying cloud APIs using three objects and the 	extbf{Container Storage Interface (CSI)}:
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{\texttt{StorageClass}:} Cluster admin template naming a CSI driver and disk tier (e.g., \texttt{disk.csi.azure.com} with \texttt{Premium\_LRS} SSDs).
+  \item \textbf{\texttt{PersistentVolumeClaim} (PVC):} A developer's request for size and access mode—for example, 50\,GiB \texttt{ReadWriteOnce} (\textbf{RWO}: mounted read-write on one node at a time, typical for block disks like Azure Disk) vs.\ \texttt{ReadWriteMany} (\textbf{RWX}: mounted concurrently on many nodes, typical for network filesystems like Azure Files).
+  \item \textbf{\texttt{PersistentVolume} (PV):} The cluster-wide resource representing the provisioned cloud volume bound 1-to-1 to the PVC.
+\end{itemize}
+
+Internally, a CSI driver splits into two gRPC services:
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{CSI Controller Plugin:} Runs as a Deployment in the control plane; calls cloud APIs (\texttt{CreateVolume}, then \texttt{ControllerPublishVolume} to attach the cloud block disk to the target VM node).
+  \item \textbf{CSI Node Plugin:} Runs as a DaemonSet on every worker node; formats the newly attached Linux block device (\texttt{/dev/sdc}) via \texttt{NodeStageVolume}, and bind-mounts it into the Pod's directory via \texttt{NodePublishVolume}.
+\end{enumerate}
+
+\begin{lstlisting}[language=yaml, caption={Dynamic Persistent Storage with StorageClass, PVC, and Pod Mount}]
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: fast-ssd
+provisioner: disk.csi.azure.com
+parameters:
+  skuName: Premium_LRS
+volumeBindingMode: WaitForFirstConsumer
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ledger-data
+  namespace: prod
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: fast-ssd
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: order-ledger-0
+  namespace: prod
+spec:
+  containers:
+  - name: ledger
+    image: myacr.azurecr.io/order-ledger:v1.4
+    volumeMounts:
+    - name: data-vol
+      mountPath: /var/lib/ledger
+  volumes:
+  - name: data-vol
+    persistentVolumeClaim:
+      claimName: ledger-data
+\end{lstlisting}
+
+\textbf{Step-by-step trace of Listing 1:} Lines 1--8 define \texttt{fast-ssd} with \texttt{volumeBindingMode: WaitForFirstConsumer}. That setting is critical: instead of creating an Azure Disk in Zone 1 before knowing where the Pod will run, Kubernetes waits until \texttt{kube-scheduler} picks a node (say in Zone 2), then tells the CSI Controller to provision the 50\,GiB disk requested by \texttt{ledger-data} (lines 10--20) in Zone 2 so disk attachment succeeds. Lines 21--37 mount the bound volume inside \texttt{/var/lib/ledger}.
+
+\section{Resource QoS Classes and Autoscaling (HPA \protect\& KEDA)}
+
+\subsection{Pod \texttt{requests}, \texttt{limits}, and Quality of Service}
+In Chapter~\ref{chap:containers}, we mapped \texttt{cpu.max}, \texttt{memory.max}, and \texttt{oom\_score\_adj}. Kubernetes translates Pod YAML fields directly into those \texttt{cgroups v2} files:
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{\texttt{resources.requests}:} Used by \texttt{kube-scheduler} to reserve node capacity and translated into \texttt{cpu.weight} (relative CPU share under contention).
+  \item \textbf{\texttt{resources.limits}:} Written directly into \texttt{cpu.max} and \texttt{memory.max}.
+\end{itemize}
+From these two fields, Kubernetes assigns one of three Quality of Service (QoS) classes:
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{Guaranteed} (\texttt{requests == limits} for both CPU and memory on every container): \texttt{oom\_score\_adj = -997} (protected until last).
+  \item \textbf{Burstable} (\texttt{limits > requests} or only \texttt{requests} set): \texttt{oom\_score\_adj = $\min(\max(2, 1000 - (1000 \times \text{ReqMem}) / \text{NodeMem}), 999)$}.
+  \item \textbf{BestEffort} (no requests or limits set): \texttt{oom\_score\_adj = 1000} (first killed under host memory pressure).
+\end{itemize}
+
+\subsection{Horizontal Pod Autoscaler (HPA) and KEDA}
+The native 	extbf{Horizontal Pod Autoscaler (HPA)} checks metrics every 15 seconds via \texttt{metrics-server} and computes:
+\begin{equation}
+\text{desiredReplicas} = \left\lceil \text{currentReplicas} \times \left( \frac{\text{currentMetricValue}}{\text{desiredMetricValue}} \right) \right\rceil
+\end{equation}
+For example, 10 replicas at 80\% average CPU targeting 50\% yields $\lceil 10 \times (80 / 50) \rceil = 16$ replicas. To prevent rapid scale-up/scale-down 	extbf{flapping} during spiky traffic, configure \texttt{behavior.scaleDown.stabilizationWindowSeconds: 300} so HPA tracks the highest replica demand over the past 5 minutes before shrinking.
+
+Because native HPA cannot scale to zero and does not inspect message queues natively, 	extbf{KEDA (Kubernetes Event-driven Autoscaling)} adds two components: the 	extbf{KEDA Operator} (scales deployments between $0 \leftrightarrow 1$ replica when queue messages arrive) and the 	extbf{KEDA Metrics Server} (feeds external queue lag into standard HPA to scale between $1 \leftrightarrow N$).
+
+\begin{lstlisting}[language=yaml, caption={KEDA ScaledObject Scaling from Zero on Azure Service Bus Lag}]
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: order-processor-scaler
+  namespace: prod
+spec:
+  scaleTargetRef:
+    name: order-processor-deployment
+  minReplicaCount: 0
+  maxReplicaCount: 50
+  cooldownPeriod: 300
+  triggers:
+  - type: azure-servicebus
+    metadata:
+      queueName: pending-transactions
+      messageCount: "100"
+    authenticationRef:
+      name: keda-trigger-auth-workload-id
+\end{lstlisting}
+
+\textbf{Step-by-step trace of Listing 2:} Lines 1--8 bind the scaler to \texttt{order-processor-deployment}. With \texttt{minReplicaCount: 0} (line 9), KEDA scales the deployment to zero pods when \texttt{pending-transactions} is empty. As soon as messages appear, KEDA wakes 1 replica and exposes $\lceil \text{queueDepth} / 100 \rceil$ (line 16) to HPA up to 50 replicas (line 10), waiting \texttt{cooldownPeriod: 300} seconds (line 11) of empty queue before returning to zero.
+
+\begin{realworldbox}[Diagnosing \texttt{PLEG is not healthy} and Stuck \texttt{Terminating} Pods]
+\textbf{Symptom:} A worker node flips to \texttt{NotReady}, events log \texttt{PLEG is not healthy: pleg was last seen active 3m12s ago}, and Pods using Azure Files RWX volumes remain stuck in \texttt{Terminating}.
+
+\textbf{Diagnostic Walkthrough:}
+\begin{enumerate}[leftmargin=12pt]
+  \item SSH to the node and run \texttt{crictl --runtime-endpoint unix:///run/containerd/containerd.sock ps}. The command hangs for $>30\text{s}$ and times out, confirming \texttt{containerd} itself is blocked.
+  \item Run \texttt{ps aux | awk '\$8 \textasciitilde{} /D/'}. Three processes—including a \texttt{containerd-shim} cleanup and \texttt{mount.cifs}—appear in state \texttt{D} (uninterruptible I/O sleep).
+  \item Run \texttt{iostat -xz 1 3}: local NVMe \texttt{\%util} is only 4\%, ruling out local disk wear, while \texttt{/sys/fs/cgroup/memory.pressure} shows \texttt{full avg10=0.00}, ruling out memory thrashing.
+  \item Inspect \texttt{dmesg -T | tail}: \texttt{CIFS: VFS: server 10.1.2.60 has not responded in 180 seconds}. A stale firewall rule severed the SMB port 445 connection to the CSI Azure Files share, locking the kernel VFS thread in \texttt{D}-state and blocking PLEG's container relist. Restoring port 445 unblocks the kernel mount and returns the node to \texttt{Ready}.
+\end{enumerate}
+\end{realworldbox}
+
+\begin{tryityourselfbox}[Tracing QoS, \texttt{kube-proxy} Endpoints, and Storage Modes]
+Consider a Pod manifest with two containers: container \texttt{api} sets \texttt{requests: \{cpu: 500m, memory: 512Mi\}} and \texttt{limits: \{cpu: 500m, memory: 512Mi\}}; sidecar \texttt{logger} sets \texttt{requests: \{cpu: 100m, memory: 128Mi\}} with \emph{no} limits. The Pod sits behind a \texttt{ClusterIP} Service and mounts a \texttt{ReadWriteOnce} PVC. Answer these three questions before checking the solutions:
+\begin{enumerate}[leftmargin=12pt]
+  \item What QoS class does Kubernetes assign to this Pod—\texttt{Guaranteed} or \texttt{Burstable}—and why?
+  \item If \texttt{api}'s HTTP readiness probe fails twice and crosses \texttt{failureThreshold}, what changes in \texttt{EndpointSlice} and \texttt{kube-proxy} \texttt{iptables} rules? Does the Pod get restarted?
+  \item If the node crashes and Kubernetes reschedules the Pod onto another node, why can a \texttt{ReadWriteOnce} volume stall in \texttt{Multi-Attach error}?
+\end{enumerate}
+\end{tryityourselfbox}
+
+\begin{labbridgebox}[Hardened Kubernetes Manifests in Project 8]
+Open \texttt{projects/p08-azure-secure-app/k8s/deployment.yaml} and \texttt{projects/p08-azure-secure-app/k8s/service.yaml} to inspect a production-hardened Deployment (explicit resource requests/limits, non-root \texttt{securityContext}, dropped Linux capabilities, and \texttt{readOnlyRootFilesystem: true}) paired with a \texttt{ClusterIP} Service selector. In Chapter~\ref{chap:terraform}, we provision the underlying AKS cluster and VNet declaratively with Terraform.
+\end{labbridgebox}
+
+\section{Chapter Summary \protect\& Key Takeaways}
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{Control Plane:} \texttt{kube-apiserver} runs AuthN $\to$ RBAC $\to$ Mutating $\to$ Schema $\to$ Validating $\to$ \texttt{etcd} (Raft quorum $Q = \lfloor N/2 \rfloor + 1$ + MVCC Watch streams). \texttt{kube-scheduler} filters then scores nodes; \texttt{kubelet} reconciles via \texttt{syncLoop} and PLEG.
+  \item \textbf{CNI \& Services:} CNI wires Pod \texttt{NET} namespaces to the host via \texttt{veth} pairs. \texttt{ClusterIP} Services rely on \texttt{EndpointSlice} lists and \texttt{kube-proxy} DNAT rules; Ingress adds L7 HTTP/TLS routing.
+  \item \textbf{CSI Storage:} \texttt{StorageClass} + \texttt{PVC} dynamically provision \texttt{PV}s via CSI Controller (cloud attach) and CSI Node (format + bind-mount) plugins.
+  \item \textbf{QoS \& Scaling:} Matching \texttt{requests == limits} across all containers earns \texttt{Guaranteed} QoS (\texttt{oom\_score\_adj = -997}). HPA scales on resource ratios; KEDA scales $0 \leftrightarrow 1 \leftrightarrow N$ on event backlogs.
+\end{itemize}
+
+\section{Exercises}
+
+\subsection{Mechanics}
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Exercise~\thechapter.1:} An application currently runs 8 replicas averaging 720\,MiB of memory per Pod. An HPA targets 500\,MiB per Pod. Compute the desired replica count produced by the HPA formula. Why should you pair this HPA with a \texttt{scaleDown.stabilizationWindowSeconds} setting?
+  \item \textbf{Exercise~\thechapter.2:} Trace every network translation hop when Pod~A (\texttt{10.244.1.5}) calls \texttt{http://order-ledger.prod.svc.cluster.local}, which resolves via CoreDNS to \texttt{ClusterIP} \texttt{10.96.40.12:80} backed by Pod~B (\texttt{10.244.2.8:8080}) on Worker Node~2.
+\end{enumerate}
+
+\subsection{Debugging}
+\begin{enumerate}[leftmargin=18pt]
+  \setcounter{enumi}{2}
+  \item \textbf{Exercise~\thechapter.3:} A worker node enters \texttt{NotReady} with \texttt{PLEG is not healthy}. Outline a 4-step root-cause workflow using \texttt{iostat}, \texttt{crictl}, \texttt{D}-state inspection, and PSI \texttt{memory.pressure} to separate local disk saturation, \texttt{containerd} deadlock, hung CSI storage, and memory thrashing.
+\end{enumerate}
+
+\subsection{Architecture}
+\begin{enumerate}[leftmargin=18pt]
+  \setcounter{enumi}{3}
+  \item \textbf{Exercise~\thechapter.4:} Design a Pod specification, storage choice, and autoscaling policy for a stateful event-processing consumer reading from Kafka across 3 Availability Zones. The Pods must retain maximum OOM protection, avoid zone-mismatch volume scheduling failures, prevent scale-down flapping, and scale from 0 to 40 replicas on Kafka consumer lag.
+\end{enumerate}
+
+\section{Detailed Solutions}
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Solution~\thechapter.1 (Mechanics):}\\
+  \begin{equation*}
+  \text{desiredReplicas} = \left\lceil 8 \times \frac{720}{500} \right\rceil = \lceil 8 \times 1.44 \rceil = \lceil 11.52 \rceil = \mathbf{12\text{ replicas}}.
+  \end{equation*}
+  Adding \texttt{stabilizationWindowSeconds} (e.g., 300s) prevents HPA from scaling down prematurely during brief metric dips and immediately scaling back up seconds later (flapping).
+
+  \item \textbf{Solution~\thechapter.2 (Mechanics):}\\
+  (1) Pod~A queries CoreDNS and receives \texttt{10.96.40.12}. (2) Pod~A sends TCP SYN to \texttt{10.96.40.12:80} through its \texttt{eth0} $\to$ Node~1's \texttt{veth}. (3) On Node~1, \texttt{kube-proxy}'s \texttt{iptables}/IPVS/eBPF DNAT rule rewrites destination \texttt{10.96.40.12:80} to \texttt{10.244.2.8:8080}. (4) Node~1 routes the packet via CNI (overlay or Azure VNet) to Node~2, which delivers it through Node~2's \texttt{veth} to Pod~B's \texttt{eth0:8080}.
+
+  \item \textbf{Solution~\thechapter.3 (Debugging):}\\
+  \textbf{Step 1 (\texttt{iostat -xz 1 10}):} Check local disk \texttt{\%util} and \texttt{await}; near-100\% utilization means \texttt{overlay2} snapshot/image I/O is disk-bound.\\
+  \textbf{Step 2 (\texttt{crictl --runtime-endpoint unix:///run/containerd/containerd.sock ps}):} If \texttt{crictl} hangs, \texttt{containerd} itself is deadlocked or blocked on a kernel call.\\
+  \textbf{Step 3 (\texttt{ps aux | awk '\$8 \textasciitilde{} /D/'}):} Processes stuck in \texttt{D}-state point to a stalled kernel disk or CSI/NFS network mount.\\
+  \textbf{Step 4 (\texttt{/sys/fs/cgroup/memory.pressure}):} High \texttt{full} percentages indicate severe memory thrashing starving node daemons of CPU.
+
+  \item \textbf{Solution~\thechapter.4 (Architecture):}\\
+  Set \texttt{requests == limits} on every container (e.g., \texttt{2000m} CPU, \texttt{2Gi} memory) to obtain 	extbf{Guaranteed QoS} (\texttt{oom\_score\_adj = -997}). Add \texttt{topologySpreadConstraints} across \texttt{topology.kubernetes.io/zone} with \texttt{maxSkew: 1} and \texttt{whenUnsatisfiable: DoNotSchedule}. If local scratch persistence is needed per Pod, use a \texttt{StatefulSet} with a \texttt{StorageClass} configured with \texttt{volumeBindingMode: WaitForFirstConsumer} so disks are created in the scheduled Pod's zone. Finally, deploy a KEDA \texttt{ScaledObject} with a Kafka trigger (\texttt{minReplicaCount: 0}, \texttt{maxReplicaCount: 40}, \texttt{cooldownPeriod: 300}) and HPA \texttt{scaleDown} stabilization.
+
+  \item \textbf{Try-It-Yourself Verification:}\\
+  (1) 	extbf{Burstable}—every container in the Pod must specify equal CPU and memory requests and limits to achieve \texttt{Guaranteed}; because \texttt{logger} omitted limits, the entire Pod drops to \texttt{Burstable}.\\
+  (2) The EndpointSlice controller marks the Pod's IP \texttt{ready: false} and \texttt{kube-proxy} removes it from the Service's DNAT backend pool so new traffic stops arriving; failing a \emph{readiness} probe does \emph{not} restart the Pod (only a \emph{liveness} probe triggers a restart).\\
+  (3) A \texttt{ReadWriteOnce} block disk can attach to only one VM at a time; if the crashed node stays unresponsive, the CSI Controller waits for node lease expiry/volume detachment before attaching the disk to the new node, temporarily failing with \texttt{Multi-Attach error}.
+\end{enumerate}
+
+\section{Further Reading \protect\& Citations}
+\begin{itemize}[leftmargin=15pt]
+  \item Ongaro, D., and Ousterhout, J. \emph{In Search of an Understandable Consensus Algorithm (Raft)}. USENIX ATC, 2014.
+  \item Burns, B., Beda, J., Hightower, K., and Evenson, L. \emph{Kubernetes: Up and Running}. 3rd ed., O'Reilly Media, 2022.
+  \item Kubernetes Documentation. \emph{Cluster Networking (CNI)}, \emph{Container Storage Interface (CSI)}, and \emph{Pod Quality of Service Classes}, \texttt{kubernetes.io}.
+\end{itemize}

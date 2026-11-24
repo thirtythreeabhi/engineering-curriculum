@@ -1,0 +1,313 @@
+\chapter{Architecture Decision Records}
+\label{chap:adrs}
+
+\begin{chaptergoalsbox}
+\textbf{What You Will Learn:}
+\begin{itemize}[leftmargin=12pt]
+  \item Prevent architectural drift and institutional amnesia by capturing design rationale in **Architecture Decision Records (ADRs)**.
+  \item Contrast weak, hype-driven ADRs with rigorous **Nygard** and **MADR** records containing neutral Context, active Decisions, and honest Negative Consequences.
+  \item Manage the full ADR lifecycle (\textit{Proposed, Accepted, Rejected, Superseded, Deprecated}) using immutable superseding chains.
+  \item Automate governance with \texttt{adr-tools} and **Architectural Fitness Functions** (Python AST import checks in CI).
+  \item Reason about multi-tenant database isolation trade-offs—specifically **PostgreSQL Row-Level Security (RLS)** with **PgBouncer transaction pooling (\texttt{SET LOCAL})**.
+\end{itemize}
+
+\textbf{Prerequisites \& Calibration:}
+No prior experience with RFCs, Technical Design Documents (covered in Chapter~\ref{chap:tdd}), or database connection poolers is assumed. Whenever we introduce tooling like \texttt{adr-tools}, Python AST checks, or PgBouncer pooling modes, we explain the underlying mechanism clearly from scratch.
+
+\textbf{Opening Problem:}
+A newly hired staff engineer notices that tracking microservices publish events to Apache Kafka, while batch delivery notifications use RabbitMQ. Calling this ``pointless fragmentation,'' the engineer spends three sprints migrating event tracking onto RabbitMQ. During the next holiday traffic peak, RabbitMQ runs out of memory under 250,000 continuous append-only events per second and stalls the platform. Three years earlier, the original team had hit that exact RabbitMQ wall and migrated to Kafka---but nobody wrote down \emph{why}.
+\end{chaptergoalsbox}
+
+\section{Architectural Erosion and Chesterton's Fence}
+
+Every codebase suffers from **architectural erosion**: as teams rotate, the reasons behind structural choices vanish. A newcomer seeing an unusual workaround faces **Chesterton's Fence**: \textit{``Never tear down a fence until you know why it was built in the first place.''} Without written context, engineers either tear down load-bearing constraints blindly or preserve obsolete hacks forever.
+
+Michael Nygard solved this by keeping lightweight, 1--2 page Markdown files called **Architecture Decision Records (ADRs)** directly inside the Git repository alongside source code.
+
+\begin{intuitionbox}[Judicial Precedents in Code]
+In common law, judges publish written opinions detailing the facts of a case, competing arguments, and why a ruling was chosen. Future courts read those opinions before overturning precedent. ADRs serve as the living case law of your software repository.
+\end{intuitionbox}
+
+\section{The Nygard Format: Bad vs.\ Good ADR}
+
+An ADR follows five core sections: **Title** (numbered, e.g., \texttt{0007-adopt-kafka.md}), **Status**, **Context** (neutral facts and constraints), **Decision** (active-voice commitment), and **Consequences** (both positive and negative trade-offs).
+
+\subsection{Contrasting a Bad ADR with a Good ADR}
+
+Before reading a full production record, compare these two excerpts for choosing a datastore:
+
+\begin{tcolorbox}[colback=warningBg, colframe=warningRed, boxrule=0pt, leftrule=3pt, title={\sffamily\bfseries\small Bad ADR Excerpt (Hype-Driven, Dishonest)}, coltitle=warningRed]
+\small\ttfamily
+\# 0004. Use MongoDB Everywhere\\
+* Status: Accepted\\
+\#\# Context: SQL databases are old and slow.\\
+\#\# Decision: We will rewrite our billing system in MongoDB because NoSQL is modern and web-scale.\\
+\#\# Consequences: Zero latency, infinite scalability, and 100\% bug-free queries.
+\end{tcolorbox}
+
+\begin{tcolorbox}[colback=intuitionBg, colframe=intuitionTeal, boxrule=0pt, leftrule=3pt, title={\sffamily\bfseries\small Good ADR Excerpt (Quantitative, Honest Trade-Offs)}, coltitle=intuitionTeal]
+\small\ttfamily
+\# 0004. Keep PostgreSQL 16 for Financial Ledger; Offload Click Logs to ClickHouse\\
+* Status: Accepted\\
+\#\# Context: Billing ledger requires strict ACID double-entry balances at 3,500 TPS. Meanwhile, 120,000/sec click-stream analytics queries are saturating read replicas (45s lag).\\
+\#\# Decision: Retain PostgreSQL 16 for transactional ledger tables; stream click events via Kafka into ClickHouse for analytical rollups.\\
+\#\# Consequences: (+) Eliminates replica lag; preserves ACID money invariants. (-) Adds operational burden of running ClickHouse and eventual consistency (2--5s lag) on marketing dashboards.
+\end{tcolorbox}
+
+Notice the difference: the good ADR states measurable numbers ($3,500\text{ TPS}$, $120\text{k/s}$, $45\text{s}$ lag) and openly admits operational downsides. An ADR with zero negative consequences is marketing copy, not engineering analysis.
+
+\begin{underthehoodbox}[Why Git Commit Messages Are Not Enough]
+Git commits record the \emph{micro} change (\texttt{"Add Kafka producer pool"}), not the \emph{macro} alternatives rejected (\texttt{"Why Kafka beat RabbitMQ and SQS under 90-day audit replay"}). Storing ADRs in \texttt{docs/decisions/} inside the same Git repo guarantees version parity: checking out a tag from 18 months ago shows the exact architecture active at that commit.
+\end{underthehoodbox}
+
+\section{Production ADR Walkthrough (MADR Format)}
+
+The **Markdown Architectural Decision Record (MADR)** template extends Nygard's format with explicit Decision Drivers and Considered Options. Listing~\ref{lst:v5-ch06-adr-kafka} demonstrates a full production ADR.
+
+\begin{lstlisting}[language=bash, caption={Production MADR Record 0007: Adopting Apache Kafka}, label={lst:v5-ch06-adr-kafka}]
+# 0007. Adopting Apache Kafka for Financial Ledger Event Sourcing
+
+* Status: Accepted
+* Deciders: Platform Architecture Guild, Billing Leads, SRE Lead
+* Date: 2026-03-15
+
+## Context and Problem Statement
+At 8,500 transactions/sec peak, direct polling of PostgreSQL outbox tables by four
+downstream consumers (Fraud, Reporting, Invoicing, Webhooks) drives primary write
+IOPS to 82% and pushes read-replica lag past 45 seconds during market open.
+
+## Decision Drivers
+* Sustain >50,000 events/sec with p99 publish latency <15 ms.
+* Guarantee strict per-account ordering via partition keys (`account_id`).
+* Support 90-day event replay for compliance audits and read-model rebuilds.
+
+## Considered Options
+* Option 1: Apache Kafka (Managed AWS MSK / KRaft)
+* Option 2: RabbitMQ with Quorum Queues
+* Option 3: AWS SQS + SNS Fan-Out
+
+## Decision Outcome
+Chosen: **Option 1: Apache Kafka**. Partitioned append-only logs preserve strict
+`account_id` ordering and let independent consumer groups replay 90 days of events
+without adding read load to PostgreSQL.
+
+### Positive Consequences
+* Scales horizontally past 100k events/sec by adding partitions and brokers.
+* Consumers can rewind offsets to rebuild derived views after bug fixes.
+
+### Negative Consequences
+* Requires SRE expertise for partition rebalancing and consumer lag monitoring.
+* Teams must implement idempotent consumers and Dead-Letter Topics (DLTs).
+* Increases baseline infra spend ($1,450/mo MSK vs $320/mo outbox polling).
+\end{lstlisting}
+
+\section{ADR Lifecycle, \texttt{adr-tools}, and Fitness Functions}
+
+ADRs move through five formal states (Figure~\ref{fig:v5-ch06-adr-lifecycle}). When a past decision changes, **never edit the original ADR's body**; instead, create a new ADR and link both records bidirectionally:
+\begin{enumerate}[leftmargin=18pt]
+  \item Create \texttt{0024-migrate-kafka-to-redpanda.md} with \texttt{Status: Accepted} and \texttt{Supersedes: [0007-adopting-apache-kafka.md]}.
+  \item Update only the status line of ADR~0007 to \texttt{Superseded by [0024-migrate-kafka-to-redpanda.md]}.
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1.4cm and 2.0cm,
+  state/.style={rectangle, draw=headingblue, fill=headingblue!10, rounded corners=3pt, minimum width=2.4cm, minimum height=0.85cm, font=\sffamily\small\bfseries, align=center},
+  arrow/.style={-{Stealth[scale=1.0]}, thick, color=textdark}
+]
+
+\node[state] (prop) {Proposed};
+\node[state, right=2.0cm of prop] (acc) {Accepted};
+\node[state, below=1.1cm of prop] (rej) {Rejected};
+\node[state, right=2.0cm of acc] (sup) {Superseded};
+\node[state, below=1.1cm of acc] (dep) {Deprecated};
+
+\draw[arrow] (prop) -- node[above, font=\tiny\sffamily]{PR Approved} (acc);
+\draw[arrow] (prop) -- node[left, font=\tiny\sffamily]{Vetoed} (rej);
+\draw[arrow] (acc) -- node[above, font=\tiny\sffamily]{Replaced} (sup);
+\draw[arrow] (acc) -- node[left, font=\tiny\sffamily]{Retired} (dep);
+
+\end{tikzpicture}
+\caption{Lifecycle State Machine for Architecture Decision Records}
+\label{fig:v5-ch06-adr-lifecycle}
+\end{figure}
+
+\subsection{Automating ADRs with \texttt{adr-tools} and Fitness Functions}
+
+Nat Pryce's \texttt{adr-tools} CLI automates numbering and superseding links cleanly in Git:
+\begin{lstlisting}[language=bash, caption={Managing Numbered Superseding Chains with \texttt{adr-tools}}]
+# Initialize docs/decisions/ in the repository root
+adr init docs/decisions
+
+# Create ADR 0007 (auto-numbered) and open editor
+adr new Adopting Apache Kafka for Financial Ledger Event Sourcing
+
+# Later, supersede ADR 0007 with a new record in one atomic step
+adr new -s 7 Migrate Event Bus from Kafka to Redpanda
+\end{lstlisting}
+
+To stop **Zombie ADRs** (records marked \emph{Accepted} that code silently violates), teams write **Architectural Fitness Functions** in CI. Listing~\ref{lst:v5-ch06-fitness} uses Python's built-in \texttt{ast} module---which parses source text into an Abstract Syntax Tree so we can inspect \texttt{import} statements statically without executing business code---to enforce an ADR rule that pure \texttt{domain/} modules must never import HTTP framework or database ORM libraries.
+
+\begin{lstlisting}[language=Python, caption={Runnable AST Architectural Fitness Function Enforcing Domain Isolation}, label={lst:v5-ch06-fitness}]
+import ast
+
+FORBIDDEN_IN_DOMAIN = {"fastapi", "flask", "sqlalchemy", "controllers"}
+
+def check_domain_purity(source_code: str, filename: str):
+    tree = ast.parse(source_code, filename=filename)
+    violations = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".")[0] in FORBIDDEN_IN_DOMAIN:
+                    violations.append(f"{filename}:{node.lineno} imports '{alias.name}'")
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            if node.module.split(".")[0] in FORBIDDEN_IN_DOMAIN:
+                violations.append(f"{filename}:{node.lineno} imports from '{node.module}'")
+    return violations
+
+bad_src = "from fastapi import HTTPException\ndef transfer(amt):\n    return amt\n"
+good_src = "from decimal import Decimal\ndef transfer(amt: Decimal) -> Decimal:\n    return amt\n"
+print("Bad module:", check_domain_purity(bad_src, "domain/ledger.py"))
+print("Good module:", check_domain_purity(good_src, "domain/ledger.py"))
+\end{lstlisting}
+
+\textbf{Step-by-Step Trace:}
+\begin{enumerate}[leftmargin=18pt]
+  \item Line 6 parses \texttt{bad\_src} into AST nodes (\texttt{ImportFrom}, \texttt{FunctionDef}, \texttt{Return}).
+  \item Lines 8--15 walk every node: on \texttt{from fastapi import HTTPException}, \texttt{node.module.split(".")[0]} yields \texttt{"fastapi"}, which matches \texttt{FORBIDDEN\_IN\_DOMAIN}, recording \texttt{domain/ledger.py:1 imports from 'fastapi'}.
+  \item Passing \texttt{good\_src} (which only imports \texttt{decimal.Decimal}) returns \texttt{[]}, passing the CI check.
+\end{enumerate}
+
+\section{Primer: PostgreSQL RLS and PgBouncer Transaction Pooling}
+
+Architecture decisions often involve subtle database-to-runtime interactions. Before tackling Exercise~6.4, understand **PostgreSQL Row-Level Security (RLS)** and connection pooling (building on Volume~I, Chapters~4 and 5):
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{What problem RLS solves}: In a shared multi-tenant database table (e.g., \texttt{invoices}), forgetting \texttt{WHERE tenant\_id = \$1} in a single endpoint leaks another customer's records (an IDOR breach). PostgreSQL RLS lets you attach a policy directly to the table (\texttt{CREATE POLICY tenant\_iso ON invoices USING (tenant\_id = current\_setting('app.tenant\_id')::uuid)}) so the database engine itself rejects cross-tenant rows even if application code has a bug.
+  \item \textbf{The PgBouncer Transaction-Pooling Trap}: High-concurrency services place **PgBouncer** in front of PostgreSQL in *transaction-pooling* mode, where a physical database connection is lent to Request~A for one \texttt{BEGIN...COMMIT} transaction and immediately lent to Request~B (possibly a different customer!) for the next transaction. If Request~A sets a session-wide variable (\texttt{SET app.tenant\_id = 'tenant\_1'}), that value **persists on the pooled connection** when Request~B runs---silently leaking Tenant~1's data to Tenant~2!
+  \item \textbf{The Fix (\texttt{SET LOCAL})}: Always bind tenant context using \texttt{SET LOCAL app.tenant\_id = 'tenant\_1'} inside an explicit \texttt{BEGIN ... COMMIT} transaction block. PostgreSQL automatically clears \texttt{SET LOCAL} variables when the transaction commits or rolls back.
+\end{itemize}
+
+\begin{realworldbox}[Diagnostic Walkthrough: Passing a Clearinghouse Regulatory Audit via ADRs]
+\textbf{Symptoms:} During an annual SOC2/financial clearinghouse audit, examiners flag a critical question: \textit{``Why does your batch settlement service write files over SFTP with AES-256 instead of calling the partner bank's REST API, and why is encryption key rotation set to 90 days?''} Nobody who built the integration three years prior still works at the company.\\
+\textbf{Investigation:} Instead of spending two weeks interviewing former contractors or reverse-engineering legacy Java configs, the lead engineer runs \texttt{git grep -i "SFTP" docs/decisions/} and retrieves \texttt{0019-iso20022-sftp-settlement.md} and \texttt{0021-kms-90day-key-rotation.md}.\\
+\textbf{Outcome:} The timestamped Git history and signed PR approvals show the exact bank specification constraints and KMS policy drivers reviewed by Security and Engineering three years prior, closing the audit inquiry in 20 minutes.
+\end{realworldbox}
+
+\begin{tryityourselfbox}[Author an ADR for GraphQL vs.\ REST]
+A mobile team wants to replace 35 REST endpoints with an Apollo GraphQL gateway. Draft a Nygard ADR covering:
+\begin{enumerate}
+  \item \textbf{Context}: mobile over-fetching on cellular networks, battery drain, multiple round-trips per screen.
+  \item \textbf{Decision}: adopt a GraphQL BFF (Backend for Frontend) gateway over the existing REST/gRPC core.
+  \item \textbf{Consequences}: at least two positive and two negative trade-offs (including edge HTTP caching complexity and runaway nested-query DoS risk).
+\end{enumerate}
+\end{tryityourselfbox}
+
+\section{Summary \protect\& Key Takeaways}
+
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Preserve Intent}: ADRs solve Chesterton's Fence by capturing quantitative context, alternatives, and honest trade-offs in Git.
+  \item \textbf{Immutable Superseding}: Never rewrite old Accepted ADRs; supersede them forward with bidirectional links using \texttt{adr-tools}.
+  \item \textbf{Fitness Functions}: Pair ADRs with automated CI AST/import checks so code cannot drift silently from accepted rules.
+  \item \textbf{Honest Downsides}: Every architecture choice carries costs—such as \texttt{SET LOCAL} pooling discipline for PostgreSQL RLS.
+\end{itemize}
+
+\section{Exercises}
+
+\subsection*{Mechanics}
+\begin{enumerate}[label=\textbf{Exercise~\thechapter.\arabic*}, leftmargin=*]
+  \item Name the five ADR lifecycle states and describe the exact Git commit steps required to replace an \emph{Accepted} ADR with a newer decision.
+  \item Give three concrete reasons to store ADRs inside the application's Git repository rather than an external wiki.
+\end{enumerate}
+
+\subsection*{Debugging}
+\begin{enumerate}[label=\textbf{Exercise~\thechapter.\arabic*}, leftmargin=*, start=3]
+  \item Critique this ADR draft: \textit{``Decision: Migrate our Rails monolith to Rust because Rust is faster and modern. Consequences: Zero latency and zero bugs.''} Identify three major defects.
+\end{enumerate}
+
+\subsection*{Architecture Design}
+\begin{enumerate}[label=\textbf{Exercise~\thechapter.\arabic*}, leftmargin=*, start=4]
+  \item Write a complete MADR/Nygard ADR evaluating **PostgreSQL Row-Level Security (RLS)** versus **Application-Layer \texttt{WHERE tenant\_id = ?} Scoping** for a multi-tenant B2B SaaS platform running behind PgBouncer in transaction-pooling mode.
+\end{enumerate}
+
+\section{Detailed Solutions}
+
+\subsection*{Try It Yourself Solution}
+\begin{lstlisting}[language=bash, caption={Worked Nygard ADR for Mobile GraphQL BFF Gateway}]
+# 0018. Adopt GraphQL BFF Gateway for Mobile Clients
+
+* Status: Accepted
+* Date: 2026-05-10
+* Deciders: Mobile Lead, Backend Platform Lead
+
+## Context
+Rendering the mobile home screen currently requires 7 sequential REST calls over
+cellular networks, fetching 420 KB of unused JSON fields and inflating p95 screen
+load to 1.8 seconds while draining user battery.
+
+## Decision
+We will deploy a GraphQL Backend-for-Frontend (BFF) gateway aggregating internal
+gRPC/REST services so mobile clients fetch exact required fields in one round-trip.
+
+## Consequences
+### Positive
+* Reduces mobile payload size by ~70% and cuts p95 home-screen latency to <500 ms.
+* Decouples mobile release cycles from backend schema refactors.
+### Negative
+* Breaks standard URL-keyed CDN/HTTP caching (GraphQL uses POST bodies), requiring
+  persisted queries or normalized client caching.
+* Exposes nested-query DoS risks (e.g., `user -> orders -> items -> user` cycles),
+  requiring query-depth and complexity limits in the gateway.
+\end{lstlisting}
+
+\subsection*{Mechanics, Debugging & Architecture Solutions}
+\begin{enumerate}[label=\textbf{Solution~\thechapter.\arabic*}, leftmargin=*]
+  \item The five states are **Proposed, Accepted, Rejected, Superseded, Deprecated**. To replace an Accepted ADR, commit a new numbered ADR with \texttt{Status: Accepted} and \texttt{Supersedes: [old-adr]}, and in the same PR change only the header of the old ADR to \texttt{Superseded by [new-adr]}.
+  \item (1) **Version parity** across branches and historical tags, (2) **Pull-request peer review** alongside code changes, (3) **Local searchability** (\texttt{git grep}) and immunity to corporate wiki migrations/link rot.
+  \item Three defects: (1) Zero quantitative metrics or bottleneck evidence in Context, (2) hype-driven rationale (``modern''), and (3) impossible, dishonest Consequences ignoring team ramp-up cost, slower compile times, and rewrite risk.
+  \item Listing~\ref{lst:v5-ch06-rls-adr} presents the complete ADR addressing PostgreSQL RLS and PgBouncer \texttt{SET LOCAL} discipline.
+\end{enumerate}
+
+\begin{lstlisting}[language=bash, caption={ADR 0012: PostgreSQL RLS vs.\ Application-Layer Tenant Scoping}, label={lst:v5-ch06-rls-adr}]
+# 0012. Adopting PostgreSQL Row-Level Security (RLS) for Multi-Tenant Isolation
+
+* Status: Accepted
+* Date: 2026-04-02
+* Deciders: Security Guild, Database Architect, Core API Team
+
+## Context and Problem Statement
+Our SaaS database serves 1,200 enterprise tenants from shared tables. Relying on
+developers to add `WHERE tenant_id = ?` across 400 endpoints failed a recent pentest
+when `/api/v1/invoices/export` omitted the filter (cross-tenant IDOR).
+
+## Decision Drivers
+* Defense-in-depth: prevent cross-tenant reads even if an endpoint omits a filter.
+* Compatibility with PgBouncer transaction-pooling mode (4,000 app connections -> 100 DB).
+
+## Decision Outcome
+Chosen: **PostgreSQL Row-Level Security (RLS)** enforced via `SET LOCAL app.tenant_id`.
+Every request middleware opens an explicit transaction (`BEGIN`), executes
+`SET LOCAL app.tenant_id = $1`, and commits cleanly.
+
+### Positive Consequences
+* Database physically enforces tenant boundaries across all queries and exports.
+* Auditors verify one declarative SQL policy instead of 400 controller handlers.
+
+### Negative Consequences
+* Adds 3%--7% query planner overhead on multi-table joins; requires composite indexes
+  leading with `tenant_id`.
+* Strict PgBouncer hazard: using session-level `SET` instead of transaction-scoped
+  `SET LOCAL` leaks tenant context to the next pooled request. Enforced via CI linter.
+\end{lstlisting}
+
+\begin{labbridgebox}
+Use \texttt{exercises/volume5/ex03\_c4\_model\_validator.py} as a blueprint for automated architecture fitness checks in CI, and review \texttt{projects/p12-end-to-end-platform/init-db/01-init.sql} to inspect schema choices worth capturing as ADRs.
+\end{labbridgebox}
+
+\section{Further Reading \protect\& Citations}
+\begin{itemize}[leftmargin=18pt]
+  \item Nygard, M. (2011). \textit{Documenting Architecture Decisions}. Cognitect Blog.
+  \item MADR Project: \url{https://adr.github.io/madr/}.
+  \item Ford, N., Parsons, R., \& Kua, P. (2017). \textit{Building Evolutionary Architectures}. O'Reilly Media.
+\end{itemize}

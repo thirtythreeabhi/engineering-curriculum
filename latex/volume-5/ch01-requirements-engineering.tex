@@ -1,0 +1,450 @@
+\chapter{Requirements Engineering}
+\label{chap:requirements}
+
+\begin{chaptergoalsbox}
+\textbf{What You Will Learn:}
+\begin{itemize}[leftmargin=12pt]
+  \item Translate ambiguous stakeholder wishes into concrete, testable specifications using the **FURPS+** framework.
+  \item Calculate system availability from Mean Time Between Failures (MTBF) and Mean Time to Repair (MTTR), and evaluate composite availability across series and parallel dependencies.
+  \item Read and compute latency percentiles (\texttt{p50}, \texttt{p95}, \texttt{p99}, \texttt{p99.9}) from discrete request histograms, avoid the ``Mean-of-Means'' fallacy, and quantify distributed tail amplification.
+  \item Size concurrent thread pools and database connection limits from scratch using **Little's Law** ($L = \lambda W$).
+  \item Specify Disaster Recovery (DR) architectures around measurable **RPO** (data loss tolerance) and **RTO** (downtime tolerance).
+\end{itemize}
+
+\textbf{Prerequisites \& Calibration:}
+No advanced probability theory, calculus, or systems internals are assumed. We build percentiles from simple request-count buckets, availability from basic multiplication, and concurrency sizing from one algebraic identity ($L = \lambda W$), alongside a short runnable Python calculator.
+
+\textbf{Opening Problem:}
+During a product kickoff for a regional telehealth scheduling platform, a product stakeholder writes four sentences on a whiteboard: \textit{``The portal must never go down, pages should load instantly, patient records must stay safe in Europe, and support needs to know when something breaks.''} Six months later, a cloud zone power loss knocks out the primary database. Automated failover turns out to be a manual DNS script taking 45 minutes, and snapshots only ran once every 24 hours---triggering \$200,000 in hospital contract penalties. The code worked fine; the requirements were never quantified.
+\end{chaptergoalsbox}
+
+\section{From Vague Wishes to FURPS+ Specifications}
+
+Software projects rarely fail because a team could not write a loop or query a table. They fail because different people read the same English sentence and imagine completely different systems. Saying a service must be ``fast'' or ``reliable'' gives an engineer zero guidance on whether to spend \$500/month on a single database or \$15,000/month on multi-region replication.
+
+Requirements engineering splits what a system does into two halves:
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Functional Requirements}: Specific behaviors, calculations, and user actions (e.g., \textit{``A patient can book an available 30-minute slot and receive a confirmation code''}).
+  \item \textbf{Non-Functional Requirements (Quality Attributes)}: Measurable constraints on \emph{how well} the system operates under load, failure, and maintenance.
+\end{itemize}
+
+Robert Grady at Hewlett-Packard organized these into the **FURPS+** taxonomy, shown in Figure~\ref{fig:v5-ch01-furps-plus}.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=0.8cm and 1.2cm,
+  main/.style={rectangle, draw=headingblue, fill=headingblue!10, rounded corners=3pt, minimum width=3.2cm, minimum height=0.95cm, font=\sffamily\bfseries\color{headingblue}, align=center},
+  sub/.style={rectangle, draw=gray!60, fill=gray!5, rounded corners=2pt, text width=9.5cm, minimum height=0.85cm, font=\sffamily\scriptsize, inner sep=5pt}
+]
+
+\node[main] (f) {Functionality (F)};
+\node[sub, right=0.8cm of f] (fd) {Features, business rules, authorization checks, data accuracy, audit trails.};
+
+\node[main, below=0.35cm of f] (u) {Usability (U)};
+\node[sub, right=0.8cm of u] (ud) {Accessibility (WCAG), localization, clear error recovery, operator documentation.};
+
+\node[main, below=0.35cm of u] (r) {Reliability (R)};
+\node[sub, right=0.8cm of r] (rd) {Availability (``nines''), MTBF, MTTR, fault tolerance, data durability (RPO/RTO).};
+
+\node[main, below=0.35cm of r] (p) {Performance (P)};
+\node[sub, right=0.8cm of p] (pd) {Throughput (requests/sec), latency percentiles (p95/p99), resource saturation bounds.};
+
+\node[main, below=0.35cm of p] (s) {Supportability (S)};
+\node[sub, right=0.8cm of s] (sd) {Automated testability, structured logs, Prometheus metrics, zero-downtime config changes.};
+
+\node[main, below=0.35cm of s] (plus) {The ``+'' Constraints};
+\node[sub, right=0.8cm of plus] (plusd) {Design (immutability), Implementation (Python/Go), Interface (REST/gRPC), Physical (EU cloud region).};
+
+\end{tikzpicture}
+\caption{The FURPS+ Requirements Taxonomy}
+\label{fig:v5-ch01-furps-plus}
+\end{figure}
+
+\subsection{Step-by-Step Translation Walkthrough}
+
+Suppose a stakeholder hands you those four vague sentences from the telehealth kickoff. Table~\ref{tab:v5-ch01-translation} walks through how an architect converts each wish into a testable, unambiguous FURPS+ specification.
+
+\begin{table}[htbp]
+\centering\scriptsize
+\begin{tabular}{p{3.6cm}p{2.2cm}p{7.8cm}}
+\toprule
+\textbf{Stakeholder Wish} & \textbf{FURPS+ Bucket} & \textbf{Quantified, Testable Engineering Requirement} \\
+\midrule
+``The portal must never go down.'' & Reliability (R) & Sustain $\ge 99.95\%$ monthly availability ($\le 21.9\text{ min}$ unscheduled downtime/month) with automated failover ($\text{RTO} \le 5\text{ min}$, $\text{RPO} \le 1\text{ min}$). \\
+``Pages should load instantly.'' & Performance (P) & Booking API responds in $\le 120\text{ ms}$ at \texttt{p95} and $\le 300\text{ ms}$ at \texttt{p99} under a peak sustained arrival rate of $800\text{ req/s}$. \\
+``Patient records must stay safe in Europe.'' & Functionality (F) + Physical (+) & Encrypt records at rest (AES-256) and in transit (TLS 1.3); pin all primary databases and backups physically inside \texttt{eu-central-1} (GDPR). \\
+``Support needs to know when something breaks.'' & Supportability (S) & Emit structured JSON error logs with request trace IDs and expose \texttt{/metrics} HTTP status counters alerting within 2 minutes of budget burn. \\
+\bottomrule
+\end{tabular}
+\caption{Translating Ambiguous Stakeholder Wishes into Testable FURPS+ Specifications}
+\label{tab:v5-ch01-translation}
+\end{table}
+
+Notice what changed: every rewritten statement has a **number** or **verifiable constraint**. An engineer can write an automated load test, an infrastructure check, or a failover drill to prove whether the system passes or fails.
+
+\section{Availability Mathematics and the Cost of ``Nines''}
+
+\textbf{Availability} is the fraction of time a service works properly when a user tries to reach it:
+\begin{equation}
+A = \frac{\text{Uptime}}{\text{Total Time}} = \frac{\text{MTBF}}{\text{MTBF} + \text{MTTR}}
+\end{equation}
+Two operational clocks determine $A$:
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{MTBF (Mean Time Between Failures)}: Average uninterrupted operating time between outages. For example, if a server runs 990 hours before crashing, $\text{MTBF} = 990\text{ h}$.
+  \item \textbf{MTTR (Mean Time to Repair)}: Average time to detect, diagnose, and restore service after a failure. If recovery takes 10 hours, $\text{MTTR} = 10\text{ h}$, giving $A = \frac{990}{990 + 10} = 0.99$ ($99\%$).
+\end{itemize}
+
+Notice a crucial engineering insight in that fraction: you can raise availability either by making hardware fail less often (increasing MTBF) or by recovering faster automatically (shrinking MTTR). Reducing MTTR from 60 minutes to 30 seconds via automated health-check failover often costs a fraction of buying exotic fault-tolerant hardware.
+
+\subsection{The Financial and Operational Cost of Nines}
+
+Engineers informally refer to availability tiers by counting the leading ``9'' digits. Each extra nine cuts allowed downtime by $10\times$ (Table~\ref{tab:v5-ch01-availability-nines}).
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Availability Level} & \textbf{Downtime / Year} & \textbf{Downtime / Month (30d)} & \textbf{Downtime / Week} & \textbf{Downtime / Day} \\
+\midrule
+99\% (``Two Nines'') & 3.65 days & 7.20 hours & 1.68 hours & 14.40 minutes \\
+99.9\% (``Three Nines'') & 8.76 hours & 43.20 minutes & 10.08 minutes & 1.44 minutes \\
+99.95\% & 4.38 hours & 21.60 minutes & 5.04 minutes & 43.20 seconds \\
+99.99\% (``Four Nines'') & 52.56 minutes & 4.32 minutes & 1.01 minutes & 8.64 seconds \\
+99.999\% (``Five Nines'') & 5.26 minutes & 25.92 seconds & 6.05 seconds & 0.86 seconds \\
+\bottomrule
+\end{tabular}
+\caption{Permissible Downtime Windows Across Availability Tiers (365-day year, 30-day month)}
+\label{tab:v5-ch01-availability-nines}
+\end{table}
+
+\begin{intuitionbox}[Twin-Engine Aircraft Redundancy]
+A modern commercial airliner does not rely on a single giant engine; it flies with two or four independent engines. If one engine fails mid-flight, the chance of the second independent engine failing in the exact same hour is tiny. Software achieves four or five nines the same way: not by building an unbreakable server, but by running independent copies in parallel so a single machine crash barely registers.
+\end{intuitionbox}
+
+\subsection{Composite Availability: Series vs.\ Parallel Redundancy}
+
+Real applications are graphs of collaborating parts: load balancers, web servers, caches, and databases. How those parts are wired determines total availability.
+
+\subsubsection{Series Dependencies (The Weakest Link Principle)}
+If a user request needs $n$ independent components to \emph{all} work at the same time (for instance, DNS $\rightarrow$ Load Balancer $\rightarrow$ API $\rightarrow$ Database), the composite availability $A_s$ is the product of each component's availability:
+\begin{equation}
+A_s = \prod_{i=1}^n A_i = A_1 \times A_2 \times \dots \times A_n
+\end{equation}
+Because every $A_i < 1$, multiplying them shrinks the total below the weakest component:
+\begin{equation}
+A_s < \min(A_1, A_2, \dots, A_n)
+\end{equation}
+For three components in series at $99.9\%$ ($0.999$) each:
+\begin{equation}
+A_s = 0.999 \times 0.999 \times 0.999 = 0.997003 \approx 99.70\%
+\end{equation}
+Every mandatory synchronous dependency you add in series \emph{reduces} system availability.
+
+\subsubsection{Parallel Redundancy (Active-Active / Active-Passive)}
+When $n$ identical independent replicas sit behind a load balancer in parallel, the subsystem only goes down if \emph{every single replica fails simultaneously}. The probability that replica $i$ is down is $(1 - A_i)$, so the probability all $n$ are down together is $\prod_{i=1}^n (1 - A_i)$:
+\begin{equation}
+A_p = 1 - \prod_{i=1}^n (1 - A_i)
+\end{equation}
+Suppose two stateless API servers each have modest $99.0\%$ ($0.99$) individual availability (meaning each alone drops out 3.65 days a year). Running both in parallel behind a reliable balancer yields:
+\begin{equation}
+A_p = 1 - (1 - 0.99)^2 = 1 - (0.01)^2 = 1 - 0.0001 = 0.9999 \quad (99.99\%)
+\end{equation}
+Parallelism turns two mediocre $99\%$ nodes into a $99.99\%$ service tier---provided they share no hidden single point of failure (such as the same power rack or un-replicated database).
+
+\begin{productionwarningbox}[Promising Five Nines on Three-Nines Cloud Infrastructure]
+Cloud providers publish SLAs for each managed building block: for example, an Application Load Balancer at $99.99\%$ and a Multi-AZ managed PostgreSQL instance at $99.95\%$. If your request path runs through both in series inside a single cloud region, your infrastructure ceiling is:
+$$A_{\text{max}} = 0.9999 \times 0.9995 = 0.99940005 \approx 99.94\%$$
+Signing a customer contract guaranteeing $99.999\%$ (5.26 minutes/year) on top of a single-region $99.94\%$ floor guarantees contractual breach. Reaching five nines requires multi-region active-active architecture and local graceful degradation when dependencies fail.
+\end{productionwarningbox}
+
+\section{Latency Distributions and the Tyranny of Tail Latency}
+
+In performance engineering, reporting the **arithmetic mean (average)** latency hides the experience of your slowest users. Network and server latencies do not follow a symmetric bell curve; most requests finish quickly, while a long right-hand ``tail'' stretches out to hundreds or thousands of milliseconds due to garbage-collection pauses, lock contention, or packet retransmissions.
+
+\subsection{From Discrete Request Histograms to Percentiles}
+
+To see what percentiles actually measure without any calculus prerequisites, consider measuring 1,000 consecutive API requests and sorting them into latency buckets, as shown in Table~\ref{tab:v5-ch01-histogram}.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Latency Bucket (ms)} & \textbf{Request Count} & \textbf{Cumulative Count} & \textbf{Cumulative \%} \\
+\midrule
+$0 - 18\text{ ms}$ & 500 & 500 / 1,000 & 50.0\% (\texttt{p50}) \\
+$19 - 42\text{ ms}$ & 400 & 900 / 1,000 & 90.0\% (\texttt{p90}) \\
+$43 - 150\text{ ms}$ & 90 & 990 / 1,000 & 99.0\% (\texttt{p99}) \\
+$151 - 850\text{ ms}$ & 9 & 999 / 1,000 & 99.9\% (\texttt{p99.9}) \\
+$851 - 1,200\text{ ms}$ & 1 & 1,000 / 1,000 & 100.0\% (\texttt{max}) \\
+\bottomrule
+\end{tabular}
+\caption{Concrete Discrete Request-Count Histogram for 1,000 API Requests}
+\label{tab:v5-ch01-histogram}
+\end{table}
+
+You read percentiles directly by counting requests from fastest to slowest:
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{p50 (Median = 18 ms)}: Half (500 of 1,000) of the requests finished at or under $18\text{ ms}$.
+  \item \textbf{p90 (42 ms)}: 900 of 1,000 requests finished within $42\text{ ms}$; 100 took longer.
+  \item \textbf{p99 (150 ms)}: 990 of 1,000 requests finished within $150\text{ ms}$; the slowest 10 requests took longer. In e-commerce and SaaS, heavy-cart enterprise buyers touch the most database rows, clustering disproportionately in the \texttt{p99} tail.
+  \item \textbf{p99.9 (850 ms)}: Only 1 in 1,000 requests exceeded $850\text{ ms}$---often exposing garbage-collection stalls, cold caches, or disk flushes.
+\end{itemize}
+
+As you collect millions of requests and shrink the bucket width from milliseconds to microseconds, the stepped bar chart smooths into the continuous curve $f(t)$ shown in Figure~\ref{fig:v5-ch01-latency-dist}. The shaded fraction of requests finishing on or before a threshold $T$ is simply the cumulative percentage from Table~\ref{tab:v5-ch01-histogram} (which mathematicians write as the area under the curve $\int_0^T f(t)\,dt$).
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.9, every node/.style={transform shape},
+  axis/.style={thick, -{Stealth[scale=1.0]}},
+  curve/.style={draw=headingblue, ultra thick},
+  percentile/.style={dashed, thick}
+]
+
+\draw[axis] (0, 0) -- (12, 0) node[right, font=\sffamily\small]{Latency $t$ (ms)};
+\draw[axis] (0, 0) -- (0, 5) node[above, font=\sffamily\small]{Request Density $f(t)$};
+
+\draw[curve] plot [smooth, tension=0.7] coordinates {
+  (0.2, 0) (0.8, 1.2) (1.5, 4.5) (2.2, 3.8) (3.2, 1.8) (5.0, 0.8) (7.5, 0.4) (10.5, 0.1) (11.5, 0.02)
+};
+
+\draw[percentile, color=headingblue] (1.6, 0) -- (1.6, 4.4) node[above, font=\sffamily\tiny\bfseries]{p50 = 18ms};
+\draw[percentile, color=exampleBlue] (3.6, 0) -- (3.6, 1.5) node[above, font=\sffamily\tiny\bfseries]{p90 = 42ms};
+\draw[percentile, color=mistakeAmber] (6.5, 0) -- (6.5, 0.6) node[above, font=\sffamily\tiny\bfseries]{p99 = 150ms};
+\draw[percentile, color=warningRed] (10.0, 0) -- (10.0, 0.2) node[above, font=\sffamily\tiny\bfseries]{p99.9 = 850ms};
+
+\end{tikzpicture}
+\caption{Continuous Limit of the Skewed Latency Histogram and Tail Percentiles}
+\label{fig:v5-ch01-latency-dist}
+\end{figure}
+
+\subsection{The Fallacy of Averaging Averages (Mean-of-Means)}
+
+Suppose two application servers sit behind a load balancer:
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Server A} handled $100$ health-check/fast requests with an average latency of $10\text{ ms}$.
+  \item \textbf{Server B} handled $900$ heavy checkout requests with an average latency of $110\text{ ms}$.
+\end{itemize}
+An engineer who averages the two server averages computes:
+$$\text{Naive Mean-of-Means} = \frac{10 + 110}{2} = 60\text{ ms}$$
+That number is mathematically wrong because Server B carried $9\times$ more traffic than Server A. The true fleet average weights each server by its request count:
+$$\text{True Weighted Mean} = \frac{(100 \times 10) + (900 \times 110)}{100 + 900} = \frac{1,000 + 99,000}{1,000} = \frac{100,000}{1,000} = 100\text{ ms}$$
+The exact same warning applies to percentiles: you can \textbf{never} average \texttt{p99} across two servers (`(p99_A + p99_B)/2` is invalid). Always merge the raw histogram buckets across servers first, then read the percentile from the combined counts.
+
+\begin{commonmistakebox}[Coordinated Omission in Load Testing]
+Coordinated Omission (coined by Gil Tene) happens when a naive load generator waits for the previous request to finish before sending the next one. If the server freezes for 5 seconds during a garbage-collection pause, the benchmark script pauses too, recording only one 5-second request and omitting the thousands of requests that real users would have sent during that freeze. Use open-loop generators such as \texttt{wrk2} or \texttt{k6} constant-arrival-rate executors that fire requests on an independent clock regardless of server stalls.
+\end{commonmistakebox}
+
+\subsection{Distributed Tail Latency Amplification}
+
+When a single user request fans out in parallel to $n$ downstream services (e.g., pricing, tax, inventory, fraud, recommendations), the parent API cannot reply until the \emph{slowest} of those $n$ calls finishes.
+
+If each downstream call independently hits its slow tail with probability $p$ (say $p = 0.01$ for \texttt{p99}), the chance all $n$ calls stay fast is $(1 - p)^n$. Therefore, the probability $P(\text{slow})$ that at least one call lands in the tail is:
+\begin{equation}
+P(\text{slow}) = 1 - (1 - p)^n
+\end{equation}
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{rrrr}
+\toprule
+\textbf{Downstream Calls ($n$)} & \textbf{If $p = 0.01$ (\texttt{p99})} & \textbf{If $p = 0.05$ (\texttt{p95})} & \textbf{If $p = 0.001$ (\texttt{p99.9})} \\
+\midrule
+1 & 1.0\% & 5.0\% & 0.1\% \\
+5 & 4.9\% & 22.6\% & 0.5\% \\
+20 & 18.2\% & 64.2\% & 2.0\% \\
+50 & 39.5\% & 92.3\% & 4.9\% \\
+100 & \textbf{63.4\%} & \textbf{99.4\%} & 9.5\% \\
+\bottomrule
+\end{tabular}
+\caption{Probability of Experiencing Tail Latency as Fan-Out $n$ Grows}
+\label{tab:v5-ch01-tail-amplification}
+\end{table}
+
+Even when every single microservice comfortably beats its 99\% latency goal, a page fanning out to 100 services exposes **63.4\% of users** to a slow tail response. To tame tail amplification, architects use **hedged requests** (sending a backup read if the primary takes longer than \texttt{p95}), strict per-call **timeouts**, and **graceful shedding** of non-essential widgets.
+
+\section{Throughput, Concurrency, and Little's Law}
+
+How many concurrent threads or database connections does a service need? Too few and requests pile up waiting; too many and memory/lock contention collapses the database. **Little's Law** relates the three steady-state quantities cleanly:
+\begin{equation}
+L = \lambda W
+\end{equation}
+where:
+\begin{itemize}[leftmargin=18pt]
+  \item $L$: Average number of concurrent in-flight requests inside the system.
+  \item $\lambda$: Arrival rate (throughput in requests per second, RPS).
+  \item $W$: Average time a single request spends inside the system (latency in seconds).
+\end{itemize}
+
+Think of a highway tunnel: if $\lambda = 10$ cars enter per second and each car takes $W = 20$ seconds to drive through, there are $L = 10 \times 20 = 200$ cars inside the tunnel at any moment. If an accident slows traffic so $W' = 60$ seconds while cars still arrive at $\lambda = 10$/s, the tunnel needs capacity for $L' = 600$ cars---otherwise cars back up onto the entrance ramp.
+
+\begin{lstlisting}[language=Python, caption={Runnable Availability and Little's Law Capacity Calculator}]
+from math import prod
+
+def series_availability(availabilities):
+    return prod(availabilities)
+
+def parallel_availability(availabilities):
+    return 1.0 - prod(1.0 - a for a in availabilities)
+
+def annual_downtime_minutes(avail):
+    return (1.0 - avail) * 365 * 24 * 60
+
+def littles_law_concurrency(rps, latency_ms):
+    return rps * (latency_ms / 1000.0)
+
+a_series = series_availability([0.9999, 0.9995, 0.999])
+a_db_ha = parallel_availability([0.99, 0.99])
+
+print(f"Series 3-tier: {a_series:.6f} ({annual_downtime_minutes(a_series):.1f} min/yr)")
+print(f"Parallel 2x99%: {a_db_ha:.6f} ({annual_downtime_minutes(a_db_ha):.1f} min/yr)")
+print(f"Normal concurrency (2500 rps @ 80ms):  {littles_law_concurrency(2500, 80):.1f}")
+print(f"Degraded concurrency (2500 rps @ 800ms): {littles_law_concurrency(2500, 800):.1f}")
+\end{lstlisting}
+
+\textbf{Step-by-Step Trace on Concrete Inputs:}
+\begin{enumerate}[leftmargin=18pt]
+  \item Lines 3--4 compute $A_s = 0.9999 \times 0.9995 \times 0.999 = 0.998401$. Lines 9--10 multiply $(1 - 0.998401) \times 525,600 = 840.6\text{ minutes/year}$ of downtime.
+  \item Lines 6--7 compute parallel redundancy for two $99\%$ nodes: $1 - (0.01 \times 0.01) = 0.999900$, cutting downtime to $52.6\text{ minutes/year}$.
+  \item Line 12 converts $80\text{ ms} \rightarrow 0.08\text{ s}$ and computes $L = 2,500 \times 0.08 = 200.0$ active workers.
+  \item Line 13 models a database lock slowing average response to $800\text{ ms}$ ($0.8\text{ s}$): required concurrency jumps $10\times$ to $2,000.0$. If the worker pool is hard-capped at 500 threads, maximum throughput collapses to $500 / 0.8 = 625\text{ req/s}$, and the remaining $1,875\text{ req/s}$ overflow socket queues into \texttt{504 Gateway Timeout} errors.
+\end{enumerate}
+
+\section{Disaster Recovery: RPO and RTO}
+
+When an entire availability zone or database disk is lost, recovery requirements rest on two clocks (Figure~\ref{fig:v5-ch01-rpo-rto}):
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{RPO (Recovery Point Objective)}: Maximum acceptable data loss looking backward from the crash. $\text{RPO} = 15\text{ minutes}$ means your last replicated write or backup cannot be older than 15 minutes.
+  \item \textbf{RTO (Recovery Time Objective)}: Maximum acceptable downtime looking forward until traffic is served again. $\text{RTO} = 15\text{ minutes}$ means failover, promotion, and DNS/routing updates must finish inside 15 minutes.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.9, every node/.style={transform shape},
+  axis/.style={thick, -{Stealth[scale=1.0]}},
+  line/.style={thick, color=headingblue}
+]
+
+\draw[axis] (0, 0) -- (12, 0) node[right, font=\sffamily\small]{Time $\rightarrow$};
+
+\draw[thick, color=warningRed] (6, -1.0) -- (6, 2.0);
+\node[font=\sffamily\small\bfseries\color{warningRed}, anchor=south] at (6, 2.0) {Disaster / Outage Event};
+
+\draw[line] (2, 0) -- (2, 1.0);
+\draw[line] (6, 0) -- (6, 1.0);
+\draw[thick, <->, color=exampleBlue] (2, 0.7) -- node[above, font=\sffamily\footnotesize\bfseries]{RPO (Max Data Loss)} (6, 0.7);
+\node[font=\sffamily\scriptsize, anchor=north] at (2, -0.2) {Last Durable Backup / WAL};
+
+\draw[line] (6, 0) -- (6, 1.0);
+\draw[line] (10.5, 0) -- (10.5, 1.0);
+\draw[thick, <->, color=tryViolet] (6, 0.7) -- node[above, font=\sffamily\footnotesize\bfseries]{RTO (Max Downtime)} (10.5, 0.7);
+\node[font=\sffamily\scriptsize, anchor=north] at (10.5, -0.2) {Service Restored};
+
+\end{tikzpicture}
+\caption{Disaster Recovery Timeline Defining RPO and RTO}
+\label{fig:v5-ch01-rpo-rto}
+\end{figure}
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lllrr}
+\toprule
+\textbf{DR Strategy} & \textbf{Topology} & \textbf{Data Replication} & \textbf{Typical RPO} & \textbf{Typical RTO} \\
+\midrule
+\textbf{Backup \& Restore} & Cold nightly snapshots in S3/Blob & Batch export & 24 hours & 12--24 hours \\
+\textbf{Pilot Light} & Standby DB replicates; app servers off & Continuous async DB & 1--5 minutes & 30--60 minutes \\
+\textbf{Warm Standby} & Scaled-down shadow fleet in 2nd region & Continuous async DB & Seconds & 5--10 minutes \\
+\textbf{Multi-Region Hot} & Active-active in 2+ regions & Sync / Consensus (Raft) & $\approx 0$ & $< 30\text{ s}$ \\
+\bottomrule
+\end{tabular}
+\caption{Disaster Recovery Architectural Tiers and Cost Trade-Offs}
+\label{tab:v5-ch01-dr-tiers}
+\end{table}
+
+\begin{realworldbox}[Diagnostic Walkthrough: E-Commerce Fan-Out Tail Cascade]
+\textbf{Symptoms:} During a seasonal sale, checkout conversion drops 18\% while the primary dashboard shows \texttt{HTTP 200} availability at $99.98\%$ and median latency flat at \texttt{p50 = 22 ms}.\\
+\textbf{Metrics & Logs:} Inspecting the latency histogram shows \texttt{p99} jumped from $140\text{ ms}$ to $2,400\text{ ms}$. Distributed trace logs show the product page synchronously fans out to $n = 35$ microservices, and \texttt{recommendation-svc} logs:
+\texttt{level=warn svc=recommendation-svc msg="redis_cache_miss_storm" p99_ms=850}.\\
+\textbf{Root Cause:} Even though only $1\%$ of \texttt{recommendation-svc} calls took $850\text{ ms}$, across $n = 35$ parallel fan-out calls per page load, $P(\text{slow}) = 1 - 0.99^{35} = 29.7\%$ of shoppers waited on the slow tail, triggering frontend timeouts.\\
+\textbf{Remediation:} Engineers flipped a load-shedding feature flag skipping optional recommendations whenever \texttt{recommendation-svc} exceeded a $150\text{ ms}$ deadline, dropping checkout \texttt{p99} back to $130\text{ ms}$ within two minutes.
+\end{realworldbox}
+
+\begin{tryityourselfbox}[Sizing Queue Capacity with Little's Law]
+A webhook dispatcher delivers $\lambda = 1,200\text{ webhooks/second}$ to merchant servers with average round-trip latency $W = 250\text{ ms}$.
+\begin{enumerate}
+  \item Compute steady-state concurrent in-flight tasks ($L$) via Little's Law.
+  \item If a carrier outage slows merchant responses to $W' = 4.5\text{ seconds}$, compute the new required concurrency $L'$.
+  \item If the worker pool is capped at 500 concurrent tasks, what happens to throughput and incoming requests?
+\end{enumerate}
+\end{tryityourselfbox}
+
+\section{Summary \protect\& Key Takeaways}
+
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{FURPS+ Clarity}: Convert vague stakeholder adjectives into measurable constraints across Functionality, Usability, Reliability, Performance, Supportability, and technical ``+'' boundaries.
+  \item \textbf{Series vs.\ Parallel Availability}: Series dependencies multiply ($A_s = \prod A_i$) and always degrade below the weakest link; parallel redundancy reduces simultaneous failure probability ($A_p = 1 - \prod (1 - A_i)$).
+  \item \textbf{Histogram Percentiles}: Read \texttt{p50}, \texttt{p95}, \texttt{p99}, and \texttt{p99.9} from merged raw histograms, never by averaging averages. Remember fan-out tail amplification: $1 - (1 - p)^n$.
+  \item \textbf{Little's Law}: Size worker pools and connection limits via $L = \lambda W$, reserving headroom for latency spikes.
+  \item \textbf{RPO \& RTO}: Choose backup, pilot light, warm standby, or active-active topologies strictly from quantified data-loss and downtime limits.
+\end{itemize}
+
+\section{Exercises}
+
+\subsection*{Mechanics}
+\begin{enumerate}[label=\textbf{Exercise~\thechapter.\arabic*}, leftmargin=*]
+  \item Calculate the permissible annual downtime in minutes for an enterprise system targeting $99.95\%$ availability over a 365-day year.
+  \item Four sequential microservices sit in series, each providing $99.9\%$ availability. Compute the composite end-to-end availability and annual downtime in hours.
+\end{enumerate}
+
+\subsection*{Debugging}
+\begin{enumerate}[label=\textbf{Exercise~\thechapter.\arabic*}, leftmargin=*, start=3]
+  \item A load-test summary claims: \textit{``Node A averaged 20 ms over 1,000 requests; Node B averaged 100 ms over 100,000 requests; fleet mean is $(20+100)/2 = 60\text{ ms}$.''} Explain the mathematical error and compute the true fleet arithmetic mean.
+\end{enumerate}
+
+\subsection*{Architecture Design}
+\begin{enumerate}[label=\textbf{Exercise~\thechapter.\arabic*}, leftmargin=*, start=4]
+  \item Design an active-passive Disaster Recovery topology for a PostgreSQL-backed healthcare platform constrained to $\text{RPO} \le 1\text{ minute}$ and $\text{RTO} \le 15\text{ minutes}$. Specify replication, automated failover, DNS routing, and warm compute scaling.
+\end{enumerate}
+
+\section{Detailed Solutions}
+
+\subsection*{Try It Yourself Solution}
+\begin{enumerate}[leftmargin=18pt]
+  \item Steady-state concurrency at $W = 250\text{ ms} = 0.25\text{ s}$:
+  $$L = \lambda W = 1,200 \times 0.25 = 300\text{ concurrent worker tasks}$$
+  \item During the outage ($W' = 4.5\text{ s}$):
+  $$L' = 1,200 \times 4.5 = 5,400\text{ concurrent worker tasks}$$
+  \item With a hard cap of $L_{\max} = 500$ concurrent workers and $W' = 4.5\text{ s}$, Little's Law bounds maximum drain throughput to:
+  $$\lambda_{\max} = \frac{L_{\max}}{W'} = \frac{500}{4.5} \approx 111.1\text{ webhooks/s}$$
+  Because $1,200\text{ webhooks/s}$ arrive while only $111.1\text{/s}$ finish, $1,088.9\text{ webhooks/s}$ accumulate in the queue every second until memory/queue caps trip and deliveries fail or time out. (Remediation: enforce strict per-merchant HTTP timeouts and isolate slow merchants into separate dead-letter/low-priority queues.)
+\end{enumerate}
+
+\subsection*{Mechanics & Debugging Solutions}
+\begin{enumerate}[label=\textbf{Solution~\thechapter.\arabic*}, leftmargin=*]
+  \item Total minutes in a 365-day year: $365 \times 24 \times 60 = 525,600\text{ minutes}$. Permissible downtime fraction is $1 - 0.9995 = 0.0005$:
+  $$\text{Downtime} = 525,600 \times 0.0005 = 262.8\text{ minutes } (4\text{ h } 22\text{ m } 48\text{ s})$$
+  \item Series composite availability:
+  $$A_s = (0.999)^4 = 0.996005996 \approx 99.60\%$$
+  Downtime rises from $8.76\text{ h/yr}$ (single node) to $8,760 \times (1 - 0.996006) \approx 34.99\text{ hours/year}$.
+  \item The report commits the Mean-of-Means fallacy by weighting Node A ($1\%$ of traffic) equally with Node B ($99\%$ of traffic). The true fleet mean is:
+  $$\bar{x} = \frac{(20 \times 1,000) + (100 \times 100,000)}{1,000 + 100,000} = \frac{10,020,000}{101,000} \approx 99.21\text{ ms}$$
+  \item \textbf{Healthcare Active-Passive DR Architecture}:
+  \begin{itemize}[leftmargin=14pt]
+    \item \textbf{Replication ($\text{RPO} \le 1\text{ min}$)}: Configure continuous PostgreSQL physical Write-Ahead Log (WAL) streaming to a cross-region hot standby, backed by continuous WAL segment shipping (e.g., via \texttt{wal-g}) every 10--15 seconds to cross-region object storage. Steady-state replication lag stays under 5 seconds.
+    \item \textbf{Automated Failover ($\text{RTO} \le 15\text{ min}$)}: Run Patroni/Consul health monitors across regions. After 60 seconds of confirmed primary unreachability, Patroni promotes the standby ($\approx 90\text{ s}$), updates a low-TTL (10 s) health-checked DNS failover record (e.g., Route 53 ARC / Azure Traffic Manager), and scales warm standby application replicas from $20\%$ baseline to $100\%$ in $\approx 3\text{ minutes}$. Total failover time $\approx 5.5\text{ minutes} < 15\text{ minutes}$.
+  \end{itemize}
+\end{enumerate}
+
+\begin{labbridgebox}
+Practice availability and budget-burn math interactively in \texttt{exercises/volume5/ex01\_slo\_error\_budget\_burn.py}, and review how non-functional latency and reliability goals shape the multi-service platform in \texttt{projects/p12-end-to-end-platform/README.md}.
+\end{labbridgebox}
+
+\section{Further Reading \protect\& Citations}
+\begin{itemize}[leftmargin=18pt]
+  \item Tene, G. (2015). \textit{How NOT to Measure Latency}. Strange Loop Conference.
+  \item Little, J. D. C. (1961). A Proof for the Queuing Formula: $L = \lambda W$. \textit{Operations Research}, 9(3), 383--387.
+  \item Dean, J., \& Barroso, L. A. (2013). The Tail at Scale. \textit{Communications of the ACM}, 56(2), 74--80.
+  \item Beyer, B., Jones, C., Petoff, J., \& Murphy, N. R. (2016). \textit{Site Reliability Engineering}~\cite{beyer2016site}. O'Reilly Media.
+\end{itemize}

@@ -1,0 +1,438 @@
+\chapter{C4 Architecture Modeling}
+\label{chap:c4}
+
+\begin{chaptergoalsbox}
+\textbf{What You Will Learn:}
+\begin{itemize}[leftmargin=12pt]
+  \item Navigate software architecture across four hierarchical zoom tiers using Simon Brown's **C4 Model**: System Context (L1), Container (L2), Component (L3), and Code (L4).
+  \item Eliminate diagram ambiguity by enforcing explicit element tags (\texttt{[Name, Role, Technology]}), unidirectional protocol-labeled arrows, and visual system boundaries.
+  \item Distinguish a C4 \emph{container} (any separately deployable runtime or data store) from a Docker/OCI container image.
+  \item Version and validate diagrams alongside source code using **Architecture-as-Code** in the **Structurizr DSL**, understanding how an Abstract Syntax Tree (AST) catches broken references before rendering.
+\end{itemize}
+
+\textbf{Prerequisites \& Calibration:}
+No prior knowledge of formal UML syntax, compiler ASTs, or banking clearing protocols is assumed. Whenever we use transport acronyms (\texttt{HTTPS}, \texttt{gRPC}, \texttt{mTLS}) or regulated payment terms (\texttt{ACH}, \texttt{ISO 20022}, \texttt{PCI-DSS}, \texttt{SOC2}), we define them plainly on first appearance.
+
+\textbf{Opening Problem:}
+On your first Monday at a growing payments company, a bug report arrives: \textit{``Settlement payouts for European merchants are stuck in pending.''} You open the company wiki and find three contradictory diagrams exported three years ago---full of unlabeled arrows, internal codenames like ``Zeus,'' and a mix of database tables and AWS regions on the same canvas. Four engineers spend four hours just figuring out which service actually talks to the bank clearinghouse. Good architecture diagrams exist to make that answer obvious in thirty seconds.
+\end{chaptergoalsbox}
+
+\section{Why Whiteboard Diagrams Fail}
+
+When teams sketch architecture informally, four recurring habits destroy clarity:
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{The Mysterious Bidirectional Arrow}: A double-headed line between ``Service A'' and ``Service B'' with no text. Which side opens the connection? Is it a synchronous HTTP call, a shared database, or an asynchronous message queue?
+  \item \textbf{The Missing Legend}: Red boxes, green circles, and blue cylinders with no key explaining whether colors denote programming languages, teams, or security zones.
+  \item \textbf{Mixed Zoom Levels}: Placing a customer persona next to a cloud Availability Zone, an individual Python class, and a PostgreSQL column on one crowded page.
+  \item \textbf{Cryptic Codenames}: Labeling boxes ``Apollo'' or ``Hydra'' without stating what the service does or what technology runs it.
+\end{enumerate}
+
+To fix this, Simon Brown created the **C4 Model**~\cite{c4model} around a simple geographical analogy.
+
+\begin{intuitionbox}[The Google Maps Zoom Analogy]
+On a world map, you see continents and oceans. Zoom into a city and highways appear; zoom further and you see street names and storefronts. No sensible map prints every residential driveway on a globe. C4 enforces the same discipline: pick the zoom level that matches your audience instead of cramming every class and database table onto one diagram.
+\end{intuitionbox}
+
+\section{The Four Hierarchical Abstraction Levels}
+
+C4 organizes architecture into four nested tiers (Figure~\ref{fig:v5-ch02-c4-hierarchy}): **Context (L1)**, **Containers (L2)**, **Components (L3)**, and **Code (L4)**.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=0.9cm and 1.2cm,
+  levelbox/.style={rectangle, draw=headingblue!80, fill=headingblue!5, rounded corners=3pt, text width=12cm, minimum height=1.2cm, inner sep=7pt, font=\sffamily}
+]
+
+\node[levelbox] (l1) {
+  \textbf{\color{headingblue}Level 1: System Context Diagram}\\
+  \small\color{textdark}Shows the system as a single box surrounded by human users (personas) and external third-party systems. Technology-agnostic; readable by executives and engineers alike.
+};
+
+\node[levelbox, below=0.5cm of l1] (l2) {
+  \textbf{\color{headingblue}Level 2: Container Diagram}\\
+  \small\color{textdark}Zooms inside the system to show separately runnable units: web apps, mobile apps, backend APIs, background workers, databases, and message brokers, plus network protocols.
+};
+
+\node[levelbox, below=0.5cm of l2] (l3) {
+  \textbf{\color{headingblue}Level 3: Component Diagram}\\
+  \small\color{textdark}Zooms inside a single container to reveal its internal modules (controllers, domain services, repositories, external adapters) and how they depend on one another.
+};
+
+\node[levelbox, below=0.5cm of l3] (l4) {
+  \textbf{\color{headingblue}Level 4: Code Diagram (Optional)}\\
+  \small\color{textdark}Shows classes, functions, or database schemas. Generated automatically by IDE tools when needed---almost never drawn by hand.
+};
+
+\draw[-{Stealth[scale=1.1]}, thick, color=headingblue!60] (l1) -- (l2);
+\draw[-{Stealth[scale=1.1]}, thick, color=headingblue!60] (l2) -- (l3);
+\draw[-{Stealth[scale=1.1]}, thick, color=headingblue!60] (l3) -- (l4);
+
+\end{tikzpicture}
+\caption{The C4 Model Hierarchical Zoom Progression}
+\label{fig:v5-ch02-c4-hierarchy}
+\end{figure}
+
+\subsection{Level 1: System Context Diagram}
+
+Level 1 establishes the boundary between what your team builds and the outside world. Before drawing Level 1 for a payment platform, note three domain acronyms we label explicitly on the wire:
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{ACH (Automated Clearing House)}: The US inter-bank network that settles bulk bank-to-bank transfers in batches.
+  \item \textbf{ISO 20022}: An international structured messaging standard (typically XML/JSON schemas) used by banks to exchange payment instructions unambiguously.
+  \item \textbf{gRPC / mTLS}: A fast binary RPC protocol (\texttt{gRPC}) secured by \textbf{mutual TLS (mTLS)}, where both client and server verify each other's cryptographic X.509 identity certificates before exchanging data.
+\end{itemize}
+
+Figure~\ref{fig:v5-ch02-l1-context} shows the resulting System Context view: notice there are no databases, message queues, or languages---only users, our platform box, and external dependencies.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1.5cm and 2.0cm,
+  person/.style={rectangle, draw=gray!70, fill=gray!15, rounded corners=4pt, text width=3.0cm, minimum height=1.5cm, align=center, inner sep=6pt, font=\sffamily\footnotesize},
+  system/.style={rectangle, draw=exampleBlue!80, fill=exampleBg, rounded corners=4pt, text width=3.8cm, minimum height=1.7cm, align=center, inner sep=6pt, font=\sffamily\footnotesize},
+  extsystem/.style={rectangle, draw=gray!60, fill=gray!10, rounded corners=4pt, text width=3.4cm, minimum height=1.7cm, align=center, inner sep=6pt, font=\sffamily\footnotesize},
+  arrow/.style={-{Stealth[scale=1.0]}, thick, color=textdark}
+]
+
+\node[person] (merchant) {\textbf{Merchant}\\ \scriptsize[Person]\\ \raggedright Lists goods online and tracks daily payouts.};
+\node[system, right=2.0cm of merchant] (paycore) {\textbf{Global Payments Platform}\\ \scriptsize[Software System]\\ \raggedright Authorizes cards, holds escrow, and settles merchant payouts.};
+\node[extsystem, right=2.0cm of paycore] (bank) {\textbf{Banking Rails / ACH}\\ \scriptsize[External System]\\ \raggedright Inter-bank clearinghouse executing bulk transfers.};
+\node[extsystem, above=1.4cm of paycore] (fraud) {\textbf{Third-Party Fraud API}\\ \scriptsize[External System]\\ \raggedright Real-time anti-money-laundering & risk scoring.};
+\node[person, below=1.4cm of merchant] (buyer) {\textbf{Shopper}\\ \scriptsize[Person]\\ \raggedright Pays for orders at checkout.};
+
+\draw[arrow] (merchant) -- node[above, font=\tiny\sffamily, align=center]{Views reports\\{[HTTPS]}} (paycore);
+\draw[arrow] (buyer) |- node[below, pos=0.72, font=\tiny\sffamily, align=center]{Submits payments\\{[HTTPS]}} (paycore);
+\draw[arrow] (paycore) -- node[above, font=\tiny\sffamily, align=center]{Settles funds\\{[ISO 20022]}} (bank);
+\draw[arrow] (paycore) -- node[right, font=\tiny\sffamily, align=center]{Scores risk\\{[gRPC / mTLS]}} (fraud);
+
+\end{tikzpicture}
+\caption{C4 Level 1: System Context Diagram for Global Payments Platform}
+\label{fig:v5-ch02-l1-context}
+\end{figure}
+
+\subsection{Level 2: Container Diagram}
+
+In C4, a **container** is \emph{not} a Docker container or Kubernetes pod. A C4 container is any \textbf{separately deployable or runnable unit that executes code or stores data}: a browser React app, an iOS mobile app, a Go API server, a Python worker, a PostgreSQL database, a Redis cache, or an Apache Kafka event broker.
+
+Figure~\ref{fig:v5-ch02-l2-container} zooms inside our \texttt{Global Payments Platform} boundary to show its containers and exact communication protocols.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1.2cm and 1.4cm,
+  cnt/.style={rectangle, draw=headingblue!70, fill=headingblue!8, rounded corners=3pt, text width=3.4cm, minimum height=1.5cm, align=left, inner sep=6pt, font=\sffamily\scriptsize},
+  db/.style={cylinder, shape border rotate=90, aspect=0.25, draw=headingblue!70, fill=headingblue!8, text width=2.8cm, minimum height=1.5cm, align=center, inner sep=4pt, font=\sffamily\scriptsize},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=textdark}
+]
+
+\draw[draw=gray!50, dashed, rounded corners=6pt] (-0.3,-5.2) rectangle (12.8,1.8);
+\node[font=\sffamily\bfseries\color{gray!80}, anchor=north west] at (0.0,1.6) {Global Payments Platform [Software System]};
+
+\node[cnt] (web) at (1.6, 0.4) {\textbf{Merchant Web App}\\ \textit{[Container: React / TypeScript]}\\ Serves dashboard UI in browser.};
+\node[cnt] (api) at (6.5, 0.4) {\textbf{API Gateway}\\ \textit{[Container: Go / Envoy]}\\ Routing, JWT check, rate limits.};
+\node[cnt] (order) at (6.5, -2.1) {\textbf{Settlement Service}\\ \textit{[Container: Java / Spring Boot]}\\ Orchestrates ledger & payouts.};
+\node[db] (sqldb) at (11.0, -2.1) {\textbf{Ledger DB}\\ \textit{[Container: PostgreSQL]}\\ Double-entry ledger tables.};
+\node[cnt] (kafka) at (1.6, -4.0) {\textbf{Event Broker}\\ \textit{[Container: Apache Kafka]}\\ Durable settlement event log.};
+\node[cnt] (worker) at (6.5, -4.0) {\textbf{Payout Worker}\\ \textit{[Container: Python AsyncIO]}\\ Dispatches batch ACH files.};
+
+\draw[arrow] (web) -- node[above, font=\tiny\sffamily]{Calls [JSON/HTTPS]} (api);
+\draw[arrow] (api) -- node[right, font=\tiny\sffamily]{Forwards [gRPC]} (order);
+\draw[arrow] (order) -- node[above, font=\tiny\sffamily]{Reads/Writes [JDBC/TLS]} (sqldb);
+\draw[arrow] (order) -- node[above left, font=\tiny\sffamily]{Publishes [Kafka Wire]} (kafka);
+\draw[arrow] (kafka) -- node[above, font=\tiny\sffamily]{Consumes [Kafka]} (worker);
+
+\end{tikzpicture}
+\caption{C4 Level 2: Container Diagram for Settlement Architecture}
+\label{fig:v5-ch02-l2-container}
+\end{figure}
+
+\begin{commonmistakebox}[Equating C4 Containers with Docker Containers]
+A PostgreSQL database installed directly on bare-metal Linux is a C4 container. A Swift app running on a customer's iPhone is a C4 container. Conversely, five sidecar containers packaged inside one Kubernetes pod that logically form one HTTP service still count as one C4 container unless they execute independently addressable workloads.
+\end{commonmistakebox}
+
+\subsection{Level 3: Component Diagram}
+
+Level 3 zooms inside \emph{one} container from Level 2---here, the \texttt{Settlement Service}---to expose the internal code modules running inside that single process and how external containers connect to them (Figure~\ref{fig:v5-ch02-l3-component}).
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.88, every node/.style={transform shape},
+  comp/.style={rectangle, draw=exampleBlue!80, fill=exampleBg, rounded corners=3pt, text width=3.2cm, minimum height=1.35cm, align=left, inner sep=5pt, font=\sffamily\scriptsize},
+  extc/.style={rectangle, draw=gray!70, fill=gray!10, rounded corners=3pt, text width=2.8cm, minimum height=1.1cm, align=center, inner sep=4pt, font=\sffamily\scriptsize},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=textdark}
+]
+
+% Container Boundary
+\draw[draw=headingblue!60, dashed, rounded corners=6pt, fill=headingblue!3] (2.8, -4.8) rectangle (11.2, 2.3);
+\node[font=\sffamily\footnotesize\bfseries\color{headingblue}, anchor=north west] at (3.0, 2.15) {Settlement Service [Container: Java / Spring Boot]};
+
+% External containers (left and right)
+\node[extc] (gw) at (0.3, 0.8) {\textbf{API Gateway}\\ \textit{[Container: Envoy]}};
+\node[extc] (fraud) at (0.3, -3.4) {\textbf{Fraud API}\\ \textit{[External System]}};
+\node[extc] (db) at (13.6, 0.8) {\textbf{Ledger DB}\\ \textit{[Container: Postgres]}};
+\node[extc] (kafka) at (13.6, -3.4) {\textbf{Event Broker}\\ \textit{[Container: Kafka]}};
+
+% Components inside Settlement Service
+\node[comp] (ctrl) at (4.9, 0.8) {\textbf{SettlementController}\\ \textit{[Component: gRPC]}\\ Validates payloads \& auth claims.};
+\node[comp] (svc) at (9.1, -1.2) {\textbf{LedgerDomainService}\\ \textit{[Component: Spring Bean]}\\ Enforces balance invariants & payout state.};
+\node[comp] (repo) at (9.1, 0.8) {\textbf{LedgerRepository}\\ \textit{[Component: JDBC DAO]}\\ Executes SQL journal inserts.};
+\node[comp] (fclient) at (4.9, -3.4) {\textbf{FraudClientAdapter}\\ \textit{[Component: Resilience4j]}\\ Circuit-broken gRPC risk client.};
+\node[comp] (pub) at (9.1, -3.4) {\textbf{OutboxPublisher}\\ \textit{[Component: Kafka Client]}\\ Emits captured events.};
+
+% Arrows
+\draw[arrow] (gw) -- node[above, font=\tiny\sffamily]{gRPC} (ctrl);
+\draw[arrow] (ctrl) |- node[left, pos=0.25, font=\tiny\sffamily]{Invokes} (svc);
+\draw[arrow] (svc) -- node[right, font=\tiny\sffamily]{Persists} (repo);
+\draw[arrow] (repo) -- node[above, font=\tiny\sffamily]{JDBC/TLS} (db);
+\draw[arrow] (svc) -| node[above, pos=0.25, font=\tiny\sffamily]{Checks risk} (fclient);
+\draw[arrow] (fclient) -- node[above, font=\tiny\sffamily]{mTLS} (fraud);
+\draw[arrow] (svc) -- node[right, font=\tiny\sffamily]{Publishes} (pub);
+\draw[arrow] (pub) -- node[above, font=\tiny\sffamily]{Kafka Wire} (kafka);
+
+\end{tikzpicture}
+\caption{C4 Level 3: Component Diagram Zooming Inside \texttt{Settlement Service}}
+\label{fig:v5-ch02-l3-component}
+\end{figure}
+
+Notice how Level 3 enforces clean architectural boundaries: \texttt{SettlementController} never opens a raw JDBC socket to \texttt{Ledger DB}; it must pass through \texttt{LedgerDomainService} and \texttt{LedgerRepository}.
+
+\subsection{Level 4: Code Diagram}
+
+Level 4 shows language-level classes, interfaces, or database table columns. Because code changes daily, maintaining hand-drawn Level 4 diagrams creates guaranteed documentation rot. Generate Level 4 diagrams automatically from code or database schemas only when onboarding onto a uniquely intricate algorithm.
+
+\section{Visual Syntax Rules and Compliance}
+
+Every C4 diagram obeys the discipline summarized in Table~\ref{tab:v5-ch02-syntax-checklist}.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lp{5.5cm}p{5.5cm}}
+\toprule
+\textbf{Element} & \textbf{Mandatory Requirement} & \textbf{Anti-Pattern to Avoid} \\
+\midrule
+\textbf{Box Title} & Explicit name + type/role (e.g., \texttt{Ledger DB [Container: Postgres]}). & Internal codename alone (e.g., \texttt{Zeus}). \\
+\textbf{Technology Tag} & Specific runtime, framework, or datastore. & Blank tag leaving readers guessing. \\
+\textbf{Description} & 1--2 concise phrases stating core responsibility. & Empty rectangle with just a title. \\
+\textbf{Arrows} & Unidirectional, showing who initiates the request or flow. & Bidirectional arrow without flow direction. \\
+\textbf{Arrow Labels} & Action verb + wire protocol (e.g., \texttt{Publishes [Kafka Wire]}). & Unlabeled line or vague ``Uses'' / ``Data.'' \\
+\textbf{Boundaries} & Dashed box naming system or container ownership. & Floating nodes with unclear scope. \\
+\bottomrule
+\end{tabular}
+\caption{C4 Visual Syntax Checklist and Anti-Patterns}
+\label{tab:v5-ch02-syntax-checklist}
+\end{table}
+
+\begin{productionwarningbox}[Compliance Audits and Wiki Rot]
+Static PNG diagrams exported to corporate wikis drift out of date within weeks. In regulated environments---such as \textbf{PCI-DSS} (Payment Card Industry Data Security Standard, protecting credit-card numbers) or \textbf{SOC2} (System and Organization Controls 2, auditing security and availability controls)---handing an auditor a diagram showing an obsolete unencrypted service or missing network boundary can trigger immediate audit findings. Treating diagrams as versioned source code eliminates that drift.
+\end{productionwarningbox}
+
+\section{Architecture-as-Code: The Structurizr DSL}
+
+To keep diagrams synchronized with code, teams use **Architecture-as-Code (AaC)** with the **Structurizr DSL**. The DSL separates the \emph{model} (what exists and what talks to what) from the \emph{views} (which slice to render and how to style it).
+
+\begin{underthehoodbox}[What an AST Does Inside the Structurizr CLI]
+When you write text in a Domain-Specific Language (DSL), a parser reads characters and builds an **Abstract Syntax Tree (AST)**---an in-memory tree of structured nodes (e.g., \texttt{SoftwareSystem("Payment Gateway")} containing child \texttt{Container("Ledger Store")}). Why build an AST instead of drawing boxes directly from regexes? Because the AST lets Structurizr validate \textbf{referential integrity}: if line 28 writes \texttt{paymentCore -> legerDb} (typo in \texttt{ledgerDb}), the validator walks the AST, detects an undeclared target node, and fails the CI build before exporting canonical JSON for PlantUML or Mermaid renderers.
+\end{underthehoodbox}
+
+\begin{lstlisting}[language=Java, caption={Structurizr DSL Workspace for Global Payments Gateway}]
+workspace "Global Payments Gateway" "Production C4 Model" {
+
+    model {
+        merchant = person "Online Merchant" "Manages products and payouts."
+        shopper  = person "End Shopper" "Submits checkout payments."
+
+        enterprise "Acme Fintech Corp" {
+            fraudApi     = softwareSystem "Risk Engine" "Real-time fraud scoring." "External"
+            bankingRails = softwareSystem "ACH Settlement Rails" "Inter-bank clearing." "External"
+
+            paymentSystem = softwareSystem "Payment Gateway" "Processes global payments." {
+                webApp      = container "Merchant Portal" "Dashboard UI" "TypeScript / React"
+                apiGateway  = container "Edge Gateway" "TLS, JWT auth, rate limits" "Envoy / Go"
+                paymentCore = container "Settlement Service" "Ledger state machine" "Java / Spring Boot"
+                ledgerDb    = container "Ledger DB" "Double-entry store" "PostgreSQL 16" "Database"
+                eventBus    = container "Event Broker" "Settlement stream" "Apache Kafka" "Queue"
+            }
+        }
+
+        shopper -> apiGateway "Submits checkout payments" "JSON/HTTPS"
+        merchant -> webApp "Views settlement reports" "HTTPS"
+        webApp -> apiGateway "Calls backend endpoints" "JSON/HTTPS"
+
+        apiGateway -> paymentCore "Dispatches charge requests" "gRPC/HTTP2"
+        paymentCore -> ledgerDb "Appends journal entries" "JDBC/TLS"
+        paymentCore -> eventBus "Emits PaymentCaptured events" "Kafka Wire"
+        paymentCore -> fraudApi "Requests fraud risk score" "gRPC/mTLS"
+        paymentCore -> bankingRails "Submits batch settlement file" "SFTP / ISO 20022"
+    }
+
+    views {
+        systemContext paymentSystem "SystemContext" {
+            include *
+            autoLayout lr
+        }
+        container paymentSystem "Containers" {
+            include *
+            autoLayout tb
+        }
+        styles {
+            element "Person" {
+                shape Person
+                background #08427b
+                color #ffffff
+            }
+            element "Software System" {
+                background #1168bd
+                color #ffffff
+            }
+            element "Container" {
+                background #438dd5
+                color #ffffff
+            }
+            element "Database" {
+                shape Cylinder
+                background #2a52be
+                color #ffffff
+            }
+        }
+    }
+}
+\end{lstlisting}
+
+\textbf{Step-by-Step DSL Walkthrough:}
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Model Declarations (Lines 4--18)}: Every entity receives a unique identifier (\texttt{paymentCore}, \texttt{ledgerDb}). Nesting \texttt{container} blocks inside \texttt{paymentSystem} tells the AST which system owns those deployable units. Trailing strings like \texttt{"Database"} or \texttt{"External"} attach reusable tags.
+  \item \textbf{Relationships (Lines 20--28)}: Each \texttt{A -> B "Description" "Protocol"} line registers a directed edge between declared identifiers. Defining each relationship once means it appears automatically in every view where both endpoints are visible.
+  \item \textbf{Views (Lines 31--40)}: \texttt{systemContext paymentSystem} generates Level 1 (collapsing all internal containers into one \texttt{Payment Gateway} box), whereas \texttt{container paymentSystem} generates Level 2. \texttt{include *} pulls in all direct relationships, and \texttt{autoLayout lr} (left-to-right) or \texttt{tb} (top-to-bottom) computes box coordinates deterministically.
+  \item \textbf{Styles (Lines 41--58)}: Tag selectors match elements by type or custom tag---for example, applying \texttt{shape Cylinder} to anything tagged \texttt{"Database"}---so visual rules never leak into the structural model.
+\end{enumerate}
+
+\begin{realworldbox}[Diagnostic Walkthrough: Tracing a Latency Spike Across 200+ Services]
+\textbf{Symptoms:} During peak morning payouts, PagerDuty triggers a high-latency alert on \texttt{ledger-posting-svc} (\texttt{p99 = 1,800 ms}, normally $35\text{ ms}$).\\
+\textbf{Metrics & Logs:} Service metrics show database CPU at $94\%$ and active connections pinned at $200/200$, while \texttt{ledger-posting-svc} logs show thousands of \texttt{POST /internal/entries} calls from an unrecognized user-agent \texttt{payout-reconciler/1.4}.\\
+\textbf{Root Cause Investigation:} Rather than grepping 200 repositories, the on-call engineer opens the platform's Git-generated C4 Container catalog (built automatically like Monzo's service graph from Kubernetes manifests and RPC routing metadata) centered on \texttt{ledger-posting-svc}. One upstream edge stands out: \texttt{payout-reconciler} was added two weeks earlier calling \texttt{ledger-posting-svc} synchronously in a tight retry loop instead of reading from the Kafka event stream.\\
+\textbf{Remediation:} The team rate-limits \texttt{payout-reconciler} at the Envoy sidecar and moves it onto the Kafka consumer group documented in the C4 model, restoring \texttt{p99} to $38\text{ ms}$.
+\end{realworldbox}
+
+\begin{tryityourselfbox}[Model a Multi-Tenant Notification Service in Structurizr DSL]
+Using Structurizr DSL syntax, model a \texttt{Notification Platform} system containing:
+\begin{enumerate}
+  \item An \texttt{Apache Kafka} event bus supplying notification requests.
+  \item A \texttt{Notification Dispatcher} container that consumes Kafka events, tracks delivery state in a \texttt{Redis} cluster, and calls three external systems: \texttt{Apple APNs}, \texttt{Google FCM}, and \texttt{SendGrid}.
+\end{enumerate}
+Declare all elements with technology tags, unidirectional protocol-labeled arrows, and a \texttt{container} view.
+\end{tryityourselfbox}
+
+\section{Summary \protect\& Key Takeaways}
+
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Four Zoom Tiers}: Separate System Context (L1), Containers (L2), Components (L3), and Code (L4) so each diagram answers one clear question for one audience.
+  \item \textbf{Container Definition}: A C4 container is any separately deployable code runtime or datastore, not a Docker image.
+  \item \textbf{Syntax Discipline}: Label every box with Name, Type, and Technology; label every arrow with an action verb, direction, and wire protocol.
+  \item \textbf{Architecture-as-Code}: Store models in Structurizr DSL inside Git so CI validates references via AST checks and regenerates views on every merge.
+\end{itemize}
+
+\section{Exercises}
+
+\subsection*{Mechanics}
+\begin{enumerate}[label=\textbf{Exercise~\thechapter.\arabic*}, leftmargin=*]
+  \item Classify each item into its C4 abstraction category (Person, Software System, External System, Container, or Component): (a) PostgreSQL 16 database, (b) React web SPA, (c) Customer Support Agent, (d) Stripe Billing API, (e) \texttt{JwtTokenValidator} class inside an Auth API.
+  \item Explain why an unlabeled bidirectional arrow between an API service and a Redis cache violates C4 rules, and rewrite it properly.
+\end{enumerate}
+
+\subsection*{Debugging}
+\begin{enumerate}[label=\textbf{Exercise~\thechapter.\arabic*}, leftmargin=*, start=3]
+  \item A wiki page says: \textit{``Our System Context diagram shows the Customer connecting directly to our Python SQLAlchemy ORM Session, bypassing the Nginx Reverse Proxy.''} Identify two severe architectural and abstraction mistakes in this statement.
+\end{enumerate}
+
+\subsection*{Architecture Design}
+\begin{enumerate}[label=\textbf{Exercise~\thechapter.\arabic*}, leftmargin=*, start=4]
+  \item Draw a C4 Level 2 Container Diagram for an IoT Telemetry Ingestion Platform: 100,000 smart energy meters publish MQTT v5 telemetry to an \texttt{EMQX} broker; an \texttt{Apache Flink} stream processor subscribes over MQTT to compute 1-minute aggregates and writes them to \texttt{TimescaleDB}; a \texttt{Go REST API} queries TimescaleDB to serve a \texttt{React Grid Ops Portal}.
+\end{enumerate}
+
+\section{Detailed Solutions}
+
+\subsection*{Try It Yourself Solution}
+\begin{lstlisting}[language=Java, caption={Structurizr DSL Solution for the Multi-Tenant Notification Service}]
+workspace "Multi-Tenant Notification Platform" "Try It Yourself Solution" {
+    model {
+        user = person "End User" "Receives push alerts and transactional emails."
+
+        apns     = softwareSystem "Apple APNs" "iOS push gateway." "External"
+        fcm      = softwareSystem "Google FCM" "Android push gateway." "External"
+        sendgrid = softwareSystem "SendGrid" "Transactional email API." "External"
+
+        notifSys = softwareSystem "Notification Platform" "Delivers multi-channel alerts." {
+            kafka      = container "Notification Bus" "Event queue" "Apache Kafka" "Queue"
+            dispatcher = container "Notification Dispatcher" "Fan-out worker" "Go 1.23"
+            redis      = container "Delivery State Store" "Deduplication & status" "Redis Cluster" "Database"
+        }
+
+        kafka -> dispatcher "Delivers notification jobs" "Kafka Wire Protocol"
+        dispatcher -> redis "Tracks idempotency & status" "RESP / TLS"
+        dispatcher -> apns "Sends iOS pushes" "HTTP/2 + APNs JWT"
+        dispatcher -> fcm "Sends Android pushes" "HTTPS / OAuth2"
+        dispatcher -> sendgrid "Sends emails" "JSON / HTTPS"
+        apns -> user "Delivers mobile push" "APNs"
+        fcm -> user "Delivers mobile push" "FCM"
+        sendgrid -> user "Delivers email" "SMTP / TLS"
+    }
+
+    views {
+        container notifSys "NotificationContainers" {
+            include *
+            autoLayout lr
+        }
+    }
+}
+\end{lstlisting}
+
+\subsection*{Mechanics, Debugging & Architecture Solutions}
+\begin{enumerate}[label=\textbf{Solution~\thechapter.\arabic*}, leftmargin=*]
+  \item Classifications: (a) \textbf{Container} (Data Store), (b) \textbf{Container} (Web SPA), (c) \textbf{Person}, (d) \textbf{External System}, (e) \textbf{Component} (encapsulated module running inside the Auth API container).
+  \item A bidirectional arrow hides which process opens the TCP socket and what protocol travels over it. Corrected unidirectional arrow:
+  $$\text{API Service} \xrightarrow{\text{Reads/writes session cache [RESP / TLS]}} \text{Redis Cluster}$$
+  \item Two violations: (1) \textbf{Level Mixing (L1 vs.\ L3/L4)}: A System Context diagram only depicts Persons and Software Systems; a SQLAlchemy ORM Session is an internal Component/Code object. (2) \textbf{Impossible Network Topology}: A browser cannot directly invoke an in-memory Python ORM object over the public internet; traffic passes through HTTPS to the reverse proxy container first.
+  \item Figure~\ref{fig:v5-ch02-iot-solution} presents the corrected C4 Level 2 Container Diagram. Note that \texttt{EMQX} connects to \texttt{Apache Flink} over \textbf{MQTT v5 / TLS} (using Flink's MQTT source connector); in ultra-high-burst deployments where durable multi-day replay is required, architects place an explicit \texttt{Apache Kafka} container between \texttt{EMQX} and \texttt{Flink} rather than mixing protocol labels.
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1.2cm and 1.5cm,
+  cnt/.style={rectangle, draw=headingblue!80, fill=headingblue!8, rounded corners=3pt, text width=3.3cm, minimum height=1.55cm, align=left, inner sep=6pt, font=\sffamily\scriptsize},
+  db/.style={cylinder, shape border rotate=90, aspect=0.25, draw=headingblue!80, fill=headingblue!8, text width=2.8cm, minimum height=1.5cm, align=center, inner sep=4pt, font=\sffamily\scriptsize},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=textdark}
+]
+
+\draw[draw=gray!50, dashed, rounded corners=6pt] (2.4, -4.0) rectangle (11.2, 1.3);
+\node[font=\sffamily\bfseries\scriptsize\color{gray!80}, anchor=north west] at (2.6, 1.15) {IoT Telemetry Platform [Software System]};
+
+\node[cnt, fill=gray!10, draw=gray!60] (meter) at (0, 0) {\textbf{Smart Energy Meter}\\ \textit{[External System]}\\ Transmits smart-meter telemetry.};
+\node[cnt] (broker) at (4.5, 0) {\textbf{MQTT Broker}\\ \textit{[Container: EMQX]}\\ Terminates 100k meter sockets.};
+\node[cnt] (flink) at (9.0, 0) {\textbf{Stream Pipeline}\\ \textit{[Container: Apache Flink]}\\ Computes 1-min window rollups.};
+\node[db] (tsdb) at (9.0, -2.8) {\textbf{Telemetry Store}\\ \textit{[Container: TimescaleDB]}\\ Hypertable time-series DB.};
+\node[cnt] (api) at (4.5, -2.8) {\textbf{Analytics API}\\ \textit{[Container: Go / Gin]}\\ Exposes rollup endpoints.};
+\node[cnt] (ui) at (0, -2.8) {\textbf{Grid Ops Portal}\\ \textit{[Container: React / TS]}\\ Live grid dashboard.};
+
+\draw[arrow] (meter) -- node[above, font=\tiny\sffamily]{Publishes [MQTT/TLS]} (broker);
+\draw[arrow] (broker) -- node[above, font=\tiny\sffamily]{Subscribes [MQTT v5/TLS]} (flink);
+\draw[arrow] (flink) -- node[right, font=\tiny\sffamily]{Writes [JDBC/TLS]} (tsdb);
+\draw[arrow] (api) -- node[above, font=\tiny\sffamily]{Queries [SQL/TCP]} (tsdb);
+\draw[arrow] (ui) -- node[above, font=\tiny\sffamily]{Fetches [HTTPS/JSON]} (api);
+
+\end{tikzpicture}
+\caption{C4 Level 2 Container Diagram for IoT Telemetry Ingestion Platform}
+\label{fig:v5-ch02-iot-solution}
+\end{figure}
+
+\begin{labbridgebox}
+Run \texttt{python3 exercises/volume5/ex03\_c4\_model\_validator.py} to inspect how a Python AST/graph validator enforces C4 containment and blocks boundary violations, and map out the container boundaries in \texttt{projects/p12-end-to-end-platform/docker-compose.yml}.
+\end{labbridgebox}
+
+\section{Further Reading \protect\& Citations}
+\begin{itemize}[leftmargin=18pt]
+  \item Brown, S. (2023). \textit{The C4 Model for Visualising Software Architecture}~\cite{c4model}.
+  \item Brown, S. (2018). \textit{Software Architecture for Developers}. Leanpub.
+  \item Structurizr DSL Specification: \url{https://structurizr.com/dsl}.
+\end{itemize}

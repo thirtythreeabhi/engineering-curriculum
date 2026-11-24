@@ -1,0 +1,511 @@
+\chapter{Concurrency Models, Event Loops, and Fibers}
+\label{chap:concurrency}
+
+Suppose you build a telemetry server that holds open connections from 10,000 sensors. Each sensor sends a tiny 60-byte heartbeat once every 30 seconds, so 99.9\% of the time, almost every socket is completely silent. Yet if you spawn one operating-system thread per sensor, your server quickly burns through gigabytes of virtual memory and spends most of its CPU switching between idle workers. Meanwhile, a single-threaded event loop handles all 10,000 sockets using a few dozen megabytes of RAM.
+
+How can one worker juggle 10,000 connections faster than 10,000 workers? Answering that question---known historically as the 	extbf{C10K problem}---requires building a clear mental model of call stacks, blocking vs.\ non-blocking sockets, kernel I/O multiplexers, and the four major concurrency paradigms used in modern backends.
+
+% ==========================================
+\section{Processes, Threads, and Blocking vs.\ Non-Blocking I/O}
+
+From the Foundations Primer, a \textbf{process} is an isolated program with its own private memory, and a \textbf{thread} is an independent execution worker inside that process. Each thread needs its own private \textbf{call stack} to remember where each function was called from and what local variables it holds.
+
+On Linux, creating an OS thread via 	exttt{pthread\_create()} reserves a large virtual memory stack---typically \textbf{2\,MB to 8\,MB} per thread---followed by an unreadable \textbf{guard page} so a runaway recursive function crashes immediately instead of silently overwriting adjacent memory. Even before a thread runs serious work, reserving stacks for 10,000 threads claims $10{,}000 \times 8\text{\,MB} = 80\text{\,GB}$ of virtual address space!
+
+\subsection{Why Default Sockets Block}
+
+When your server reads from a network socket (a kernel integer handle called a \textbf{file descriptor}), by default that 	exttt{read()} call is \textbf{blocking}:
+\begin{enumerate}[leftmargin=15pt]
+  \item Your thread asks the OS kernel: ``Give me bytes from socket \#42.''
+  \item If no packet has arrived yet from the network card, the kernel marks your thread \emph{asleep} and takes it off the CPU until bytes arrive.
+  \item Because that thread is frozen waiting on socket \#42, it cannot check sockets \#43 through \#10,041---so a blocking server is forced to dedicate one full thread per connection.
+\end{enumerate}
+
+\subsection{Non-Blocking I/O and Kernel Event Multiplexers}
+
+If you flip a socket into \textbf{non-blocking mode} (	exttt{O\_NONBLOCK}), calling 	exttt{read()} when no data is ready returns immediately with an error code 	exttt{EAGAIN} (``try again later''). However, looping over 10,000 sockets in user space asking ``Ready? Ready? Ready?'' burns 100\% of a CPU core doing nothing useful ($O(N)$ busy-polling).
+
+The real breakthrough is letting the \textbf{OS kernel watch all 10,000 sockets at once} and wake your program only when specific sockets actually have data:
+
+\begin{table}[htbp]
+\centering
+\small\sffamily
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Kernel API} & \textbf{OS Family} & \textbf{Lookup Cost} & \textbf{Triggering Mode} \\ \midrule
+	exttt{select()} & POSIX / Windows & $O(N)$ (1,024 FD cap) & Level-triggered \\
+	exttt{poll()} & POSIX & $O(N)$ (no 1,024 cap) & Level-triggered \\
+	exttt{epoll()} & Linux & $O(1)$ per ready event & Level-triggered (default) or Edge (	exttt{EPOLLET}) \\
+	exttt{kqueue()} & macOS / FreeBSD & $O(1)$ per ready event & Level-triggered (default) or Edge (	exttt{EV\_CLEAR}) \\ \bottomrule
+\end{tabular}
+\caption{Kernel I/O multiplexing interfaces powering modern event loops.}
+\label{tab:v1-ch02-multiplexing}
+\end{table}
+
+\begin{intuitionbox}[Level-Triggered vs.\ Edge-Triggered Notifications]
+Think of a mailbox with a red flag:
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{Level-triggered} (default in 	exttt{epoll} and 	exttt{kqueue}): As long as unread letters sit inside the mailbox, the flag stays up. If you read only half the bytes, the next 	exttt{epoll\_wait()} / 	exttt{kevent()} immediately notifies you again.
+  \item \textbf{Edge-triggered} (	exttt{EPOLLET} on Linux, 	exttt{EV\_CLEAR} on BSD/macOS): The kernel notifies you \emph{only once} when new bytes arrive. Your code must loop 	exttt{read()} until it hits 	exttt{EAGAIN}, otherwise remaining buffered bytes will sit unread forever.
+\end{itemize}
+\end{intuitionbox}
+
+Notice how an \textbf{event loop} works with 	exttt{epoll}: your single thread registers 10,000 non-blocking sockets with the kernel once, then sleeps inside 	exttt{epoll\_wait()}. When 12 sensors send packets, the kernel wakes your thread and hands back a list of \emph{only those 12 ready sockets}. You process all 12 in microseconds and go right back to sleep.
+
+% ==========================================
+\section{Preemptive vs.\ Cooperative Scheduling}
+
+Whether a program uses OS threads, Go goroutines, Python coroutines, or PHP Fibers comes down to \emph{who} decides when a task pauses and resumes.
+
+\subsection{Preemptive Multitasking (Kernel-Driven)}
+
+In \textbf{preemptive multitasking} (standard OS threads in Java, C++, or POSIX pthreads), the OS kernel acts like a strict referee with a stopwatch:
+\begin{enumerate}[leftmargin=15pt]
+  \item A hardware timer interrupts the CPU every few milliseconds.
+  \item The CPU switches from user code into kernel mode, saves the running thread's register state and execution position, picks the next runnable thread, updates memory mappings if switching processes, and resumes the new thread.
+\end{enumerate}
+\textbf{Why this has hidden cost:} A kernel context switch takes roughly $1.5\text{--}5\ \mu\text{s}$ directly, plus an indirect penalty: swapping to unrelated threads evicts hot data from the CPU's tiny L1/L2 caches, forcing slower reads from main RAM when execution resumes.
+
+\subsection{Cooperative Multitasking (Voluntary Yield Points)}
+
+In \textbf{cooperative multitasking} (async event loops, coroutines, fibers), tasks never interrupt each other mid-line. Instead, a task runs uninterrupted until it hits an explicit wait operation---such as 	exttt{await} in Python or 	exttt{Fiber::suspend()} in PHP---and voluntarily hands control back to the user-space scheduler.
+\begin{itemize}[leftmargin=15pt]
+  \item Zero transitions into the OS kernel are needed to switch tasks.
+  \item Memory mappings stay unchanged, preserving warm CPU caches.
+  \item Switching tasks shrinks from microseconds to roughly \textbf{10--30 nanoseconds}.
+\end{itemize}
+The trade-off is equally clear: if one cooperative task runs an infinite 	exttt{while (true)} loop or a synchronous blocking call without yielding, it starves every other task on that thread.
+
+% ==========================================
+\section{1:1 Threads, 1:N Coroutines, and M:N Green Threads}
+
+Concurrency runtimes map user-level tasks onto OS kernel threads in three distinct topologies---and confusing them leads to broken capacity math:
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.86, transform shape,
+  node distance=0.6cm and 1.0cm,
+  box/.style={rectangle, draw=headingblue, fill=codebg, rounded corners=2pt, thick, align=center, inner sep=5pt, font=\scriptsize\sffamily},
+  accent/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, thick, align=center, inner sep=5pt, font=\scriptsize\sffamily\bfseries},
+  line/.style={draw=headingblue, -{Stealth[length=2.2mm]}, thick}
+]
+  % 1:1
+  \node[box, minimum width=2.3cm] (u1) {Task 1};
+  \node[box, right=0.2cm of u1, minimum width=2.3cm] (u2) {Task 2};
+  \node[accent, below=0.55cm of u1, minimum width=2.3cm] (os1) {OS Thread 1};
+  \node[accent, below=0.55cm of u2, minimum width=2.3cm] (os2) {OS Thread 2};
+  \draw[line, <->] (u1) -- (os1);
+  \draw[line, <->] (u2) -- (os2);
+  \node[above=0.15cm of u1, xshift=1.25cm, font=\scriptsize\sffamily\bfseries] {1:1 Kernel Threads (Pthreads, Java)};
+
+  % 1:N
+  \node[box, right=1.0cm of u2, minimum width=1.4cm] (f1) {Fiber 1};
+  \node[box, right=0.15cm of f1, minimum width=1.4cm] (f2) {Fiber 2};
+  \node[box, right=0.15cm of f2, minimum width=1.4cm] (f3) {Fiber $N$};
+  \node[accent, below=0.55cm of f2, minimum width=4.6cm] (single) {Single OS Thread (Event Loop)};
+  \draw[line] (f1) -- (single);
+  \draw[line] (f2) -- (single);
+  \draw[line] (f3) -- (single);
+  \node[above=0.15cm of f2, font=\scriptsize\sffamily\bfseries] {1:N Single-Thread (PHP Fibers, asyncio)};
+
+  % M:N
+  \node[box, below=1.6cm of os1, xshift=1.0cm, minimum width=1.6cm] (g1) {Goro 1};
+  \node[box, right=0.15cm of g1, minimum width=1.6cm] (g2) {Goro 2};
+  \node[box, right=0.15cm of g2, minimum width=1.6cm] (g3) {Goro 3};
+  \node[box, right=0.15cm of g3, minimum width=1.6cm] (g4) {Goro $M$};
+  \node[accent, below=0.55cm of g1, xshift=0.9cm, minimum width=3.2cm] (w1) {Worker OS Thread 1};
+  \node[accent, below=0.55cm of g3, xshift=0.9cm, minimum width=3.2cm] (w2) {Worker OS Thread 2};
+  \draw[line] (g1) -- (w1);
+  \draw[line] (g2) -- (w1);
+  \draw[line] (g3) -- (w2);
+  \draw[line] (g4) -- (w2);
+  \node[above=0.15cm of g2, xshift=0.9cm, font=\scriptsize\sffamily\bfseries] {M:N Multi-Core Scheduler (Go Goroutines, Erlang/BEAM)};
+\end{tikzpicture}
+\caption{Three concurrency mapping models: 1:1 OS threads, 1:N single-threaded coroutines/fibers, and M:N work-stealing green threads.}
+\label{fig:v1-ch02-thread-models}
+\end{figure}
+
+\begin{table}[htbp]
+\centering
+\small\sffamily
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Metric} & \textbf{OS Thread (1:1)} & \textbf{PHP 8.1+ Fiber (1:N)} & \textbf{Go Goroutine (M:N)} \\ \midrule
+\textbf{OS Threads Used} & 1 per task & 1 shared thread & $N$ cores (work-stealing) \\
+\textbf{Stack Mechanism} & 2--8\,MB virtual + guard & C 	exttt{mmap} stack + guard & 2\,KB growable heap stack \\
+\textbf{Scheduling} & Kernel preemptive & Cooperative (	exttt{suspend}) & Runtime preemptive/coop \\
+\textbf{Switch Overhead} & $1.5\text{--}5\ \mu\text{s}$ & $\approx 20\text{--}50\text{\,ns}$ & $\approx 20\text{--}100\text{\,ns}$ \\ \bottomrule
+\end{tabular}
+\caption{Comparing 1:1 OS threads, 1:N PHP Fibers, and M:N Go goroutines.}
+\label{tab:v1-ch02-thread-comparison}
+\end{table}
+
+Look closely at PHP Fibers versus Go goroutines, because engineers frequently conflate them:
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{PHP 8.1+ Fibers are 1:N single-threaded cooperative coroutines:} All Fibers created inside a PHP process run on that \emph{one} PHP thread---never migrating across multiple CPU cores. Under the hood, Zend allocates each Fiber's C execution stack via 	exttt{mmap()} (default 	exttt{fiber.stack\_size = 2M} virtual address space with a guard page; physical RAM pages are only committed by the OS as the stack actually grows). Because PHP Fibers reserve ~2\,MB of virtual memory per Fiber, spawning 500,000 simultaneously alive Fibers can hit OS 	exttt{vm.max\_map\_count} limits unless pooled or sized appropriately.
+  \item \textbf{Go Goroutines are M:N work-stealing green threads:} Go starts each goroutine with a tiny \textbf{2\,KB} contiguous heap stack that grows dynamically by copying when needed, and multiplexes $M$ goroutines across $N$ OS worker threads running on all CPU cores.
+\end{itemize}
+
+\begin{realworldbox}[Diagnosing Thread-Pool Exhaustion vs.\ Event-Loop Scaling]
+\textbf{Symptom:} A blocking telemetry service running 1 thread per connection crashes under a 12,000-device reconnect storm with 	exttt{pthread\_create failed: Cannot allocate memory} and 	exttt{vmstat 1} reporting 	exttt{cs} (context switches) above 450,000/sec while user CPU is only 18\%.
+
+\textbf{Diagnostic Steps:}
+\begin{enumerate}[leftmargin=15pt,itemsep=2pt]
+  \item Check per-process thread count (	exttt{cat /proc/<pid>/status | grep Threads}) and virtual memory maps (	exttt{ulimit -s} showing 8,192\,KB default stack; 	exttt{/proc/sys/vm/max\_map\_count}).
+  \item Observe in 	exttt{pidstat -w 1} that 	exttt{nvcswch/s} (voluntary switches) and 	exttt{nivcswch/s} (involuntary switches) dwarf actual payload work.
+  \item Replace thread-per-connection with a single-threaded 	exttt{epoll} event loop (or bounded coroutine pool), cutting virtual memory from tens of gigabytes to a few megabytes and dropping kernel context switches by orders of magnitude.
+\end{enumerate}
+\end{realworldbox}
+
+% ==========================================
+\section{Communicating Sequential Processes (CSP)}
+
+Formalized by C.\,A.\,R. Hoare in 1978, \textbf{Communicating Sequential Processes (CSP)} avoids shared-memory lock bugs with one guiding rule:
+$$\text{\textit{``Do not communicate by sharing memory; instead, share memory by communicating.''}}$$
+
+Instead of two threads mutating the same dictionary behind a mutex, independent sequential routines pass values through typed pipes called \textbf{Channels}. Once Routine A sends a value into a channel, Routine A stops touching it and Routine B becomes its sole owner.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.88, transform shape,
+  node distance=0.8cm and 1.3cm,
+  node/.style={rectangle, draw=headingblue, fill=codebg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily},
+  accent/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily\bfseries},
+  line/.style={draw=headingblue, -{Stealth[length=2.5mm]}, thick}
+]
+  \node[node] (p1) {Routine A};
+  \node[accent, right=of p1] (rendezvous) {Unbuffered Channel\\(Rendezvous Sync Point)};
+  \node[node, right=of rendezvous] (p2) {Routine B};
+  \draw[line] (p1) -- node[above, font=\tiny\sffamily] {Pauses until B ready} (rendezvous);
+  \draw[line] (rendezvous) -- node[above, font=\tiny\sffamily] {Direct hand-off} (p2);
+
+  \node[node, below=1.1cm of p1] (p3) {Routine C};
+  \node[accent, right=of p3] (buf) {Buffered Channel $[V_1, V_2, V_3]$\\Circular Ring Buffer};
+  \node[node, right=of buf] (p4) {Routine D};
+  \draw[line] (p3) -- node[above, font=\tiny\sffamily] {Proceeds if len < cap} (buf);
+  \draw[line] (buf) -- node[above, font=\tiny\sffamily] {Pops FIFO} (p4);
+\end{tikzpicture}
+\caption{CSP channel synchronization: unbuffered rendezvous vs.\ buffered ring queue.}
+\label{fig:v1-ch02-csp-channels}
+\end{figure}
+
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{Unbuffered Channel (Capacity 0):} Acts as a \textbf{rendezvous}. If Routine A sends before Routine B is listening, A pauses. Only when Routine B calls receive does the runtime hand the value directly from A to B and mark both runnable.
+  \item \textbf{Buffered Channel (Capacity $C$):} Backed by a FIFO circular ring buffer. Sends return immediately while occupancy $< C$; senders block only when the buffer is full, providing natural backpressure.
+\end{itemize}
+
+% ==========================================
+\section{The Actor Model: Isolated State and Supervision Trees}
+
+Introduced by Carl Hewitt, Peter Bishop, and Richard Steiger in 1973 and proven at telecom scale in Erlang/OTP, the \textbf{Actor Model} makes each concurrent unit an isolated \textbf{Actor} holding private state and a sequential FIFO \textbf{mailbox}.
+
+On receiving a message, an actor may do three things:
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Create} new child actors.
+  \item \textbf{Send} asynchronous messages to actors whose addresses it knows.
+  \item \textbf{Designate} the behavior/state for the next message in its mailbox.
+\end{enumerate}
+
+Because an actor reads its mailbox one message at a time and shares no memory with any other actor, internal race conditions cannot happen.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.88, transform shape,
+  node distance=0.8cm and 1.2cm,
+  actor/.style={rectangle, draw=headingblue, fill=codebg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily},
+  sup/.style={rectangle, draw=warningRed, fill=warningBg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily\bfseries},
+  line/.style={draw=headingblue, -{Stealth[length=2.5mm]}, thick}
+]
+  \node[sup] (sup) {\textbf{Root Supervisor}\\\small Strategy: 	exttt{OneForOne}};
+  \node[actor, below=1.1cm of sup, xshift=-3.6cm] (w1) {\textbf{Worker Actor 1}\\\small Private State};
+  \node[actor, below=1.1cm of sup] (w2) {\textbf{Worker Actor 2}\\\small Crashes on Bad Frame!};
+  \node[actor, below=1.1cm of sup, xshift=3.6cm] (w3) {\textbf{Worker Actor 3}\\\small Private State};
+
+  \draw[line] (sup) -- node[left, font=\tiny\sffamily] {Monitors} (w1);
+  \draw[line, warningRed] (sup) -- node[right, font=\tiny\sffamily] {Restarts Fresh} (w2);
+  \draw[line] (sup) -- node[right, font=\tiny\sffamily] {Monitors} (w3);
+\end{tikzpicture}
+\caption{Actor supervision tree isolating faults via ``let it crash''.}
+\label{fig:v1-ch02-actor-tree}
+\end{figure}
+
+Instead of burying every function in defensive 	exttt{try/catch} recovery that risks continuing with corrupted state, Actors follow \textbf{``let it crash''}: a crashing worker dies cleanly, and its parent \textbf{Supervisor} applies a deterministic restart policy (	exttt{OneForOne} restarts just the crashed child; 	exttt{OneForAll} restarts all children; 	exttt{RestForOne} restarts children started after the crashed one).
+
+% ==========================================
+\section{Modern Asynchronous PHP: Fibers and the Revolt Event Loop}
+
+PHP 8.1 added native 	exttt{Fiber} support: stackful, cooperative coroutines inside the Zend Engine. Unlike Python generators or 	exttt{async/await}---which are \emph{stackless} and only suspend directly inside an 	exttt{async} function---a Fiber has its own C call stack, so a helper function five calls deep can call 	exttt{Fiber::suspend()} without changing caller signatures.
+
+\subsection{Tracing the Raw 	exttt{Fiber} Primitive}
+
+\begin{lstlisting}[language=PHP,caption={Tracing PHP 8.1+ 	exttt{Fiber} Execution Step-by-Step}]
+<?php
+declare(strict_types=1);
+
+$fiber = new Fiber(function (string $name): string {
+    echo "1. Fiber {$name}: started\n";
+    $reply = Fiber::suspend("need-io");   // Pauses entire Fiber stack here!
+    echo "3. Fiber {$name}: resumed with '{$reply}'\n";
+    return "done-{$name}";
+});
+
+$yielded = $fiber->start("Worker-A");     // Runs until Fiber::suspend()
+echo "2. Caller received '{$yielded}'\n";
+$fiber->resume("db-row-42");              // Resumes right after suspend()
+echo "4. Return value: " . $fiber->getReturn() . "\n";
+\end{lstlisting}
+
+\textbf{Step-by-step execution trace:}
+\begin{enumerate}[leftmargin=15pt]
+  \item 	exttt{\$fiber->start("Worker-A")} switches onto the Fiber's stack and prints 	exttt{1. Fiber Worker-A: started}.
+  \item 	exttt{Fiber::suspend("need-io")} saves the Fiber's call stack and returns 	exttt{"need-io"} directly as the return value of 	exttt{\$fiber->start(...)}.
+  \item The main script prints 	exttt{2. Caller received 'need-io'}, then calls 	exttt{\$fiber->resume("db-row-42")}.
+  \item Execution jumps back inside the Fiber at line 6 with 	exttt{\$reply === "db-row-42"}, prints line 7, returns 	exttt{"done-Worker-A"}, and finishes.
+\end{enumerate}
+
+\subsection{Wiring Fibers to Non-Blocking I/O with Revolt}
+
+Calling 	exttt{Fiber::suspend()} inside a bare event-loop callback with no enclosing 	exttt{Fiber} throws a fatal 	exttt{FiberError: Cannot suspend outside of a fiber}! Libraries like Amp and ReactPHP solve this using the unified \textbf{Revolt (	exttt{revolt/event-loop})} kernel: every callback that needs to suspend runs inside its own 	exttt{Fiber} (for instance via 	exttt{EventLoop::queue()} or an explicit 	exttt{new Fiber(...)}), and I/O watchers resume that specific Fiber when 	exttt{epoll}/	exttt{stream\_select} signals readiness.
+
+\begin{lstlisting}[language=PHP,caption={Non-Blocking TCP Echo Server Using Revolt and Per-Connection Fibers}]
+<?php
+declare(strict_types=1);
+
+use Revolt\EventLoop;
+
+$server = stream_socket_server("tcp://127.0.0.1:8080", $errno, $errstr);
+stream_set_blocking($server, false);
+
+// Helper: suspends the current Fiber until $stream is readable
+function asyncReadLine($stream): ?string {
+    $fiber = Fiber::getCurrent();
+    if ($fiber === null) {
+        throw new LogicException("Must be called inside a Fiber");
+    }
+    $watcherId = EventLoop::onReadable($stream, static function (string $id) use ($fiber): void {
+        EventLoop::cancel($id);
+        $fiber->resume();
+    });
+    Fiber::suspend();
+    $line = fgets($stream);
+    return $line === false ? null : $line;
+}
+
+EventLoop::onReadable($server, static function (string $id, $srv): void {
+    $conn = @stream_socket_accept($srv, 0);
+    if ($conn === false) {
+        return;
+    }
+    stream_set_blocking($conn, false);
+
+    // Spawn a dedicated Fiber for this connection via EventLoop::queue
+    EventLoop::queue(static function () use ($conn): void {
+        $fiber = new Fiber(static function () use ($conn): void {
+            while (($msg = asyncReadLine($conn)) !== null) {
+                fwrite($conn, "ECHO: " . $msg);
+            }
+            fclose($conn);
+        });
+        $fiber->start();
+    });
+});
+
+EventLoop::run();
+\end{lstlisting}
+
+\textbf{Concrete trace with two simultaneous clients (Alice and Bob):}
+\begin{enumerate}[leftmargin=15pt]
+  \item Alice connects. 	exttt{onReadable(\$server)} accepts 	exttt{\$conn\_alice}, queues a callback, and returns immediately to the event loop.
+  \item 	exttt{EventLoop} runs the queued callback, which creates and starts 	exttt{\$fiber\_alice}. Inside 	exttt{asyncReadLine(\$conn\_alice)}, it registers a readable watcher on Alice's socket and calls 	exttt{Fiber::suspend()}, yielding back to the event loop without blocking.
+  \item Before Alice types anything, Bob connects. Because the loop is free, 	exttt{onReadable(\$server)} immediately accepts 	exttt{\$conn\_bob} and starts 	exttt{\$fiber\_bob}, which suspends waiting on Bob's socket.
+  \item Bob sends 	exttt{"ping\textbackslash n"}. The kernel wakes 	exttt{EventLoop}, Bob's watcher cancels itself and calls 	exttt{\$fiber\_bob->resume()}, 	exttt{fgets} reads 	exttt{"ping\textbackslash n"} immediately, writes 	exttt{"ECHO: ping\textbackslash n"}, and suspends again---all on a single OS thread!
+\end{enumerate}
+
+\begin{intuitionbox}[Why Fibers Avoid ``Function Coloring'']
+In Python or JavaScript, calling an 	exttt{async} database driver forces every caller above it to become 	exttt{async def} and write 	exttt{await} (``function coloring''). Because PHP Fibers save the entire call stack in C, 	exttt{asyncReadLine()} looks synchronous to its callers while remaining 100\% non-blocking inside the Revolt loop.
+\end{intuitionbox}
+
+\begin{tryityourselfbox}[Predict the Interleaved Fiber Trace]
+Suppose you create two Fibers without Revolt: 	exttt{\$f1} prints 	exttt{"A1"}, suspends, then prints 	exttt{"A2"}; 	exttt{\$f2} prints 	exttt{"B1"}, suspends, then prints 	exttt{"B2"}. Your scheduler calls 	exttt{\$f1->start()}, 	exttt{\$f2->start()}, 	exttt{\$f2->resume()}, 	exttt{\$f1->resume()}. Write down the exact 4-line output and state whether any OS thread switch occurred.
+\end{tryityourselfbox}
+
+% ==========================================
+\section{Chapter Summary \protect\& Key Takeaways}
+
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{Kernel I/O Multiplexing:} Blocking sockets waste one 2--8\,MB OS thread stack per idle connection. Non-blocking sockets paired with $O(1)$ kernel selectors (	exttt{epoll} on Linux, 	exttt{kqueue} on BSD/macOS---level-triggered by default, edge-triggered with 	exttt{EV\_CLEAR}) let one thread monitor tens of thousands of sockets.
+  \item \textbf{Preemptive vs.\ Cooperative:} Kernel preemption isolates misbehaving CPU loops at microsecond context-switch and cache-eviction cost; cooperative routines switch in nanoseconds at explicit yield points.
+  \item \textbf{1:1 vs.\ 1:N vs.\ M:N:} Pthreads are 1:1 OS threads; PHP Fibers are 1:N single-threaded cooperative stackful coroutines using 	exttt{mmap} C stacks with guard pages; Go goroutines are M:N work-stealing green threads starting at 2\,KB.
+  \item \textbf{CSP \& Actors:} CSP passes ownership over rendezvous or bounded ring-buffer channels; Actors isolate private state behind async mailboxes and supervision trees.
+  \item \textbf{PHP Fibers + Revolt:} Never call 	exttt{Fiber::suspend()} directly outside a Fiber; launch per-task Fibers inside 	exttt{EventLoop::queue()} and resume them from non-blocking I/O watchers.
+\end{itemize}
+
+% ==========================================
+\section{Exercises and Real-World Scenarios}
+
+\subsection{Mechanics Exercises}
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Exercise~\thechapter.1:} A 64-bit Linux host has 32\,GB of RAM, reserving 25\% for the OS kernel and page cache. Calculate the maximum theoretical number of 1:1 OS threads with 4\,MB stacks versus M:N green threads with 4\,KB initial stacks. Why do PHP 8.1+ Fibers (default 2\,MB virtual 	exttt{mmap} stack) behave differently from both?
+  \item \textbf{Exercise~\thechapter.2:} Trace step-by-step what happens on an unbuffered CSP channel when a sender writes a value before any receiver is waiting.
+\end{enumerate}
+
+\subsection{Debugging Exercise}
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Exercise~\thechapter.3:} An engineer tries to speed up CPU-heavy math across 8 cores in standard CPython using:
+\begin{lstlisting}[language=Python]
+import threading
+def compute_heavy_math(data):
+    return [x ** 2 for x in data]
+threads = [threading.Thread(target=compute_heavy_math, args=(c,)) for c in chunks]
+for t in threads: t.start()
+for t in threads: t.join()
+\end{lstlisting}
+  Benchmarks show 8 threads run 40\% slower than 1 thread. Explain the exact cause and provide the production fix.
+\end{enumerate}
+
+\subsection{Architecture Design Problem}
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Exercise~\thechapter.4:} Design an IoT telemetry gateway in PHP 8.3 using Revolt and Fibers that holds 20,000 persistent TCP sensor connections, reads newline-delimited JSON without blocking, batches readings into chunks of 1,000 (or every 500\,ms), and flushes them in a single multi-row 	exttt{INSERT} while enforcing backpressure when the database slows down.
+\end{enumerate}
+
+% ==========================================
+\section{Detailed Solutions}
+
+\subsection{Solution to Try It Yourself: Interleaved Fiber Trace}
+Exact output:
+\begin{verbatim}
+A1
+B1
+B2
+A2
+\end{verbatim}
+Zero OS thread switches occurred. Both Fibers executed sequentially on the single PHP thread; 	exttt{start()} and 	exttt{resume()} simply swapped Zend VM execution pointers and C 	exttt{mmap} stack pointers in user space.
+
+\subsection{Solution~\thechapter.1: Stack Memory Capacity Math}
+\begin{enumerate}[leftmargin=15pt]
+  \item Usable application RAM: $32\text{\,GB} \times 0.75 = 24\text{\,GB} = 24{,}576\text{\,MB}$.
+  \item \textbf{1:1 OS Threads (4\,MB stack):} $\frac{24{,}576\text{\,MB}}{4\text{\,MB}} = \mathbf{6{,}144\text{ threads}}$ (and virtual address space + kernel task structs limit scaling even further).
+  \item \textbf{4\,KB M:N Green Threads:} $\frac{24{,}576 \times 1{,}024\text{\,KB}}{4\text{\,KB}} = \mathbf{6{,}291{,}456\text{ green threads}}$ (subject to payload heap memory).
+  \item \textbf{PHP Fibers:} Each Fiber reserves ~2\,MB of \emph{virtual} address space via 	exttt{mmap} (so physical RAM is only consumed by pages actually touched on the C stack), runs strictly 1:N on one PHP thread, and is bounded primarily by 	exttt{vm.max\_map\_count} and per-Fiber PHP heap objects rather than 4\,MB of physical RAM per Fiber.
+\end{enumerate}
+
+\subsection{Solution~\thechapter.2: Unbuffered CSP Channel Trace}
+\begin{enumerate}[leftmargin=15pt]
+  \item Sender attempts to send 	exttt{val} on unbuffered channel 	exttt{ch}.
+  \item Because no receiver is waiting in the receive queue, the sender suspends and places a wait entry holding 	exttt{val} onto the channel's send wait queue. (In \textbf{Go's specific M:N runtime}, this allocates a 	exttt{sudog} descriptor on 	exttt{ch.sendq} and parks the goroutine in 	exttt{Gwaiting} state, freeing its OS worker thread to run another goroutine.)
+  \item Later, a receiver executes receive on 	exttt{ch}, finds the waiting sender, copies 	exttt{val} directly from the sender's entry into the receiver's destination variable, and marks the sender runnable again (	exttt{Grunnable} in Go).
+  \item Both routines continue past the rendezvous point.
+\end{enumerate}
+
+\subsection{Solution~\thechapter.3: CPython GIL Contention on CPU Work}
+\textbf{Diagnosis:} Standard CPython protects object reference counts with the \textbf{Global Interpreter Lock (GIL)}, allowing only one thread to execute Python bytecode at once. Because 	exttt{compute\_heavy\_math} performs zero blocking I/O, all 8 threads compete for the single GIL every 5\,ms, paying OS thread-wake and cache-thrashing costs with zero parallel speedup.
+
+\textbf{Correction:} Spawn separate OS processes (each with its own interpreter and GIL) via 	exttt{ProcessPoolExecutor} (or use a free-threaded Python 3.13+ 	exttt{--disable-gil} build \cite{pep703}):
+\begin{lstlisting}[language=Python]
+from concurrent.futures import ProcessPoolExecutor
+
+with ProcessPoolExecutor(max_workers=8) as pool:
+    results = list(pool.map(compute_heavy_math, chunks))
+\end{lstlisting}
+
+\subsection{Solution~\thechapter.4: Revolt + Fiber IoT Telemetry Gateway}
+\begin{lstlisting}[language=PHP,caption={Batching IoT Telemetry Gateway in Revolt + Fibers}]
+<?php
+declare(strict_types=1);
+
+use Revolt\EventLoop;
+
+final class TelemetryGateway {
+    /** @var list<array{sensor:string,value:float,ts:int}> */
+    private array $buffer = [];
+    private bool $flushing = false;
+    private const int MAX_BATCH = 1000;
+    private const int MAX_BUFFER = 10000; // Backpressure cap
+
+    public function __construct(private readonly PDO $pdo) {}
+
+    public function run(string $listenAddr): void {
+        $server = stream_socket_server($listenAddr, $errno, $errstr);
+        stream_set_blocking($server, false);
+
+        EventLoop::onReadable($server, function (string $id, $srv): void {
+            $conn = @stream_socket_accept($srv, 0);
+            if ($conn === false) return;
+            stream_set_blocking($conn, false);
+
+            EventLoop::queue(function () use ($conn): void {
+                (new Fiber(fn() => $this->handleClient($conn)))->start();
+            });
+        });
+
+        EventLoop::repeat(0.5, function (): void {
+            if ($this->buffer !== []) {
+                (new Fiber(fn() => $this->flush()))->start();
+            }
+        });
+
+        EventLoop::run();
+    }
+
+    private function handleClient($conn): void {
+        while (($line = $this->readLineAsync($conn)) !== null) {
+            if (count($this->buffer) >= self::MAX_BUFFER) {
+                fwrite($conn, "429 OVERLOADED\n"); // Shed/pause load
+                continue;
+            }
+            $row = json_decode($line, true);
+            if (isset($row['sensor'], $row['value'], $row['ts'])) {
+                $this->buffer[] = $row;
+                if (count($this->buffer) >= self::MAX_BATCH) {
+                    $this->flush();
+                }
+            }
+        }
+        fclose($conn);
+    }
+
+    private function readLineAsync($conn): ?string {
+        $fiber = Fiber::getCurrent();
+        $id = EventLoop::onReadable($conn, static function (string $wid) use ($fiber): void {
+            EventLoop::cancel($wid);
+            $fiber->resume();
+        });
+        Fiber::suspend();
+        $line = fgets($conn);
+        return $line === false ? null : $line;
+    }
+
+    private function flush(): void {
+        if ($this->flushing || $this->buffer === []) return;
+        $this->flushing = true;
+        $batch = array_splice($this->buffer, 0, self::MAX_BATCH);
+        try {
+            $placeholders = implode(',', array_fill(0, count($batch), '(?,?,?)'));
+            $stmt = $this->pdo->prepare(
+                "INSERT INTO telemetry(sensor, val, ts) VALUES {$placeholders}"
+            );
+            $params = [];
+            foreach ($batch as $item) {
+                array_push($params, $item['sensor'], $item['value'], $item['ts']);
+            }
+            $stmt->execute($params);
+        } finally {
+            $this->flushing = false;
+        }
+    }
+}
+\end{lstlisting}
+\textbf{Walkthrough:} Incoming connections spawn isolated Fibers via 	exttt{EventLoop::queue()}. Each Fiber suspends inside 	exttt{readLineAsync()} until bytes arrive, appending validated readings to 	exttt{\$this->buffer}. Either hitting 1,000 queued events or the 500\,ms timer triggers 	exttt{flush()}, which slices out a batch and runs one multi-row prepared 	exttt{INSERT}. If the database stalls and 	exttt{\$this->buffer} reaches 10,000 items, 	exttt{handleClient()} rejects new items with 	exttt{429 OVERLOADED} instead of exhausting worker memory.
+
+\begin{labbridgebox}[Practice Event Loops \& Concurrency]
+\begin{itemize}[leftmargin=15pt,itemsep=2pt]
+  \item 	exttt{exercises/volume1/ex03\_python\_asyncio\_event\_loop.py}: Experiment with bounded concurrency (	exttt{asyncio.Semaphore}), timeouts, and graceful task cancellation.
+  \item 	exttt{projects/p03-python-fastapi-api/app/routes/items.py}: Inspect how async endpoints share a single event-loop thread.
+\end{itemize}
+\end{labbridgebox}
+
+\section*{Further Reading}
+For deeper treatment of concurrency theory and kernel multiplexing, see Hoare's original CSP paper, Hewitt's Actor formalism, and PEP 703 on free-threaded Python \cite{pep703}.

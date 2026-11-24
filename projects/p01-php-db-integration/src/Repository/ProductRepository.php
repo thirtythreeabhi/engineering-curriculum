@@ -9,13 +9,17 @@ use App\Domain\Product;
 
 final class ProductRepository implements ProductRepositoryInterface
 {
-    public function __construct(private ConnectionInterface $connection) {}
+    public function __construct(
+        private ConnectionInterface $connection,
+        private bool $supportsForUpdate = true
+    ) {}
 
     public function findByIdForUpdate(int $id): ?Product
     {
-        $stmt = $this->connection->prepare(
-            "SELECT id, sku, name, price, stock_quantity FROM products WHERE id = :id FOR UPDATE"
-        );
+        $sql = $this->supportsForUpdate
+            ? "SELECT id, sku, name, price, stock_quantity FROM products WHERE id = :id FOR UPDATE"
+            : "SELECT id, sku, name, price, stock_quantity FROM products WHERE id = :id";
+        $stmt = $this->connection->prepare($sql);
         $stmt->execute(['id' => $id]);
         $row = $stmt->fetch();
 

@@ -11,11 +11,13 @@ Production-grade PHP 8.3 implementation of an e-commerce order processing pipeli
 2. **Pessimistic Locking (`SELECT ... FOR UPDATE`)**:
    - Product inventory is locked at the row level during stock verification to prevent race conditions and inventory overselling under high concurrency.
 
-3. **Strict Domain Model & Typed Exceptions**:
+3. **Strict Domain Model, Integer-Cents `Money`, & Typed Exceptions**:
    - Pure PHP 8.3 typed properties, readonly classes, and backed enums (`OrderStatus`).
+   - `Money` (`src/Domain/Money.php`) demonstrates exact integer minor-unit (`int $cents`) arithmetic to eliminate IEEE-754 floating-point drift (e.g. `$19.99` -> `1999` cents; production schemas should store `BIGINT price_cents` rather than `FLOAT`).
    - Domain-specific exceptions (`InsufficientStockException`, `PaymentFailedException`, `OrderNotFoundException`) ensure business errors are cleanly separated from low-level infrastructure failures.
 
-4. **Production PDO Hardening**:
+4. **Driver-Aware PDO Hardening**:
+   - `PdoConnection::beginTransaction(?IsolationLevel)` checks `PDO::ATTR_DRIVER_NAME` so PostgreSQL executes `SET TRANSACTION ISOLATION LEVEL` **after** `beginTransaction()` (avoiding PostgreSQL's `SET TRANSACTION can only be used in transaction blocks` warning), MySQL executes it before, and SQLite omits unsupported isolation syntax.
    - `PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION`: guarantees all database anomalies trigger exceptions.
    - `PDO::ATTR_EMULATE_PREPARES => false`: uses genuine engine-level prepared statements to protect against SQL injection.
    - `PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC`: avoids duplicated numerical indices in memory.

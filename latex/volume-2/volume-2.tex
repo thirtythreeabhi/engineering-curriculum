@@ -9,13 +9,13 @@
   \vspace*{2cm}
   {\Huge\sffamily\bfseries\color{headingblue} Modern Engineering Curriculum}\\[12pt]
   {\Large\sffamily\color{gray} Volume II: AI Engineering}\\[8pt]
-  {\large\sffamily\color{textdark} State Machines, Vector Databases, Production RAG, and LLMOps}\\[30pt]
+  {\large\sffamily\color{textdark} Vector Databases, Production RAG, Stateful Agents, Evaluations, and LLMOps}\\[30pt]
   \hrule height 1.2pt
   \vspace*{25pt}
-  {\normalsize\sffamily A Production-Grade Systems Textbook for Staff Engineers and AI Architects}
+  {\normalsize\sffamily A First-Principles Systems Textbook for Production AI Engineers}
 \end{center}
 
-\vspace{2.5cm}
+\vspace{2.2cm}
 
 \begin{tcolorbox}[
   enhanced,
@@ -28,9 +28,10 @@
 \sffamily\small
 \textbf{About Volume II (AI Engineering):}
 \begin{itemize}[leftmargin=15pt]
-  \item \textbf{Prerequisites}: Proficiency in modern Python (asynchronous programming, Pydantic, type systems), vector mathematics (inner products, cosine metrics), and relational database fundamentals.
-  \item \textbf{Core Thesis}: Generative AI applications cannot survive in production as naive prompt chains. Robust AI engineering demands formal state machine topologies (Bulk Synchronous Parallelism / Pregel), mathematically grounded vector indexing (HNSW, DiskANN), two-stage hybrid retrieval cascades, autonomous error recovery loops, semantic evaluation gates, and OpenTelemetry distributed tracing.
-  \item \textbf{Curriculum Role}: Volume II bridges backend API engineering (Volume I) with distributed consensus systems (Volume IV) and architectural economics (Volume V).
+  \item \textbf{Who This Book Is For}: Software builders and engineers who have shipped applications---often with AI coding assistants---and want to master the math, storage engines, retrieval algorithms, state machines, and telemetry running underneath production AI systems.
+  \item \textbf{Prerequisites}: Familiarity with reading basic Python functions, dictionaries, and lists, plus elementary comfort with SQL tables. Vector geometry, Transformer attention intuition, asynchronous \texttt{contextvars}, Pregel state machines, and OpenTelemetry tracing are all taught from first principles in the chapters where they appear.
+  \item \textbf{Progression}: Volume II builds upward in dependency order: vector geometry and approximate indexes (Chapter~1), document parsing and contextual chunking (Chapter~2), hybrid sparse-dense retrieval and cross-encoder reranking (Chapter~3), tool-calling agent loops and safety boundaries (Chapter~4), durable LangGraph state machines (Chapter~5), semantic evaluation gates (Chapter~6), and OpenTelemetry observability, latency, and token economics (Chapter~7).
+  \item \textbf{Curriculum Role}: Volume II bridges backend API and database engineering (Volume~I) with cloud security (Volume~III), distributed consensus systems (Volume~IV), and inference economics (Volume~V).
 \end{itemize}
 \end{tcolorbox}
 
@@ -41,11 +42,11 @@
 
 \mainmatter
 
-\input{ch01-langgraph.tex}
+\input{ch01-embeddings-vector-db.tex}
 \input{ch02-production-rag.tex}
-\input{ch03-embeddings-vector-db.tex}
-\input{ch04-retrieval-reranking.tex}
-\input{ch05-agent-architectures.tex}
+\input{ch03-retrieval-reranking.tex}
+\input{ch04-agent-architectures.tex}
+\input{ch05-langgraph.tex}
 \input{ch06-llm-evaluations.tex}
 \input{ch07-observability-tracing.tex}
 

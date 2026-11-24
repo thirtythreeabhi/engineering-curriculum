@@ -1,0 +1,383 @@
+\chapter{Infrastructure Security, Identity Federation, and Zero Trust}
+\label{chap:infra-security}
+
+\begin{chaptergoalsbox}
+\textbf{What You Will Learn:}
+\begin{itemize}[leftmargin=12pt]
+  \item Cryptography \& PKI foundations: symmetric vs.\ asymmetric keys, X.509 certificate chains, TLS vs.\ mutual TLS (mTLS), and JWT structure.
+  \item NIST SP 800-207 Zero Trust Architecture: verify explicitly, least privilege, assume breach, and Policy Decision/Enforcement Points (PDP/PEP).
+  \item Azure RBAC evaluation (\texttt{Actions - NotActions}) and Just-In-Time Privileged Identity Management (PIM).
+  \item Cryptographic workload identity via SPIFFE/SPIRE, Unix domain sockets, and kernel \texttt{SO\_PEERCRED} attestation.
+  \item Eliminating static secrets with OIDC Workload Identity Federation (RFC 7523 / RFC 8693) and Azure IMDS (\texttt{169.254.169.254}).
+  \item Cloud KMS Envelope Encryption (KEK/DEK) and mounting secrets into Kubernetes Pods on in-memory \texttt{tmpfs} via the Secrets Store CSI Driver.
+\end{itemize}
+
+\textbf{What You Should Already Understand:}
+\begin{itemize}[leftmargin=12pt]
+  \item Virtual networks, Private Endpoints, and subnets (Chapter~\ref{chap:azure-fundamentals}).
+  \item Linux processes, cgroups, Kubernetes Pods, and ServiceAccounts (Chapters~\ref{chap:containers}--\ref{chap:kubernetes}).
+  \item No prior cryptography or PKI coursework is assumed; Section~\ref{sec:v3-ch05-pki-primer} builds certificates, mTLS, and JWTs from first principles.
+\end{itemize}
+
+\textbf{Why This Topic Exists:}
+The old ``castle-and-moat'' assumption—trusting every packet once it is inside a private subnet—breaks the moment a single pod suffers a vulnerability or a developer accidentally pushes a cloud password to Git. Zero Trust replaces implicit network trust with cryptographic identity on every call and short-lived tokens in place of static passwords.
+
+\textbf{Motivating Practical Problem:}
+An automated deployment script leaves an unencrypted Service Principal client secret in an archived Git branch, granting permanent \texttt{Contributor} access across a production subscription. Months later, a separate Server-Side Request Forgery (SSRF) bug in an internal image-preview service lets an attacker query the local cloud metadata endpoint. How do you remove static credentials entirely, lock down permissions with RBAC and JIT elevation, authenticate pod-to-pod traffic with mTLS, and isolate database secrets in RAM?
+\end{chaptergoalsbox}
+
+\section{PKI, X.509 Certificate Chains, and TLS vs.\ mTLS}
+\label{sec:v3-ch05-pki-primer}
+
+Modern cloud security rests on four cryptographic building blocks. Understanding what each solves removes the mystery behind ``certificate errors'' and ``token exchange.''
+
+\subsection{Symmetric vs.\ Asymmetric Cryptography}
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{Symmetric Encryption (e.g., AES-256):} Both sender and receiver use the \emph{exact same secret key} to encrypt and decrypt data. AES is blazingly fast (gigabytes per second), but creates a chicken-and-egg problem: how do two servers share that secret key safely over an untrusted network?
+  \item \textbf{Asymmetric Cryptography (e.g., RSA, ECDSA):} Generates a mathematically linked \textbf{keypair}: a \textbf{public key} (shared openly) and a \textbf{private key} (kept strictly secret). Anything signed with the private key can be verified by anyone holding the public key—proving identity without ever transmitting the private key.
+\end{itemize}
+
+\subsection{X.509 Certificates and Trust Chains}
+A public key alone does not tell you *who* owns it. An \textbf{X.509 certificate} binds a public key to an identity (such as \texttt{api.clinic.internal} or a SPIFFE workload URI), includes validity timestamps (\texttt{NotBefore}, \texttt{NotAfter}), and is digitally signed by a trusted 	extbf{Certificate Authority (CA)}.
+
+Because a single Root CA private key is kept offline in extreme security, production 	extbf{Public Key Infrastructure (PKI)} uses a three-tier 	extbf{chain of trust}:
+\begin{equation*}
+\text{Root CA (offline, pre-trusted)} \xrightarrow{\text{signs}} \text{Intermediate CA} \xrightarrow{\text{signs}} \text{Leaf Workload Certificate}
+\end{equation*}
+When a service verifies a leaf certificate, it checks the Intermediate signature, then the Root signature against its local trust store, and confirms the current clock sits between \texttt{NotBefore} and \texttt{NotAfter}.
+
+\subsection{Standard TLS vs.\ Mutual TLS (mTLS)}
+In standard 	extbf{TLS} (everyday HTTPS), only the \emph{server} presents an X.509 certificate; the client verifies the server's identity, negotiates an ephemeral symmetric AES session key, and stays anonymous at the transport layer. In 	extbf{Mutual TLS (mTLS)}, *both* the server and the client present X.509 certificates during the handshake and cryptographically verify each other before a single byte of application HTTP flows.
+
+\subsection{OAuth 2.0 and JWT Structure}
+While mTLS authenticates machines over TCP connections, HTTP APIs often pass short-lived identity assertions called 	extbf{JSON Web Tokens (JWTs)} inside \texttt{Authorization: Bearer <token>} headers (governed by OAuth 2.0 and OpenID Connect, OIDC). A JWT is three Base64URL-encoded parts separated by dots:
+\begin{equation*}
+\texttt{header.payload.signature}
+\end{equation*}
+The \texttt{header} names the signing algorithm (e.g., \texttt{RS256}), the \texttt{payload} carries JSON claims (\texttt{iss} = issuer, \texttt{sub} = subject, \texttt{aud} = intended audience, \texttt{exp} = expiration), and the \texttt{signature} is the issuer's asymmetric signature over \texttt{header.payload}. Any recipient holding the issuer's public 	extbf{JSON Web Key Set (JWKS)} can verify the signature offline and reject tampered tokens.
+
+\section{Zero Trust Architecture (NIST SP 800-207)}
+
+Published by the National Institute of Standards and Technology, 	extbf{NIST SP 800-207} defines 	extbf{Zero Trust Architecture (ZTA)} around three rules:
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Verify Explicitly:} Authenticate and authorize every request using identity, cryptographic workload posture, and context—never trust a packet just because it came from a private \texttt{10.x.x.x} IP.
+  \item \textbf{Least Privilege Access:} Grant only the exact actions needed, for the shortest possible time (Just-In-Time, JIT).
+  \item \textbf{Assume Breach:} Segment networks, encrypt traffic inside the cluster with mTLS, and limit blast radiuses so compromising one service does not hand over the whole platform.
+\end{enumerate}
+
+Operationally, Zero Trust splits policy checking from traffic interception (Figure~\ref{fig:v3-ch05-pdp-pep}):
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{Policy Decision Point (PDP):} Evaluates identity claims and policy rules to return Allow or Deny.
+  \item \textbf{Policy Enforcement Point (PEP):} The gateway, Envoy sidecar, or ARM API layer sitting on the data path that enforces the PDP's decision.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.88, every node/.style={scale=0.88},
+  node distance=1.0cm and 1.2cm,
+  subject/.style={rectangle, draw=headingblue, fill=headingblue!5, rounded corners=2pt, text width=3.1cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  pep/.style={rectangle, draw=warningRed, fill=warningBg, rounded corners=2pt, text width=3.2cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  pdp/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, text width=4.6cm, minimum height=1.1cm, align=center, font=\sffamily\scriptsize\bfseries},
+  resource/.style={rectangle, draw=exampleBlue, fill=exampleBg, rounded corners=2pt, text width=3.1cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=headingblue}
+]
+\node[subject] (subj) {Workload / User\\(Caller)};
+\node[pep, right=1.3cm of subj] (pep) {Policy Enforcement\\Point (PEP / Proxy)};
+\node[resource, right=1.3cm of pep] (res) {Protected Resource\\(Key Vault / DB)};
+\node[pdp, above=1.1cm of pep] (pdp) {Policy Decision Point (PDP)\\Evaluates RBAC, OIDC, Posture};
+
+\draw[arrow] (subj) -- node[above, font=\tiny\sffamily]{1. Request} (pep);
+\draw[arrow, <->] (pep) -- node[right, font=\tiny\sffamily]{2. Authorize?} (pdp);
+\draw[arrow] (pep) -- node[above, font=\tiny\sffamily]{3. Forward (mTLS)} (res);
+\end{tikzpicture}
+\caption{NIST SP 800-207 Zero Trust Policy Decision and Enforcement Architecture}
+\label{fig:v3-ch05-pdp-pep}
+\end{figure}
+
+\section{Azure RBAC Evaluation and Privileged Identity Management}
+
+In Azure, a 	extbf{Role Assignment} binds three elements: $\langle \text{Security Principal}, \text{Role Definition}, \text{Scope} \rangle$. Every Role Definition JSON contains four permission arrays: control-plane \texttt{Actions}/\texttt{NotActions} (creating/deleting Azure resources) and data-plane \texttt{DataActions}/\texttt{NotDataActions} (reading Key Vault secrets or Storage blobs).
+
+\subsection{Evaluating \texttt{Actions - NotActions}}
+A common misconception is that \texttt{NotActions} acts like an AWS IAM explicit \texttt{Deny} across all roles. In Azure RBAC, 	extbf{within a single Role Definition}, effective permissions are computed by set subtraction:
+\begin{equation}
+\text{Effective Permissions} = (\text{Actions} - \text{NotActions}) \;\cup\; (\text{DataActions} - \text{NotDataActions})
+\end{equation}
+Suppose a role grants \texttt{Actions: ["Microsoft.Compute/virtualMachines/*"]} and \texttt{NotActions: ["Microsoft.Compute/virtualMachines/delete"]}. When a user calls \texttt{.../restart/action}, it matches \texttt{Actions} and does *not* match \texttt{NotActions}, so it is 	extbf{Allowed}. When they call \texttt{.../delete}, it is subtracted by \texttt{NotActions}, so this role does 	extbf{not} grant it. (Note that multiple role assignments on a principal are additive; only an explicit Azure *Deny Assignment* overrides other granted roles.)
+
+\begin{lstlisting}[language=bash, caption={Custom Least-Privilege Azure RBAC Role Definition (JSON)}]
+{
+  "Name": "Clinic Key Vault Secret Reader",
+  "IsCustom": true,
+  "Actions": [
+    "Microsoft.KeyVault/vaults/read"
+  ],
+  "NotActions": [
+    "Microsoft.KeyVault/vaults/write",
+    "Microsoft.KeyVault/vaults/delete"
+  ],
+  "DataActions": [
+    "Microsoft.KeyVault/vaults/secrets/getSecret/action"
+  ],
+  "NotDataActions": [
+    "Microsoft.KeyVault/vaults/secrets/setSecret/action"
+  ],
+  "AssignableScopes": [
+    "/subscriptions/a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d"
+  ]
+}
+\end{lstlisting}
+
+\textbf{Step-by-step trace of Listing 1:} Lines 4--10 grant read-only metadata visibility on Key Vault resources while explicitly subtracting write and delete. Lines 11--16 grant data-plane permission solely to fetch secret values (\texttt{getSecret/action}) while subtracting \texttt{setSecret/action}. Lines 17--19 restrict where this custom role may be assigned.
+
+To eliminate standing admin access for humans, 	extbf{Entra Privileged Identity Management (PIM)} turns permanent \texttt{Owner}/\texttt{Contributor} roles into 	extbf{Eligible} roles. Normally the engineer holds zero admin rights; when a production incident requires elevation, PIM enforces MFA, logs a ticket number, requests peer approval, and activates the role for a strict 2--4 hour window before auto-revoking it.
+
+\section{Cryptographic Workload Identity: SPIFFE and SPIRE}
+
+When microservices run across dynamic Kubernetes Pods, IP addresses change constantly and cannot prove identity. The 	extbf{SPIFFE (Secure Production Identity Framework for Everyone)} standard assigns every service a uniform URI—a 	extbf{SPIFFE ID} such as \texttt{spiffe://prod.clinic.internal/ns/api/sa/patient-svc}—embedded inside a short-lived X.509 certificate called an 	extbf{SVID (SPIFFE Verifiable Identity Document)}.
+
+\subsection{Why Unix Domain Sockets and \texttt{SO\_PEERCRED} Matter}
+How does a newly started container obtain its X.509 SVID without already holding a secret password? 	extbf{SPIRE} (the SPIFFE Runtime Environment) runs a 	extbf{SPIRE Server} (trust-domain CA) and a per-node 	extbf{SPIRE Agent} daemon listening on a local 	extbf{Unix Domain Socket} file (e.g., \texttt{/run/spire/sockets/workload.sock}) bind-mounted into Pods.
+
+Unlike a TCP socket on \texttt{127.0.0.1}, a Unix domain socket is a kernel-mediated IPC channel bound to a filesystem path—unreachable from outside the host. Even better, when a container connects to \texttt{workload.sock}, the SPIRE Agent asks the Linux kernel for the caller's exact identity using \texttt{getsockopt(fd, SOL\_SOCKET, SO\_PEERCRED)}. Because the kernel itself fills in the caller's real host 	extbf{PID, UID, and GID}, a rogue process cannot lie about who it is.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.85, every node/.style={scale=0.85},
+  node distance=1.0cm and 1.2cm,
+  server/.style={rectangle, draw=headingblue, fill=headingblue!5, rounded corners=2pt, text width=3.8cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  agent/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, text width=4.2cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  workload/.style={rectangle, draw=exampleBlue, fill=exampleBg, rounded corners=2pt, text width=3.8cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  kernel/.style={rectangle, draw=gray!70, fill=gray!10, rounded corners=2pt, text width=4.0cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=headingblue}
+]
+\node[server] (server) {SPIRE Server\\(Trust Domain CA)};
+\node[agent, below=1.1cm of server] (agent) {SPIRE Agent (Node Daemon)\\\texttt{/run/spire/sockets/workload.sock}};
+\node[kernel, right=1.5cm of agent] (kernel) {Linux Kernel + Kubelet\\\texttt{SO\_PEERCRED} PID, \texttt{/proc/<pid>/cgroup}};
+\node[workload, below=1.1cm of agent] (pod) {Application Container\\(Envoy / Service)};
+
+\draw[arrow, <->] (server) -- node[right, font=\tiny\sffamily]{1. Node Attestation (TPM / Azure MSI)} (agent);
+\draw[arrow] (pod) -- node[left, font=\tiny\sffamily]{2. Connect Unix Socket} (agent);
+\draw[arrow, <->] (agent) -- node[above, font=\tiny\sffamily]{3. Verify PID/Pod} (kernel);
+\draw[arrow] (agent) -- node[right, font=\tiny\sffamily]{4. Issue 60-min X.509 SVID} (pod);
+\end{tikzpicture}
+\caption{SPIFFE/SPIRE Node \& Workload Attestation via Unix Sockets and \texttt{SO\_PEERCRED}}
+\label{fig:v3-ch05-spire}
+\end{figure}
+
+Once SPIRE verifies the Pod's cgroup and Kubernetes ServiceAccount, it issues an X.509 SVID valid for only 60 minutes and pushes fresh certificates automatically at 50\% lifetime (every 30 minutes) over the socket, enabling zero-downtime mTLS everywhere.
+
+\section{OIDC Workload Identity Federation and IMDS}
+
+External workloads—such as GitHub Actions CI runners (Chapter~\ref{chap:cicd}) or AKS Pods—often need to call Azure APIs without storing a static Service Principal password. 	extbf{Workload Identity Federation} solves this ``secret zero'' problem using 	extbf{RFC 7523} (using a signed JWT as an OAuth 2.0 client assertion) and 	extbf{RFC 8693} (OAuth 2.0 token exchange).
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.85, every node/.style={scale=0.85},
+  node distance=1.1cm and 1.2cm,
+  gh/.style={rectangle, draw=headingblue, fill=headingblue!5, rounded corners=2pt, text width=3.9cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  runner/.style={rectangle, draw=exampleBlue, fill=exampleBg, rounded corners=2pt, text width=3.8cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  entra/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, text width=3.9cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  arm/.style={rectangle, draw=warningRed, fill=warningBg, rounded corners=2pt, text width=3.7cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=headingblue}
+]
+\node[runner] (run) {CI Runner / AKS Pod};
+\node[gh, above=1.1cm of run] (gh) {OIDC Issuer\\(\texttt{token.actions.githubusercontent.com})};
+\node[entra, right=1.8cm of run] (entra) {Microsoft Entra ID\\Federated Identity Credential};
+\node[arm, right=1.8cm of entra] (arm) {Azure APIs\\(ARM / Key Vault)};
+
+\draw[arrow] (run) -- node[left, font=\tiny\sffamily]{1. Request OIDC JWT} (gh);
+\draw[arrow] (gh) -- node[right, font=\tiny\sffamily]{2. Signed JWT (\texttt{iss,sub,aud})} (run);
+\draw[arrow] (run) -- node[above, font=\tiny\sffamily]{3. RFC 7523/8693 Exchange} (entra);
+\draw[arrow] (entra) -- node[above, font=\tiny\sffamily]{4. 1-hr Azure Token} (run);
+\draw[arrow] (run) to [bend right=30] node[below, font=\tiny\sffamily]{5. Bearer Token API Call} (arm);
+\end{tikzpicture}
+\caption{OIDC Workload Identity Federation Token Exchange}
+\label{fig:v3-ch05-workload-identity}
+\end{figure}
+
+Trace the exchange (Figure~\ref{fig:v3-ch05-workload-identity}):
+\begin{enumerate}[leftmargin=15pt]
+  \item The runner/Pod receives a short-lived signed JWT from its platform OIDC provider containing claims such as \texttt{"iss": "https://token.actions.githubusercontent.com"}, \texttt{"sub": "repo:contoso/clinic:ref:refs/heads/main"}, and \texttt{"aud": "api://AzureADTokenExchange"}.
+  \item The runner presents that JWT to Entra ID. Entra fetches the issuer's public JWKS keys, checks the signature, and verifies an exact string match against a configured 	extbf{Federated Identity Credential} (Listing 2).
+  \item On match, Entra returns a short-lived Azure OAuth access token—with zero static passwords stored anywhere.
+\end{enumerate}
+
+\begin{lstlisting}[language=hcl, caption={Terraform HCL Configuring an Azure Federated Identity Credential}]
+resource "azurerm_user_assigned_identity" "ci_identity" {
+  name                = "uai-github-ci"
+  resource_group_name = "rg-clinic-prod"
+  location            = "eastus"
+}
+
+resource "azurerm_federated_identity_credential" "github_prod" {
+  name                = "fed-github-main-branch"
+  resource_group_name = "rg-clinic-prod"
+  audience            = ["api://AzureADTokenExchange"]
+  issuer              = "https://token.actions.githubusercontent.com"
+  parent_id           = azurerm_user_assigned_identity.ci_identity.id
+  subject             = "repo:contoso/clinic:ref:refs/heads/main"
+}
+\end{lstlisting}
+
+\textbf{Step-by-step trace of Listing 2:} Lines 1--5 provision a Managed Identity in Entra ID. Lines 7--14 register a trust rule on that identity: Entra will exchange external JWTs *only* when signed by GitHub's OIDC issuer (line 11), addressed to Azure's token-exchange audience (line 10), and originating strictly from branch \texttt{refs/heads/main} of \texttt{contoso/clinic} (line 13). Pull requests or forks carry different \texttt{sub} claims and are automatically rejected.
+
+\subsection{Azure Instance Metadata Service (IMDS): \texttt{169.254.169.254}}
+For workloads running directly on Azure VMs or VM Scale Sets, Azure exposes a non-routable link-local REST endpoint at 	extbf{\texttt{http://169.254.169.254}} called the 	extbf{Instance Metadata Service (IMDS)} (not to be confused with \texttt{168.63.129.16}, which is Azure's WireServer for DNS and load-balancer health probes). Every request to IMDS 	extbf{must include the HTTP header \texttt{Metadata: true}} so simple browser redirects or naive proxies cannot accidentally query it.
+
+\section{Cloud KMS, Envelope Encryption, and \texttt{tmpfs} Secret Mounting}
+
+Hardware Security Modules (HSMs) inside 	extbf{Azure Key Vault} protect master keys in tamper-resistant hardware, but HSMs are too slow to encrypt gigabytes of application payloads directly. Systems solve this with 	extbf{Envelope Encryption} (Figure~\ref{fig:v3-ch05-envelope-encryption}):
+\begin{enumerate}[leftmargin=15pt]
+  \item The application generates a fast, local symmetric AES-256 	extbf{Data Encryption Key (DEK)} and encrypts the large payload.
+  \item The application calls Key Vault's \texttt{wrapKey} API to encrypt the tiny 256-bit DEK using an HSM-pinned 	extbf{Key Encryption Key (KEK)} that never leaves the HSM.
+  \item The Encrypted (Wrapped) DEK is stored alongside the ciphertext, and the plaintext DEK is wiped from memory. Rotating the KEK later requires re-wrapping only small DEKs, not re-encrypting terabytes of data.
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.86, every node/.style={scale=0.86},
+  node distance=0.8cm and 1.2cm,
+  box/.style={rectangle, draw=headingblue, fill=headingblue!5, rounded corners=2pt, text width=3.4cm, minimum height=0.9cm, align=center, font=\sffamily\scriptsize\bfseries},
+  hsm/.style={rectangle, draw=warningRed, fill=warningBg, rounded corners=2pt, text width=3.8cm, minimum height=1.1cm, align=center, font=\sffamily\scriptsize\bfseries},
+  outbox/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, text width=4.0cm, minimum height=0.9cm, align=center, font=\sffamily\scriptsize\bfseries},
+  arrow/.style={-{Stealth[scale=0.85]}, thick, color=headingblue}
+]
+\node[box] (data) {Plaintext Payload\\(e.g., 500\,MB Backup)};
+\node[box, below=0.8cm of data] (dek) {Local Ephemeral DEK\\(256-bit AES Key)};
+\node[outbox, right=1.8cm of data] (enc) {AES-Encrypted Payload\\(Stored in Blob/DB)};
+\node[hsm, right=1.8cm of dek] (hsm) {Azure Key Vault HSM\\KEK (Never Leaves HSM)\\\texttt{wrapKey(DEK)}};
+\node[outbox, right=1.5cm of hsm] (wdek) {Wrapped DEK\\(Stored Next to Payload)};
+
+\draw[arrow] (data) -- node[above, font=\tiny\sffamily]{Fast local AES} (enc);
+\draw[arrow] (dek) -- (enc);
+\draw[arrow] (dek) -- node[above, font=\tiny\sffamily]{Send 32B DEK} (hsm);
+\draw[arrow] (hsm) -- node[above, font=\tiny\sffamily]{Output} (wdek);
+\end{tikzpicture}
+\caption{Envelope Encryption Separating Local Data Encryption Keys (DEKs) from HSM Key Encryption Keys (KEKs)}
+\label{fig:v3-ch05-envelope-encryption}
+\end{figure}
+
+\subsection{Mounting Secrets into Kubernetes on \texttt{tmpfs}}
+Native Kubernetes \texttt{Secret} objects are stored as Base64-encoded strings inside \texttt{etcd}, exposing them to anyone with cluster-backup access. The 	extbf{Azure Key Vault Secrets Store CSI Driver} instead fetches secrets at Pod startup via Workload Identity and mounts them inside a Linux 	extbf{`tmpfs`} volume—a virtual filesystem backed purely by kernel RAM (never written to SSD/NVMe blocks and wiped instantly when the Pod exits).
+
+\begin{lstlisting}[language=yaml, caption={SecretProviderClass for \texttt{tmpfs} Key Vault Secret Mounting}]
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: azure-kv-secret-provider
+  namespace: clinic-prod
+spec:
+  provider: azure
+  parameters:
+    usePodIdentity: "false"
+    clientID: "d3b07384-d113-4f9e-b92c-7b81b8b8b8b8"
+    keyvaultName: "kv-clinic-prod"
+    cloudName: "AzurePublicCloud"
+    objects: |
+      array:
+        - |
+          objectName: DatabaseConnectionString
+          objectType: secret
+          objectVersion: ""
+    tenantId: "847291a1-3920-4102-a849-591823901234"
+\end{lstlisting}
+
+\textbf{Step-by-step trace of Listing 3:} Lines 9--11 instruct the CSI driver to use AKS Workload Identity (\texttt{usePodIdentity: "false"}) bound to Managed Identity \texttt{clientID}. Lines 13--18 fetch the latest version (\texttt{objectVersion: ""}) of \texttt{DatabaseConnectionString} from \texttt{kv-clinic-prod} and project it into \texttt{/mnt/secrets-store/DatabaseConnectionString} on \texttt{tmpfs}. Note that periodic background 	extbf{auto-rotation} is enabled at the 	extbf{CSI Driver installation / AKS add-on level} (\texttt{enableSecretRotation: "true"} / \texttt{--enable-secret-rotation}), not as a field inside the \texttt{SecretProviderClass} manifest itself.
+
+\begin{commonmistakebox}[Long-Lived Static Secrets]
+Creating 2-year or 5-year Service Principal client secrets to ``avoid rotation headaches'' guarantees stale credentials linger on developer laptops and CI logs. OIDC Workload Identity Federation and IMDS eliminate static client secrets completely.
+\end{commonmistakebox}
+
+\begin{realworldbox}[Lateral Movement via SSRF to Azure IMDS (\texttt{169.254.169.254})]
+\textbf{Symptom:} Security monitoring fires an alert for unexpected storage-account deletions originating from an internal web-app Managed Identity that normally only reads product thumbnails.
+
+\textbf{Diagnostic Walkthrough:}
+\begin{enumerate}[leftmargin=12pt]
+  \item Web-app access logs reveal an attacker exploiting a Server-Side Request Forgery (SSRF) header-injection flaw in an image-fetcher endpoint to send:
+  \begin{verbatim}
+  GET http://169.254.169.254/metadata/identity/oauth2/token
+      ?api-version=2018-02-01\&resource=https://management.azure.com/
+  Metadata: true
+  \end{verbatim}
+  Because the buggy proxy forwarded the custom \texttt{Metadata: true} header, Azure IMDS returned a live OAuth Bearer token for the app's Managed Identity.
+  \item Running \texttt{az role assignment list --assignee <principal-id>} shows the identity was mistakenly granted Subscription-wide \texttt{Contributor} during early testing instead of scoped \texttt{Storage Blob Data Reader} on one container.
+  \item \textbf{Remediation:} Strip the over-broad role assignment immediately using least-privilege custom RBAC, block egress to \texttt{169.254.169.254/32} in application URL validators (and strip \texttt{Metadata} headers in reverse proxies), and migrate Kubernetes Pods to scoped Workload Identity.
+\end{enumerate}
+\end{realworldbox}
+
+\begin{tryityourselfbox}[Decoding Base64URL OIDC JWTs and Evaluating RBAC]
+Perform both exercises before checking the solutions:
+\begin{enumerate}[leftmargin=12pt]
+  \item Note that JWT headers and payloads use 	extbf{Base64URL} encoding (\texttt{-} and \texttt{\_} instead of \texttt{+} and \texttt{/}, with trailing \texttt{=} padding omitted), which causes naive \texttt{jq @base64d} commands to fail whenever a token contains \texttt{-} or \texttt{\_}. Decode this sample JWT payload segment using Python or \texttt{tr '\_-' '/+'} and state its \texttt{iss} and \texttt{sub} claims:\\
+  \texttt{eyJpc3MiOiJodHRwczovL3Rva2VuLmFjdGlvbnMuZ2l0aHViLXVzZXIuY29tIiwic3ViIjoicmVwby1jbGluaWMifQ} (replace \texttt{eyJ...} or test on a real token \texttt{cat /var/run/secrets/azure/tokens/azure-identity-token | python3 -c "..."}).
+  \item Evaluate whether a principal holding a custom role with \texttt{Actions: ["Microsoft.Storage/storageAccounts/*"]} and \texttt{NotActions: ["Microsoft.Storage/storageAccounts/delete"]} can execute \texttt{listKeys/action} versus \texttt{delete}.
+\end{enumerate}
+\end{tryityourselfbox}
+
+\begin{labbridgebox}[RBAC Engine and Workload Identity in Practice]
+Explore and run both hands-on labs tied to this chapter:
+\begin{itemize}[leftmargin=12pt]
+  \item \texttt{exercises/volume3/ex01\_azure\_rbac\_least\_privilege.py} --- implements \texttt{AzureRbacEvaluator} evaluating \texttt{actions} and \texttt{notActions} wildcard patterns against requested Azure operations.
+  \item \texttt{projects/p08-azure-secure-app/src/credentials.py} and \texttt{src/keyvault.py} --- demonstrates Workload Identity token acquisition and Key Vault secret retrieval over a Private Endpoint without static secrets.
+\end{itemize}
+\end{labbridgebox}
+
+\section{Chapter Summary \protect\& Key Takeaways}
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{PKI \& mTLS:} X.509 certificates chain through Intermediate CAs to a Root CA; mTLS authenticates *both* client and server cryptographically.
+  \item \textbf{Zero Trust \& RBAC:} Decouple PDP from PEP; compute Azure role permissions per block via $\text{Actions} - \text{NotActions}$ and replace standing admin rights with PIM JIT elevation.
+  \item \textbf{SPIFFE/SPIRE:} Attests workloads locally over Unix domain sockets using kernel \texttt{SO\_PEERCRED} and auto-rotates short-lived X.509 SVIDs.
+  \item \textbf{OIDC Federation \& IMDS:} Exchange signed platform JWTs via RFC 7523/8693 for 1-hour Entra tokens; VMs call IMDS at \texttt{169.254.169.254} with \texttt{Metadata: true}.
+  \item \textbf{KMS \& CSI:} Envelope encryption wraps fast local AES DEKs with HSM-resident KEKs; Secrets Store CSI mounts secrets on \texttt{tmpfs} in RAM.
+\end{itemize}
+
+\section{Exercises}
+
+\subsection{Mechanics}
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Exercise~\thechapter.1:} A SPIRE Agent issues an X.509-SVID valid for 60 minutes and renews at 50\% lifetime. How often does rotation happen? If the SPIRE Server goes offline right after a renewal, how long can the workload continue completing mTLS handshakes?
+  \item \textbf{Exercise~\thechapter.2:} An Azure custom role has \texttt{Actions: ["Microsoft.Compute/virtualMachines/*"]} and \texttt{NotActions: ["Microsoft.Compute/virtualMachines/delete"]}. Can the assignee run \texttt{.../restart/action}? Can they run \texttt{.../delete}? Show the evaluation rule.
+\end{enumerate}
+
+\subsection{Debugging}
+\begin{enumerate}[leftmargin=18pt]
+  \setcounter{enumi}{2}
+  \item \textbf{Exercise~\thechapter.3:} A GitHub Actions workflow using OIDC Federation fails at \texttt{azure/login@v2} with \texttt{AADSTS70021: No matching federated identity record found for presented assertion. Subject: repo:contoso/payments:pull\_request}. Identify the exact mismatch and explain the secure fix.
+\end{enumerate}
+
+\subsection{Architecture}
+\begin{enumerate}[leftmargin=18pt]
+  \setcounter{enumi}{3}
+  \item \textbf{Exercise~\thechapter.4:} Design a Zero Trust security architecture for a ledger service on AKS ensuring: (1) mTLS between all Pods via SPIFFE IDs, (2) zero static cloud passwords, (3) Key Vault database credentials never touch disk or \texttt{etcd}, and (4) cluster admin access expires automatically after 2 hours.
+\end{enumerate}
+
+\section{Detailed Solutions}
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Solution~\thechapter.1 (Mechanics):}\\
+  Rotation triggers every $60 \times 0.50 = \mathbf{30\text{ minutes}}$. If the SPIRE Server goes unreachable immediately after issuance, the workload holds a valid signed certificate until its \texttt{NotAfter} timestamp, so mTLS continues functioning for 	extbf{60 minutes}.
+
+  \item \textbf{Solution~\thechapter.2 (Mechanics):}\\
+  Yes to \texttt{restart/action}; No to \texttt{delete}. Using $\text{Actions} - \text{NotActions}$, the wildcard grants \texttt{restart/action} (absent from \texttt{NotActions}), whereas \texttt{delete} matches \texttt{NotActions} and is subtracted.
+
+  \item \textbf{Solution~\thechapter.3 (Debugging):}\\
+  The workflow ran on a \texttt{pull\_request} trigger, so GitHub minted an OIDC JWT with \texttt{sub = repo:contoso/payments:pull\_request}, whereas the Azure Federated Identity Credential expects \texttt{repo:contoso/payments:ref:refs/heads/main}. 	extbf{Fix:} Never grant production cloud access to untrusted PR branches; keep the \texttt{refs/heads/main} federated credential for deployment workflows triggered on \texttt{push} to \texttt{main}, and if PRs need a non-prod sandbox, create a separate least-privilege sandbox identity scoped strictly to \texttt{pull\_request}.
+
+  \item \textbf{Solution~\thechapter.4 (Architecture):}\\
+  (1) Deploy SPIRE Server + Agent DaemonSet on AKS issuing 60-minute X.509 SVIDs to Envoy sidecars for Pod-to-Pod mTLS. (2) Enable AKS OIDC Issuer + Workload Identity Federation mapping Kubernetes ServiceAccounts to User-Assigned Managed Identities. (3) Deploy the Azure Key Vault Secrets Store CSI Driver (with \texttt{enableSecretRotation: "true"}) and a \texttt{SecretProviderClass} mounting secrets on in-memory \texttt{tmpfs} volumes. (4) Enable Entra ID RBAC for Kubernetes with PIM Eligible assignments enforcing MFA, peer approval, and a 2-hour maximum activation window.
+
+  \item \textbf{Try-It-Yourself Verification:}\\
+  (1) In Python: \texttt{import base64, json; seg = "..."; seg += "=" * (-len(seg) \% 4); print(json.loads(base64.urlsafe\_b64decode(seg)))} outputs \texttt{\{'iss': 'https://token.actions.github-user.com', 'sub': 'repo-clinic'\}}. Notice \texttt{urlsafe\_b64decode} handles \texttt{-}/\texttt{\_} safely unlike naive \texttt{jq @base64d}.\\
+  (2) \texttt{listKeys/action} is allowed (and is a sensitive credential-reading action you should also subtract in \texttt{NotActions} unless truly needed!); \texttt{delete} is subtracted and disallowed.
+\end{enumerate}
+
+\section{Further Reading \protect\& Citations}
+\begin{itemize}[leftmargin=15pt]
+  \item Rose, S., et al. \emph{Zero Trust Architecture (NIST SP 800-207)}. NIST, 2020.
+  \item SPIFFE Project Authors. \emph{SPIFFE and SPIRE Specifications}, \texttt{spiffe.io}, 2024.
+  \item IETF RFC 7523 \& RFC 8693. \emph{JWT Profile for OAuth 2.0} and \emph{OAuth 2.0 Token Exchange}.
+\end{itemize}

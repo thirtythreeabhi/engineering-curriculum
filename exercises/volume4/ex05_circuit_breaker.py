@@ -4,10 +4,11 @@ Exercise 4.5: Circuit Breaker State Machine
 Problem:
 Cascading failures occur when downstream services experience latency or outages.
 Implement a CircuitBreaker:
-1. State transitions: CLOSED -> OPEN -> HALF-OPEN -> CLOSED.
-2. Tracks consecutive failures; when threshold reached, trips to OPEN.
+1. State transitions: CLOSED -> OPEN -> HALF_OPEN -> CLOSED.
+2. Tracks CONSECUTIVE failures in CLOSED state (resetting failure_count = 0 on success);
+   when threshold is reached, trips to OPEN.
 3. In OPEN state, immediately returns fallback response without executing downstream call.
-4. After reset_timeout, transitions to HALF-OPEN to probe service health.
+4. After reset_timeout, transitions to HALF_OPEN to probe service health.
 """
 
 import time
@@ -20,13 +21,13 @@ class CircuitBreaker:
         self.reset_timeout = reset_timeout_sec
         self.failure_count = 0
         self.state: Literal["CLOSED", "OPEN", "HALF_OPEN"] = "CLOSED"
-        self.last_state_change = time.time()
+        self.last_state_change = time.monotonic()
 
     def call(self, func: Callable[[], str], fallback: Callable[[], str]) -> str:
-        now = time.time()
+        now = time.monotonic()
 
         if self.state == "OPEN":
-            if now - self.last_state_change > self.reset_timeout:
+            if now - self.last_state_change >= self.reset_timeout:
                 self.state = "HALF_OPEN"
                 self.last_state_change = now
             else:
@@ -34,9 +35,10 @@ class CircuitBreaker:
 
         try:
             result = func()
+            # Success in either CLOSED or HALF_OPEN resets consecutive failure counter
+            self.failure_count = 0
             if self.state == "HALF_OPEN":
                 self.state = "CLOSED"
-                self.failure_count = 0
                 self.last_state_change = now
             return result
         except Exception:
@@ -51,7 +53,11 @@ if __name__ == "__main__":
     print("==> Running Exercise 4.5: Circuit Breaker State Machine...")
     cb = CircuitBreaker(failure_threshold=2, reset_timeout_sec=0.1)
 
+    calls = 0
+
     def failing_service():
+        global calls
+        calls += 1
         raise RuntimeError("Downstream API timeout!")
 
     def fallback():
@@ -63,24 +69,32 @@ if __name__ == "__main__":
     # 1. Initially CLOSED
     assert cb.state == "CLOSED"
 
-    # 2. First failure
-    res1 = cb.call(failing_service, fallback)
-    assert res1 == "CACHED_FALLBACK_PAYLOAD"
-    assert cb.state == "CLOSED"
+    # 2. Non-consecutive failures separated by success must NOT trip circuit
+    assert cb.call(failing_service, fallback) == "CACHED_FALLBACK_PAYLOAD"
+    assert cb.state == "CLOSED" and cb.failure_count == 1
 
-    # 3. Second failure trips circuit to OPEN
-    res2 = cb.call(failing_service, fallback)
+    assert cb.call(healthy_service, fallback) == "LIVE_DATA_PAYLOAD"
+    assert cb.state == "CLOSED" and cb.failure_count == 0, "Success in CLOSED must reset failure_count!"
+
+    # 3. Now two consecutive failures trip circuit to OPEN
+    assert cb.call(failing_service, fallback) == "CACHED_FALLBACK_PAYLOAD"
+    assert cb.state == "CLOSED" and cb.failure_count == 1
+    assert cb.call(failing_service, fallback) == "CACHED_FALLBACK_PAYLOAD"
     assert cb.state == "OPEN"
 
-    # 4. In OPEN state, function is not even invoked
-    res3 = cb.call(failing_service, fallback)
-    assert res3 == "CACHED_FALLBACK_PAYLOAD"
-    assert cb.state == "OPEN"
+    # 4. In OPEN state, downstream function is NOT invoked
+    calls_before_open = calls
+    assert cb.call(failing_service, fallback) == "CACHED_FALLBACK_PAYLOAD"
+    assert calls == calls_before_open, "OPEN circuit must short-circuit without calling downstream!"
 
-    # 5. Wait for reset timeout -> transition to HALF_OPEN -> recover on success
+    # 5. Wait for reset timeout -> HALF_OPEN probe fails -> immediately back to OPEN
     time.sleep(0.12)
-    res4 = cb.call(healthy_service, fallback)
-    assert res4 == "LIVE_DATA_PAYLOAD"
-    assert cb.state == "CLOSED"
+    assert cb.call(failing_service, fallback) == "CACHED_FALLBACK_PAYLOAD"
+    assert cb.state == "OPEN"
 
-    print("[PASS] Exercise 4.5 verified (Circuit breaker cycled through CLOSED -> OPEN -> HALF_OPEN -> CLOSED).")
+    # 6. Wait for reset timeout -> HALF_OPEN probe succeeds -> recovers to CLOSED
+    time.sleep(0.12)
+    assert cb.call(healthy_service, fallback) == "LIVE_DATA_PAYLOAD"
+    assert cb.state == "CLOSED" and cb.failure_count == 0
+
+    print("[PASS] Exercise 4.5 verified (Non-consecutive reset + CLOSED -> OPEN -> HALF_OPEN -> CLOSED).")

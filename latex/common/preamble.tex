@@ -48,12 +48,12 @@
 \definecolor{tryViolet}{RGB}{124, 58, 237}
 \definecolor{tryBg}{RGB}{245, 243, 255}
 
-% Typography & Spacing
+% Typography \& Spacing
 \linespread{1.14}
 \setlength{\parindent}{0pt}
 \setlength{\parskip}{7pt plus 2pt minus 1pt}
 
-% Section Titles Styling (Modern & Proportionate)
+% Section Titles Styling (Modern \& Proportionate)
 \titleformat{\chapter}[display]
   {\normalfont\sffamily\bfseries\color{headingblue}}
   {\vspace{-20pt}\flushleft\normalsize\scshape\color{gray}CHAPTER \thechapter}
@@ -76,7 +76,7 @@
   {\thesubsubsection}{1em}{}
 \titlespacing*{\subsubsection}{0pt}{10pt plus 2pt minus 1pt}{3pt}
 
-% Header & Footer
+% Header \& Footer
 \pagestyle{fancy}
 \fancyhf{}
 \fancyhead[L]{\small\sffamily\color{gray}\nouppercase{\leftmark}}
@@ -115,6 +115,33 @@
   framexrightmargin=4pt,
   framextopmargin=4pt,
   framexbottommargin=4pt
+}
+
+\lstdefinelanguage{yaml}{
+  keywords={true,false,null,y,n},
+  keywordstyle=\color{blue!80!black}\bfseries,
+  basicstyle=\ttfamily\footnotesize\color{textdark},
+  sensitive=false,
+  comment=[l]{\#},
+  morecomment=[s]{/*}{*/},
+  commentstyle=\color{gray!80!black}\itshape,
+  stringstyle=\color{green!50!black},
+  moredelim=[l][\color{headingblue}\bfseries]{:},
+  morestring=[b]',
+  morestring=[b]"
+}
+
+\lstdefinelanguage{hcl}{
+  keywords={terraform,provider,resource,data,variable,output,locals,module,dynamic,content,lifecycle,precondition,postcondition},
+  keywordstyle=\color{blue!80!black}\bfseries,
+  basicstyle=\ttfamily\footnotesize\color{textdark},
+  sensitive=true,
+  comment=[l]{\#},
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  commentstyle=\color{gray!80!black}\itshape,
+  stringstyle=\color{green!50!black},
+  morestring=[b]"
 }
 
 % 6 Pedagogical Callout Boxes (Muted, Left-Border Styling)
@@ -220,6 +247,21 @@
   coltitle=headingblue,
   fonttitle=\sffamily\bfseries\small,
   title={Roadmap \& Prerequisites},
+  attach title to upper=\par\vspace{4pt}
+}
+
+\newtcolorbox{labbridgebox}[1][]{
+  enhanced,
+  breakable,
+  colback=codebg,
+  colframe=linkblue,
+  arc=1pt,
+  boxrule=0pt,
+  leftrule=3.5pt,
+  top=6pt,bottom=6pt,left=10pt,right=10pt,
+  coltitle=linkblue,
+  fonttitle=\sffamily\bfseries\small,
+  title={Hands-On Lab \& Reference Project \ifstrempty{#1}{}{: #1}},
   attach title to upper=\par\vspace{4pt}
 }
 
