@@ -1,0 +1,355 @@
+\chapter{UML and Sequence Diagrams}
+\label{ch:uml-sequence}
+
+\begin{chaptergoalsbox}
+\textbf{What You Will Learn:}
+\begin{itemize}[leftmargin=12pt]
+  \item Master the formal semantics of UML 2.5 Sequence Diagrams: lifelines, execution specifications (activation bars), synchronous call/return semantics, and asynchronous fire-and-forget signals.
+  \item Apply combined interaction fragments with mathematical rigor: conditional branching (\texttt{alt}), optional execution (\texttt{opt}), bounded iteration (\texttt{loop}), concurrent interleaving (\texttt{par}), atomic regions (\texttt{critical}), and exception escaping (\texttt{break}).
+  \item Visually model distributed concurrency vulnerabilities, including race conditions, Time-of-Check to Time-of-Use (TOCTOU) windows, lost updates, and double-spend exploits.
+  \item Deconstruct distributed failure topologies, such as cascading timeouts, retry amplification storms, and circuit breaker trip transitions.
+\end{itemize}
+
+\textbf{What You Should Already Understand:}
+\begin{itemize}[leftmargin=12pt]
+  \item Request-response networking primitives (HTTP/1.1, HTTP/2, TCP socket handshakes).
+  \item Thread concurrency models, non-blocking I/O event loops, and asynchronous message queues.
+  \item Database transaction concepts (ACID properties, row-level locks, isolation levels).
+\end{itemize}
+
+\textbf{Why This Topic Exists:}
+Static architecture diagrams (such as C4 Container views) show topological dependencies, but they reveal nothing about time, order of execution, or concurrency. When multiple distributed nodes communicate over unreliable networks, temporal bugs—such as race conditions, deadlocks, and timeout cascades—are the most difficult defects to diagnose. Sequence diagrams provide a rigorous visual notation for temporal execution paths across distributed lifelines.
+
+\textbf{Motivating Practical Problem:}
+During an annual flash-sale campaign, an online ticketing platform sells 5,000 VIP concert tickets in 90 seconds. Although the inventory database only contained 1,000 available seats, the system successfully confirmed 1,142 purchases. The post-incident forensic audit reveals that concurrent checkout requests read identical available balances simultaneously before acquiring an exclusive write lock. Because the sequence of validation and debit operations was never formally modeled, engineers did not foresee the critical race window.
+\end{chaptergoalsbox}
+
+\section{Formal Anatomy of UML Sequence Diagrams}
+
+A UML Sequence Diagram models the temporal exchange of messages between collaborating entities. In UML 2.5, time progresses monotonically downward along vertical axes, while messages are represented as horizontal or diagonal arrows spanning distinct entities.
+
+\subsection{Lifelines and Execution Specifications}
+
+A \textbf{lifeline} represents an individual participant in the interaction. It is drawn as a rectangle (the head) containing the participant's name and role, positioned atop a vertical dashed line.
+\begin{equation}
+\text{Syntax: } \texttt{instanceName : ClassOrRole}
+\end{equation}
+If the instance name is omitted (e.g., \texttt{:OrderService}), the lifeline represents an anonymous instance of that type.
+
+An \textbf{execution specification} (conventionally termed an \textit{activation bar}) is a narrow vertical rectangle overlaid onto a lifeline. It denotes the precise duration during which an entity is executing an internal procedure or actively awaiting a downstream synchronous response.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.9, every node/.style={transform shape},
+  lifeline/.style={draw=headingblue, thick, dashed},
+  head/.style={rectangle, draw=headingblue, fill=headingblue!10, rounded corners=2pt, minimum width=2.4cm, minimum height=0.8cm, font=\sffamily\small\bfseries, align=center},
+  act/.style={rectangle, draw=headingblue!80, fill=headingblue!30, minimum width=0.35cm},
+  msg/.style={-{Stealth[scale=0.9]}, thick, color=textdark},
+  ret/.style={-{Stealth[scale=0.9]}, thick, dashed, color=textdark!80}
+]
+
+% Lifeline Heads
+\node[head] (client) at (0, 0) {Client};
+\node[head] (api) at (4.5, 0) {:APIGateway};
+\node[head] (auth) at (9.0, 0) {:AuthService};
+
+% Lifelines
+\draw[lifeline] (client) -- (0, -6.5);
+\draw[lifeline] (api) -- (4.5, -6.5);
+\draw[lifeline] (auth) -- (9.0, -6.5);
+
+% Activation bars
+\node[act, minimum height=5.2cm] at (0, -3.4) {};
+\node[act, minimum height=4.5cm] at (4.5, -3.2) {};
+\node[act, minimum height=1.8cm] at (9.0, -2.4) {};
+
+% Messages
+\draw[msg] (0, -1.2) -- node[above, font=\sffamily\scriptsize]{POST /checkout (Bearer token)} (4.5, -1.2);
+\draw[msg] (4.5, -1.8) -- node[above, font=\sffamily\scriptsize]{ValidateToken(jwt)} (9.0, -1.8);
+\draw[ret] (9.0, -3.2) -- node[above, font=\sffamily\scriptsize]{Claims\{user\_id, role\}} (4.5, -3.2);
+
+\draw[msg] (4.5, -4.0) -- ++(1.0, 0) -- ++(0, -0.6) -- node[below, font=\sffamily\tiny, pos=0.8]{AuthorizeScope()} (4.5, -4.6);
+\draw[ret] (4.5, -5.4) -- node[above, font=\sffamily\scriptsize]{201 Created (order\_id)} (0, -5.4);
+
+\end{tikzpicture}
+\caption{Anatomy of Lifelines, Messages, Self-Calls, and Activation Bars}
+\label{fig:seq-anatomy}
+\end{figure}
+
+\subsection{Message Taxonomies: Sync, Async, Reply, and Found}
+
+UML defines distinct visual styles for message semantics:
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Synchronous Call}: Solid arrow with a \textbf{filled triangular arrowhead} ($\blacktriangleright$). The caller blocks execution and waits for completion.
+  \item \textbf{Asynchronous Signal}: Solid arrow with an \textbf{open stick arrowhead} ($\rightarrow$). The caller dispatches the message (e.g., publishing to Kafka or initiating a goroutine) and continues immediate execution without blocking.
+  \item \textbf{Reply Message}: Dashed arrow with an \textbf{open stick arrowhead} ($\dashrightarrow$). Conveys the return value or completion signal of an earlier synchronous call.
+  \item \textbf{Lost and Found Messages}: A lost message originates on a lifeline and terminates in a solid circle ($\bullet$), indicating packet drop. A found message originates from a solid circle and hits a lifeline, representing incoming events from an unknown external source.
+\end{itemize}
+
+\begin{intuitionbox}[The Musical Score Analogy]
+Think of a sequence diagram as an orchestral musical score. The instruments are the lifelines arranged across the horizontal axis. Time flows downwards measure by measure. When the violin plays a solo (synchronous call), other instruments might pause. In a polyphonic jazz ensemble (asynchronous event streaming), all instruments play independent motifs simultaneously, synchronizing only at designated cadences.
+\end{intuitionbox}
+
+\section{Combined Interaction Fragments}
+
+Complex distributed interactions cannot be represented purely by linear top-to-bottom arrows. Systems branch conditionally, loop across collections, execute operations concurrently, and abort upon unexpected exceptions. UML specifies **Combined Fragments**—rectangular frames enclosing interaction segments, qualified by an \textit{interaction operator} placed in the top-left corner pentagon.
+
+\subsection{Branching: \texttt{alt} and \texttt{opt}}
+
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Alternative (\texttt{alt})}: Represents mutual exclusion, equivalent to an \texttt{if-else} statement. The frame is partitioned into multiple sub-regions by horizontal dashed lines. Each region is guarded by a Boolean condition in square brackets, e.g., \texttt{[balance >= amount]}. Exactly one operand whose guard evaluates to true executes.
+  \item \textbf{Option (\texttt{opt})}: Represents an optional conditional step, equivalent to an \texttt{if} without an \texttt{else}. The enclosed steps execute only if the guard condition is met.
+\end{itemize}
+
+\subsection{Repetition and Abort: \texttt{loop} and \texttt{break}}
+
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Loop (\texttt{loop})}: Denotes repeated execution. It may define iteration bounds and guards, such as \texttt{loop(1, 5) [retry < max\_retries]}.
+  \item \textbf{Break (\texttt{break})}: Models an exceptional exit, analogous to a \texttt{try-catch} exception break or early \texttt{return}. If the guard evaluates to true, the enclosed messages execute, and the enclosing interaction immediately terminates.
+\end{itemize}
+
+\subsection{Concurrency and Atomicity: \texttt{par} and \texttt{critical}}
+
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Parallel (\texttt{par})}: Represents concurrent execution. The frame is divided into sub-operands by dashed lines. Messages in different operands may interleave in any arbitrary, non-deterministic order.
+  \item \textbf{Critical Region (\texttt{critical})}: Indicates an atomic execution sequence within a parallel context. Once an operation begins inside a \texttt{critical} frame, its messages cannot be interleaved with any other concurrent operations on the shared lifelines.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.85, every node/.style={transform shape},
+  head/.style={rectangle, draw=headingblue, fill=headingblue!10, rounded corners=2pt, minimum width=2.2cm, minimum height=0.7cm, font=\sffamily\scriptsize\bfseries, align=center},
+  lifeline/.style={draw=headingblue, thick, dashed},
+  msg/.style={-{Stealth[scale=0.8]}, thick, color=textdark},
+  ret/.style={-{Stealth[scale=0.8]}, thick, dashed, color=textdark!80}
+]
+
+% Nodes
+\node[head] (u) at (0, 0) {User};
+\node[head] (o) at (3.5, 0) {:OrderService};
+\node[head] (p) at (7.5, 0) {:PaymentService};
+\node[head] (i) at (11.5, 0) {:InventoryService};
+
+\draw[lifeline] (u) -- (0, -7.5);
+\draw[lifeline] (o) -- (3.5, -7.5);
+\draw[lifeline] (p) -- (7.5, -7.5);
+\draw[lifeline] (i) -- (11.5, -7.5);
+
+\draw[msg] (u) -- node[above, font=\tiny\sffamily]{CheckoutOrder(items)} (o);
+
+% Par Frame
+\draw[draw=gray!80, thick] (-0.3, -1.8) rectangle (12.5, -4.8);
+\node[draw=gray!80, fill=gray!20, font=\sffamily\tiny\bfseries, anchor=north west] at (-0.3, -1.8) {par [Parallel Verification]};
+
+% First par operand
+\draw[msg] (o) -- node[above, font=\tiny\sffamily]{AuthorizePayment(amount)} (p);
+\draw[ret] (p) -- node[above, font=\tiny\sffamily]{PaymentToken} (o);
+
+% Divider
+\draw[dashed, color=gray!70] (-0.3, -3.3) -- (12.5, -3.3);
+
+% Second par operand
+\draw[msg] (o) -- node[above, font=\tiny\sffamily]{ReserveStock(item\_ids)} (i);
+\draw[ret] (i) -- node[above, font=\tiny\sffamily]{StockReserved} (o);
+
+% Alt Frame
+\draw[draw=gray!80, thick] (-0.3, -5.2) rectangle (12.5, -7.2);
+\node[draw=gray!80, fill=gray!20, font=\sffamily\tiny\bfseries, anchor=north west] at (-0.3, -5.2) {alt [Both Success]};
+
+\draw[ret] (o) -- node[above, font=\tiny\sffamily]{200 OK (Confirmed)} (u);
+
+\draw[dashed, color=gray!70] (-0.3, -6.2) -- (12.5, -6.2);
+\node[font=\sffamily\tiny\itshape, anchor=north west] at (-0.2, -6.2) {[Any Failed]};
+\draw[ret] (o) -- node[above, font=\tiny\sffamily]{400 Bad Request (Compensate)} (u);
+
+\end{tikzpicture}
+\caption{Combined Fragments: Concurrent Fan-out (\texttt{par}) with Conditional Result (\texttt{alt})}
+\label{fig:seq-combined-fragments}
+\end{figure}
+
+\begin{underthehoodbox}[How Distributed Tracing Maps to Sequence Diagrams]
+Distributed tracing frameworks like OpenTelemetry, Jaeger, and Zipkin operate on the mathematical concept of a Directed Acyclic Graph (DAG) of **spans**. Each span captures:
+\begin{itemize}
+  \item \texttt{TraceID}: Globally unique identifier linking all operations in a single end-to-end user request.
+  \item \texttt{SpanID} and \texttt{ParentSpanID}: Form the hierarchical tree of caller and callee.
+  \item \texttt{StartTime} and \texttt{EndTime}: Exactly define the top and bottom bounds of an execution activation bar.
+\end{itemize}
+Modern observability tools can automatically ingest OpenTelemetry JSON trace dumps and synthesize pixel-perfect UML sequence diagrams representing the exact runtime execution path.
+\end{underthehoodbox}
+
+\section{Modeling Distributed Concurrency and Race Conditions}
+
+One of the most powerful applications of sequence diagrams is demonstrating race conditions that occur when multiple concurrent requests access shared mutable state without proper isolation.
+
+\subsection{The Double-Spend Race Condition}
+
+Consider two concurrent withdrawal requests ($R_1$ and $R_2$) for \$100 arriving at an account whose balance is exactly \$100. If the service reads the balance before applying an update lock, both requests observe a valid balance of \$100 and approve the debit.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.9, every node/.style={transform shape},
+  head/.style={rectangle, draw=headingblue, fill=headingblue!10, rounded corners=2pt, minimum width=2.4cm, minimum height=0.7cm, font=\sffamily\scriptsize\bfseries, align=center},
+  lifeline/.style={draw=headingblue, thick, dashed},
+  msg/.style={-{Stealth[scale=0.8]}, thick, color=textdark},
+  ret/.style={-{Stealth[scale=0.8]}, thick, dashed, color=textdark!80},
+  warning/.style={rectangle, draw=warningRed, fill=warningBg, rounded corners=2pt, font=\sffamily\tiny\bfseries, color=warningRed}
+]
+
+\node[head] (c1) at (0, 0) {Client 1};
+\node[head] (c2) at (4.0, 0) {Client 2};
+\node[head] (app) at (8.0, 0) {:WalletService};
+\node[head] (db) at (12.0, 0) {:Database};
+
+\draw[lifeline] (c1) -- (0, -6.5);
+\draw[lifeline] (c2) -- (4.0, -6.5);
+\draw[lifeline] (app) -- (8.0, -6.5);
+\draw[lifeline] (db) -- (12.0, -6.5);
+
+% Messages
+\draw[msg] (0, -1.0) -- node[above, font=\tiny\sffamily]{$R_1$: Withdraw(\$100)} (8.0, -1.0);
+\draw[msg] (8.0, -1.4) -- node[above, font=\tiny\sffamily]{SELECT balance WHERE id=1} (12.0, -1.4);
+\draw[ret] (12.0, -2.0) -- node[above, font=\tiny\sffamily]{balance = \$100} (8.0, -2.0);
+
+% Interleaving request 2
+\draw[msg] (4.0, -2.4) -- node[above, font=\tiny\sffamily]{$R_2$: Withdraw(\$100)} (8.0, -2.4);
+\draw[msg] (8.0, -2.8) -- node[above, font=\tiny\sffamily]{SELECT balance WHERE id=1} (12.0, -2.8);
+\draw[ret] (12.0, -3.4) -- node[above, font=\tiny\sffamily]{balance = \$100} (8.0, -3.4);
+
+% App approves R1
+\draw[msg] (8.0, -3.9) -- node[above, font=\tiny\sffamily]{UPDATE balance = 0} (12.0, -3.9);
+\draw[ret] (12.0, -4.3) -- node[above, font=\tiny\sffamily]{OK} (8.0, -4.3);
+\draw[ret] (8.0, -4.7) -- node[above, font=\tiny\sffamily]{200 Success} (0, -4.7);
+
+% App approves R2 (Race exploit)
+\draw[msg] (8.0, -5.2) -- node[above, font=\tiny\sffamily]{UPDATE balance = 0} (12.0, -5.2);
+\draw[ret] (12.0, -5.6) -- node[above, font=\tiny\sffamily]{OK} (8.0, -5.6);
+\draw[ret] (8.0, -6.0) -- node[above, font=\tiny\sffamily]{200 Success} (4.0, -6.0);
+
+\node[warning] at (6.0, -6.3) {EXPLOIT: \$200 withdrawn from \$100 initial balance};
+
+\end{tikzpicture}
+\caption{Visualizing a Lost-Update / Double-Spend Concurrency Defect}
+\label{fig:seq-double-spend}
+\end{figure}
+
+The sequence diagram vividly illustrates the \textbf{critical race window} between $t = 2.4$ and $t = 3.9$, where $R_2$ performs its read before $R_1$'s write completes.
+
+\begin{realworldbox}[The Stripe Idempotency Key Webhook Pattern]
+When a customer pays with a credit card, the browser network may disconnect before receiving the HTTP response. If the customer hits ``Pay'' again, or if Stripe's webhook triggers an automatic retry, the merchant system risks executing duplicate fulfillment. Stripe solves this using an **Idempotency-Key** header. The merchant server stores the first response in Redis keyed by the client's UUID token. Subsequent retries with the same key immediately return the cached response without re-invoking payment gateways or inventory deductions.
+\end{realworldbox}
+
+\begin{commonmistakebox}[Confusing Synchronous RPC with Blocking Operating System Threads]
+In UML, a synchronous message arrow ($\blacktriangleright$) means the \textit{logical caller awaits the logical response} before proceeding with the next step in the diagram. It does NOT imply that an underlying operating system thread is pinned in a sleep state. In modern asynchronous runtimes (e.g., Node.js event loops, Go goroutines, Kotlin coroutines), the thread is yielded back to the runtime pool to service other I/O events while the network socket awaits bytes.
+\end{commonmistakebox}
+
+\begin{productionwarningbox}[Cascading Timeout Storms and the Retry Amplifier]
+When downstream Service C experiences high CPU and response latency climbs from 50ms to 4,000ms, upstream Service B's default 2,000ms timeout triggers. Service B retries 3 times. If upstream Service A also has a 5,000ms timeout with 2 retries, the total request multiplier is $3 \times 2 = 6\times$ traffic amplification hitting an already failing Service C. Without sequence modeling that incorporates **deadline propagation** (e.g., gRPC \texttt{grpc-timeout}) and **circuit breakers**, retry storms cause total cluster collapse.
+\end{productionwarningbox}
+
+\begin{tryityourselfbox}[Exercise: Model Two-Phase Commit (2PC) with Coordinator Crash]
+Draft a sequence diagram modeling the classical Two-Phase Commit protocol across three lifelines: \texttt{:Coordinator}, \texttt{:Participant1}, and \texttt{:Participant2}.
+\begin{enumerate}
+  \item Phase 1: \texttt{:Coordinator} sends synchronous \texttt{PREPARE} messages to both participants. Both reply \texttt{VOTE\_COMMIT}.
+  \item Phase 2: \texttt{:Coordinator} logs commit decision to local disk, but crashes before dispatching the \texttt{GLOBAL\_COMMIT} message.
+  \item Depict the participants blocked in an uncertain state holding row-level locks, unable to unilaterally abort or commit.
+\end{enumerate}
+\end{tryityourselfbox}
+
+\section{Summary \& Key Takeaways}
+
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Temporal Rigor}: Sequence diagrams capture ordering, durations, and temporal relationships across distributed lifelines that static C4 models cannot show.
+  \item \textbf{Syntax Discipline}: Distinguish synchronous blocking calls ($\blacktriangleright$), asynchronous non-blocking events ($\rightarrow$), and reply messages ($\dashrightarrow$).
+  \item \textbf{Combined Fragments}: Express complex algorithmic logic using standard frames: \texttt{alt} for conditional branching, \texttt{par} for concurrency, \texttt{loop} for retries, and \texttt{break} for error escapes.
+  \item \textbf{Concurrency Defect Visualizer}: Sequence diagrams expose critical race windows, TOCTOU vulnerabilities, and cascading timeout amplification storms before deployment.
+\end{itemize}
+
+\section{Exercises}
+
+\subsection*{Mechanics}
+\begin{enumerate}[leftmargin=18pt]
+  \item Explain the semantic difference between the UML combined interaction operators \texttt{alt} and \texttt{opt}. When must \texttt{alt} be used instead of two adjacent \texttt{opt} fragments?
+  \item Describe how a \texttt{break} fragment behaves inside a \texttt{loop} fragment when its guard condition evaluates to true.
+\end{enumerate}
+
+\subsection*{Debugging}
+\begin{enumerate}[leftmargin=18pt]
+  \item An engineer models an asynchronous event-driven system with an Apache Kafka topic. In their diagram, the publisher sends a message to Kafka with a solid arrow and filled arrowhead ($\blacktriangleright$), and Kafka immediately sends a dashed return arrow ($\dashrightarrow$) containing the consumer's business outcome (e.g., \texttt{InvoiceGenerated}). Explain why this diagram is fundamentally broken.
+\end{enumerate}
+
+\subsection*{Architecture Design}
+\begin{enumerate}[leftmargin=18pt]
+  \item Construct a detailed sequence diagram modeling an OAuth 2.0 Authorization Code Flow with PKCE (Proof Key for Code Exchange) involving four lifelines: \texttt{Browser/SPA}, \texttt{AuthorizationServer}, \texttt{BackendAPI}, and \texttt{ResourceServer}. Include the code challenge generation, user consent, authorization code exchange with code verifier, and token issuance.
+\end{enumerate}
+
+\section{Detailed Solutions}
+
+\subsection*{Mechanics Solution}
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{\texttt{alt} vs \texttt{opt}}: 
+  An \texttt{alt} fragment guarantees mutual exclusion: exactly one of its operands whose guard evaluates to true will execute. An \texttt{opt} fragment represents a single optional branch with no alternate path. If an architect replaces an \texttt{alt} with two adjacent \texttt{opt} frames:
+  \begin{itemize}
+    \item If state changes during the execution of the first \texttt{opt} frame, the second \texttt{opt} guard might also evaluate to true, leading to invalid duplicate execution.
+    \item An \texttt{alt} formally guarantees that if the first condition is satisfied, subsequent operands are bypassed.
+  \end{itemize}
+  \item When the guard of a \texttt{break} fragment evaluates to true, the messages enclosed inside the \texttt{break} operand execute, and control immediately escapes the enclosing interaction frame (such as a \texttt{loop}). The loop terminates early without executing any remaining iterations.
+\end{enumerate}
+
+\subsection*{Debugging Solution}
+\begin{enumerate}[leftmargin=18pt]
+  \item In an asynchronous messaging architecture:
+  \begin{enumerate}
+    \item Publishing to Kafka is an asynchronous network dispatch. While the producer may receive a broker acknowledgement (ACK) confirming disk persistence, it does \textbf{not} wait synchronously for downstream consumers to process the event.
+    \item The downstream consumer processes the message out-of-band and asynchronously. The consumer cannot return a direct synchronous RPC reply arrow through Kafka back to the original caller within the same HTTP connection activation bar. The diagram falsely implies a synchronous RPC disguised as a message queue.
+  \end{enumerate}
+\end{enumerate}
+
+\subsection*{Architecture Design Solution}
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.85, every node/.style={transform shape},
+  head/.style={rectangle, draw=headingblue, fill=headingblue!10, rounded corners=2pt, minimum width=2.2cm, minimum height=0.7cm, font=\sffamily\scriptsize\bfseries, align=center},
+  lifeline/.style={draw=headingblue, thick, dashed},
+  msg/.style={-{Stealth[scale=0.8]}, thick, color=textdark},
+  ret/.style={-{Stealth[scale=0.8]}, thick, dashed, color=textdark!80}
+]
+
+\node[head] (spa) at (0, 0) {Browser / SPA};
+\node[head] (auth) at (4.2, 0) {Auth0 / IdP};
+\node[head] (api) at (8.4, 0) {:BackendAPI};
+
+\draw[lifeline] (spa) -- (0, -6.8);
+\draw[lifeline] (auth) -- (4.2, -6.8);
+\draw[lifeline] (api) -- (8.4, -6.8);
+
+% Step 1: PKCE generation
+\draw[msg] (0, -0.8) -- ++(1.0, 0) -- ++(0, -0.5) -- node[below, font=\tiny\sffamily, pos=0.8]{Generate verifier \& challenge} (0, -1.3);
+
+% Step 2: Auth request
+\draw[msg] (0, -1.8) -- node[above, font=\tiny\sffamily]{GET /authorize?challenge=SHA256(v)} (4.2, -1.8);
+\draw[ret] (4.2, -2.6) -- node[above, font=\tiny\sffamily]{Redirect with auth\_code} (0, -2.6);
+
+% Step 3: Token Exchange with verifier
+\draw[msg] (0, -3.4) -- node[above, font=\tiny\sffamily]{POST /oauth/token (auth\_code, code\_verifier)} (4.2, -3.4);
+\draw[msg] (4.2, -4.0) -- ++(1.0, 0) -- ++(0, -0.5) -- node[below, font=\tiny\sffamily, pos=0.8]{Verify SHA256(v) == challenge} (4.2, -4.5);
+\draw[ret] (4.2, -5.2) -- node[above, font=\tiny\sffamily]{Return Access Token (JWT)} (0, -5.2);
+
+% Step 4: API call
+\draw[msg] (0, -6.0) -- node[above, font=\tiny\sffamily]{GET /api/v1/orders (Bearer JWT)} (8.4, -6.0);
+\draw[ret] (8.4, -6.6) -- node[above, font=\tiny\sffamily]{200 OK (Orders JSON)} (0, -6.6);
+
+\end{tikzpicture}
+\caption{OAuth 2.0 PKCE Sequence Flow}
+\end{figure}
+
+\section{Further Reading \& Citations}
+\begin{itemize}[leftmargin=18pt]
+  \item Object Management Group. (2015). \textit{OMG Unified Modeling Language (OMG UML) Specification, Version 2.5}.
+  \item Fowler, M. (2003). \textit{UML Distilled: A Brief Guide to the Standard Object Modeling Language} (3rd ed.). Addison-Wesley.
+  \item Hardt, D. (2012). \textit{The OAuth 2.0 Authorization Framework} (RFC 6749). Internet Engineering Task Force.
+  \item Sakimura, N., Bradley, J., \& Agarwal, N. (2015). \textit{Proof Key for Code Exchange by OAuth Public Clients} (RFC 7636).
+\end{itemize}

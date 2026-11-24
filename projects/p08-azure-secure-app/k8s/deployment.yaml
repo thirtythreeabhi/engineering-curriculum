@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: azure-secure-app
+  namespace: production
+  labels:
+    app.kubernetes.io/name: azure-secure-app
+    azure.workload.identity/use: "true"
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: azure-secure-app
+  template:
+    metadata:
+      labels:
+        app: azure-secure-app
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: azure-workload-identity-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: app
+          image: myacr.azurecr.io/apps/azure-secure-app:1.0.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            - name: AZURE_CLIENT_ID
+              value: "11111111-2222-3333-4444-555555555555"
+            - name: APPLICATIONINSIGHTS_CONNECTION_STRING
+              valueFrom:
+                secretKeyRef:
+                  name: appinsights-secret
+                  key: connection-string
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10

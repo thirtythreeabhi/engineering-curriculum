@@ -1,0 +1,5 @@
+environment    = "prod"
+location       = "eastus2"
+vnet_cidr      = "10.0.0.0/16"
+aks_node_count = 3
+key_vault_sku  = "standard"

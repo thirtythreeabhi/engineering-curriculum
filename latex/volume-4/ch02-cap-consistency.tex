@@ -1,0 +1,395 @@
+\chapter{CAP Theorem and Consistency Models}
+\label{ch:cap-consistency}
+
+\begin{chaptergoalsbox}
+\textbf{What you will learn:}
+\begin{itemize}[leftmargin=12pt]
+  \item The formal formulation and mathematical proof of Eric Brewer's CAP Theorem (Gilbert \& Lynch 2002).
+  \item Why ``pick any two'' is a dangerous myth: network partitions are unavoidable physical events ($P$ is non-negotiable).
+  \item Daniel Abadi's PACELC Theorem: modeling the trade-off between Consistency/Availability during partitions, and Latency/Consistency during normal operation.
+  \item The complete consistency spectrum: Strict Serializability, Linearizability, Sequential Consistency, Causal Consistency, Read-Your-Writes, and Eventual Consistency.
+  \item The Raft Consensus Algorithm: leader election, log replication safety invariants, joint consensus cluster membership changes, and log compaction.
+\end{itemize}
+
+\textbf{What you should already understand:}
+\begin{itemize}[leftmargin=12pt]
+  \item Distributed timing models and vector clocks from Chapter~\ref{ch:distributed-fundamentals}.
+  \item Client-server state replication and remote procedure calls (RPC).
+\end{itemize}
+
+\textbf{Why this topic exists:}
+When network links between servers break, systems cannot magically maintain both instantaneous global consistency and 100\% availability. Understanding consistency models allows engineers to select the exact level of correctness required without paying unnecessary latency penalties.
+
+\textbf{Motivating practical problem:}
+An online social gaming platform stores player inventory across multi-region Cassandra nodes configured with \texttt{ANY} write consistency to maximize availability. During a cross-Atlantic link degradation, players discover they can duplicate high-value virtual weapons by trading simultaneously from two browser windows connected to different regional data centers.
+\end{chaptergoalsbox}
+
+\section{The CAP Theorem: Formalization and Reality}
+
+In 2000, Eric Brewer presented the CAP conjecture at the Symposium on Principles of Distributed Computing (PODC). In 2002, Seth Gilbert and Nancy Lynch published a formal mathematical proof of the conjecture under an asynchronous network model.
+
+\subsection{Formal Definitions (Gilbert \& Lynch)}
+
+To understand CAP, one must reject colloquial definitions of its terms:
+
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Consistency ($C$)}: Gilbert and Lynch strictly equate Consistency with \textbf{Linearizability} (atomic or external consistency). Every read operation must return the value of the most recent write, or an error. Once a read returns a new value $v$, all subsequent reads (by any client across the entire cluster) must return $v$ or a strictly newer value.
+  \item \textbf{Availability ($A$)}: Every non-failing node must return a non-error response to every request it receives. Returning a timeout, an HTTP 500 error, or an explicit exception violates availability under the formal CAP definition.
+  \item \textbf{Partition Tolerance ($P$)}: The system continues to operate despite an arbitrary number of messages being dropped or delayed by the network between nodes.
+\end{enumerate}
+
+\subsection{The Impossibility Proof}
+
+Consider a minimal distributed system consisting of two nodes, $G_1$ and $G_2$, maintaining a single integer variable $v$, initially $0$.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.9,
+  server/.style={rectangle, draw=headingblue, fill=codebg, thick, rounded corners=3pt, minimum width=2.6cm, minimum height=1.3cm, align=center, font=\sffamily\small},
+  client/.style={circle, draw=exampleBlue, fill=exampleBg, thick, minimum size=1.0cm, align=center, font=\sffamily\footnotesize},
+  line/.style={thick, color=headingblue},
+  partition/.style={ultra thick, dashed, color=warningRed}
+]
+  \node[client] (c1) at (-4, 1.5) {Client 1};
+  \node[client] (c2) at (4, 1.5) {Client 2};
+
+  \node[server] (g1) at (-2, -1) {\textbf{Node $G_1$}\\State: $v=1$};
+  \node[server] (g2) at (2, -1) {\textbf{Node $G_2$}\\State: $v=0$};
+
+  \draw[-{Stealth[scale=1.0]}, thick, color=exampleBlue] (c1) -- node[left, font=\sffamily\footnotesize] {Write($v=1$)} (g1);
+  \draw[-{Stealth[scale=1.0]}, thick, color=exampleBlue] (c2) -- node[right, font=\sffamily\footnotesize] {Read($v$) $\to ?$} (g2);
+
+  \draw[line] (g1) -- (g2);
+  \draw[partition] (0, 0.5) -- (0, -2.5) node[below, font=\sffamily\bfseries\footnotesize, color=warningRed] {Network Partition};
+
+  \node[font=\sffamily\footnotesize, color=warningRed] at (0, -0.4) {$\times$ Messages Dropped};
+\end{tikzpicture}
+\caption{The Fundamental CAP Partition Dilemma between Nodes $G_1$ and $G_2$}
+\label{fig:cap-proof}
+\end{figure}
+
+Assume a network partition occurs between $G_1$ and $G_2$: no message sent by $G_1$ can reach $G_2$, and vice versa.
+\begin{enumerate}[leftmargin=18pt]
+  \item Client 1 connects to $G_1$ and executes $\text{Write}(v=1)$.
+  \item Because $G_1$ is non-failing and the system is claimed to be \textbf{Available}, $G_1$ must acknowledge the write with success.
+  \item $G_1$ attempts to replicate the update to $G_2$, but all sync messages are dropped by the partition.
+  \item Client 2 connects to $G_2$ and executes $\text{Read}(v)$.
+  \item $G_2$ faces an inescapable dilemma:
+  \begin{itemize}[leftmargin=12pt]
+    \item If $G_2$ responds with $v=0$ (its local state), it violates \textbf{Consistency} (Linearizability), because Client 1's write of $1$ completed before Client 2's read began.
+    \item If $G_2$ blocks, waits for the partition to heal, or returns an error, it violates \textbf{Availability}.
+  \end{itemize}
+\end{enumerate}
+Therefore, no distributed system can achieve both Linearizability and Availability in the presence of a network partition.
+
+\begin{productionwarningbox}[The Myth of ``CA'' Systems]
+In marketing literature, some relational databases claim to be ``CA'' (Consistent and Available). This is mathematically false in any distributed environment. Network partitions are physical phenomena caused by severed cables, failed top-of-rack switches, or saturated interfaces. You cannot ``choose'' not to have partitions.
+Thus, the true choice is binary:
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{CP}: Choose Consistency by refusing writes or failing reads on partitioned nodes.
+  \item \textbf{AP}: Choose Availability by serving stale local data or accepting divergent writes that must be reconciled later.
+\end{itemize}
+\end{productionwarningbox}
+
+\section{The PACELC Theorem}
+
+While CAP describes system behavior \textbf{during rare network partitions}, systems spend 99.99\% of their lifecycle operating normally without partitions. In 2012, Daniel Abadi introduced the PACELC theorem to describe the full design trade-off space:
+
+\begin{equation}
+\mathbf{If\ Partition\ (P)} \implies \text{Choose between } \mathbf{Availability\ (A)} \text{ and } \mathbf{Consistency\ (C)}
+\end{equation}
+\begin{equation}
+\mathbf{Else\ (E)} \implies \text{Choose between } \mathbf{Latency\ (L)} \text{ and } \mathbf{Consistency\ (C)}
+\end{equation}
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lllp{6.0cm}}
+\toprule
+\textbf{System} & \textbf{Partition Mode} & \textbf{Normal Mode} & \textbf{Architectural Mechanics} \\
+\midrule
+\textbf{Spanner / CockroachDB} & CP & PC & Replicated state machine via Raft/Paxos. Enforces strict consistency; pays WAN round-trip latency on normal writes. \\
+\textbf{Cassandra / DynamoDB} & AP & PA / EL & Defaults to eventual consistency. Writes to local quorum; returns quickly without waiting for cross-region consensus. \\
+\textbf{MongoDB (w:majority)} & CP & PC & Routes all writes to primary replica. Rejects writes if primary is partitioned away from majority. \\
+\textbf{VoltDB / H-Store} & CP & PC & Strict ACID partitioned memory. Halts transaction processing during replica disconnects. \\
+\bottomrule
+\end{tabular}
+\caption{Classification of Distributed Data Stores under the PACELC Theorem}
+\label{tab:pacelc}
+\end{table}
+
+\begin{intuitionbox}[The Latency-Consistency Trade-Off (PC/EC)]
+Even when all fiber cables are intact and routers are healthy, enforcing Linearizability requires a node to coordinate with a quorum of replicas before answering a write or read request. This cross-node coordination adds round-trip network latency. If an application chooses low latency (EL), it must return the local node's current value immediately, accepting that the data might be milliseconds out of date.
+\end{intuitionbox}
+
+\section{The Consistency Spectrum}
+
+Consistency is not a binary choice between ``strong'' and ``eventual''. It is a continuous hierarchy of formal guarantees.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.85,
+  level/.style={rectangle, draw=headingblue, fill=codebg, thick, rounded corners=2pt, minimum width=11cm, minimum height=0.9cm, align=left, font=\sffamily\footnotesize}
+]
+  \node[level, fill=warningBg] (s-ser) at (0, 0) {\textbf{Strict Serializability}: External global clock order + Serial execution (Spanner TrueTime)};
+  \node[level, fill=exampleBg, below=0.25cm of s-ser] (lin) {\textbf{Linearizability}: Real-time single-object read/write register order (Raft, etcd, ZAB)};
+  \node[level, fill=intuitionBg, below=0.25cm of lin] (seq) {\textbf{Sequential Consistency}: Program order preserved; all nodes see identical sequence (Lamport 1979)};
+  \node[level, fill=hoodBg, below=0.25cm of seq] (causal) {\textbf{Causal Consistency}: Causally related writes seen in same order; concurrent writes arbitrary};
+  \node[level, fill=mistakeBg, below=0.25cm of causal] (session) {\textbf{Client Session Guarantees}: Read-Your-Writes, Monotonic Reads, Monotonic Writes};
+  \node[level, fill=gray!10, below=0.25cm of session] (eventual) {\textbf{Eventual Consistency}: Converges if writes stop; no intermediate ordering guarantees};
+
+  \draw[-{Stealth[scale=1.2]}, very thick, color=headingblue] (-6.0, -5.2) -- (-6.0, 0.4)
+    node[midway, sloped, above=3pt, font=\sffamily\small\bfseries] {Stronger Guarantees (Higher Latency / Coordination Cost)};
+\end{tikzpicture}
+\caption{The Consistency Model Hierarchy from Eventual to Strict Serializability}
+\label{fig:consistency-spectrum}
+\end{figure}
+
+\subsection{Linearizability vs. Serializability}
+
+A common source of confusion in database engineering is conflating Linearizability and Serializability:
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Serializability} is a multi-operation, multi-object transaction property. It guarantees that the execution of a set of concurrent transactions produces an outcome equivalent to \emph{some} sequential execution order. However, it imposes \textbf{no real-time constraint}. A serializable database could legally return data from yesterday, provided all historical transactions are ordered consistently.
+  \item \textbf{Linearizability} is a composable, real-time property of individual operations on single objects. It guarantees that if operation $B$ starts after operation $A$ finishes in physical wall-clock time, operation $B$ must observe the state left by $A$ or a subsequent operation.
+  \item \textbf{Strict Serializability (External Consistency)} is the union of both: transactions execute serializably, and their execution order respects physical real-time precedence.
+\end{itemize}
+
+\subsection{Causal Consistency and Session Guarantees}
+
+For systems that cannot afford the latency of Linearizability, Causal Consistency represents the strongest model achievable in a completely available (AP) partition-tolerant system (Mahajan et al., 2011).
+
+In web architectures, four \textbf{Client Session Guarantees} provide predictable semantics without requiring full consensus:
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Read-Your-Writes}: A client always sees its own previous updates. Implemented by sticky sessions, routing reads to the master node for $T$ seconds after a write, or caching client writes in browser local storage.
+  \item \textbf{Monotonic Reads}: If a client reads value $v_1$ at time $t_1$, any subsequent read at $t_2 > t_1$ will never return an older state $v_0$. Prevents time-traveling user interfaces.
+  \item \textbf{Monotonic Writes}: A client's writes are applied in the exact order they were submitted.
+  \item \textbf{Writes-Follow-Reads}: If a client reads state $v$ and subsequently writes $v'$, any other client observing $v'$ will also observe $v$.
+\end{enumerate}
+
+\section{The Raft Consensus Algorithm}
+
+Designed by Diego Ongaro and John Ousterhout (Stanford, 2014), Raft is an understandable consensus algorithm equivalent to Paxos in fault tolerance and performance. Raft decomposes consensus into three independent subproblems:
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Leader Election}: Selecting one server to manage the replicated log.
+  \item \textbf{Log Replication}: Accepting log entries from clients, replicating them across followers, and maintaining consistency.
+  \item \textbf{Safety}: Enforcing that if any server commits a log entry at a specific index, no other server will ever apply a different log entry for that index.
+\end{enumerate}
+
+\subsection{State Machine Replication}
+
+Raft implements \textbf{State Machine Replication (SMR)}. Identical state machines (such as a key-value store) execute on $2F + 1$ servers. The state machines process an identical sequence of inputs from an ordered write-ahead log (WAL), guaranteeing that all non-failing nodes produce identical output states.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.85,
+  node distance=1.5cm,
+  nodebox/.style={rectangle, draw=headingblue, fill=codebg, thick, rounded corners=3pt, minimum width=2.4cm, minimum height=1.6cm, align=center, font=\sffamily\footnotesize}
+]
+  \node[nodebox, fill=exampleBg] (leader) at (0, 0) {\textbf{Leader}\\Term: 2\\Role: Primary};
+  \node[nodebox] (f1) at (5, 1.8) {\textbf{Follower 1}\\Term: 2\\State: Up to date};
+  \node[nodebox] (f2) at (5, -1.8) {\textbf{Follower 2}\\Term: 2\\State: Up to date};
+  \node[nodebox, draw=gray!40, fill=gray!5] (f3) at (10, 0) {\textbf{Follower 3 (Offline)}\\Network Cut};
+
+  \draw[-{Stealth[scale=1.0]}, thick, color=exampleBlue] (leader) -- node[above, sloped, font=\sffamily\tiny] {AppendEntries (Heartbeat)} (f1);
+  \draw[-{Stealth[scale=1.0]}, thick, color=exampleBlue] (leader) -- node[below, sloped, font=\sffamily\tiny] {AppendEntries (Heartbeat)} (f2);
+  \draw[-{Stealth[scale=1.0]}, thick, dashed, color=warningRed] (leader) -- node[above, font=\sffamily\tiny] {Dropped} (f3);
+
+  \node[anchor=north, font=\sffamily\footnotesize, color=intuitionTeal] at (2.5, 3.2) {Quorum: $\lfloor N/2 \rfloor + 1 = \lfloor 4/2 \rfloor + 1 = 3$ nodes};
+\end{tikzpicture}
+\caption{Raft Cluster Topology with Majority Quorum ($N=4$, Quorum=3)}
+\label{fig:raft-topology}
+\end{figure}
+
+\subsection{Leader Election Mechanics}
+
+Nodes exist in one of three states: \textbf{Follower}, \textbf{Candidate}, or \textbf{Leader}.
+Time is divided into arbitrary terms identified by monotonic integers.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.9,
+  state/.style={circle, draw=headingblue, fill=codebg, thick, minimum size=2.2cm, align=center, font=\sffamily\small}
+]
+  \node[state] (f) at (0, 0) {\textbf{Follower}};
+  \node[state, fill=exampleBg] (c) at (5, 2.5) {\textbf{Candidate}};
+  \node[state, fill=intuitionBg] (l) at (10, 0) {\textbf{Leader}};
+
+  \draw[-{Stealth[scale=1.0]}, thick] (f) to [bend left=20] node[above, sloped, font=\sffamily\tiny] {Election Timeout expires} (c);
+  \draw[-{Stealth[scale=1.0]}, thick] (c) to [bend left=20] node[above, sloped, font=\sffamily\tiny] {Receives votes from majority} (l);
+  \draw[-{Stealth[scale=1.0]}, thick] (l) to [bend left=25] node[below, sloped, font=\sffamily\tiny] {Discovers higher term} (f);
+  \draw[-{Stealth[scale=1.0]}, thick] (c) to [bend left=20] node[below, sloped, font=\sffamily\tiny] {Discovers higher term / Leader} (f);
+  \draw[-{Stealth[scale=1.0]}, thick] (c) to [loop above] node[above, font=\sffamily\tiny] {Split vote timeout $\to$ New term} (c);
+\end{tikzpicture}
+\caption{Raft Finite State Machine Transitions}
+\label{fig:raft-fsm}
+\end{figure}
+
+\textbf{Randomized Election Timeouts:} To prevent split-vote deadlocks where multiple candidates split votes evenly, Raft randomizes election timeouts between $150\text{ ms}$ and $300\text{ ms}$. The first node whose timer expires increments its term, transitions to Candidate, votes for itself, and broadcasts \texttt{RequestVote} RPCs.
+
+\subsection{Log Matching and Election Safety Invariant}
+
+Raft enforces strict invariants:
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Election Safety}: At most one leader can be elected in a given term.
+  \item \textbf{Leader Append-Only}: A leader never overwrites or truncates its own log entries; it only appends new entries.
+  \item \textbf{Log Matching Property}: If two logs contain an entry with the same index and term, then:
+  \begin{itemize}[leftmargin=12pt]
+    \item They store the same command.
+    \item Their logs are completely identical in all preceding entries from index 1 to that index.
+  \end{itemize}
+  \item \textbf{Leader Completeness}: If a log entry is committed in a given term, that entry will be present in the logs of the leaders for all higher-numbered terms.
+\end{enumerate}
+
+\begin{underthehoodbox}[How Raft Enforces Leader Completeness without Transferring Old Logs]
+Unlike Multi-Paxos, which allows a new leader to be elected with an incomplete log and then retroactively discovers committed entries, Raft strictly forbids a node from becoming leader if it lacks any committed entries.
+When a voter evaluates a \texttt{RequestVote} RPC containing Candidate $(\text{term}_c, \text{lastLogIndex}_c, \text{lastLogTerm}_c)$, it rejects the vote unless the candidate's log is at least as up-to-date as its own:
+\begin{equation}
+(\text{lastLogTerm}_c > \text{lastLogTerm}_v) \lor (\text{lastLogTerm}_c == \text{lastLogTerm}_v \land \text{lastLogIndex}_c \ge \text{lastLogIndex}_v)
+\end{equation}
+Because any committed entry must reside on a majority of nodes, and an elected candidate must obtain votes from a majority of nodes, the candidate's quorum and the commit quorum must overlap by at least one node. That overlapping node will refuse to vote for any candidate lacking the committed entry.
+\end{underthehoodbox}
+
+\begin{lstlisting}[language=Python, caption={Core Raft Log Replication RPC Handler in Python}]
+from typing import List, Optional
+
+class LogEntry:
+    def __init__(self, term: int, index: int, command: str):
+        self.term = term
+        self.index = index
+        self.command = command
+
+class RaftFollower:
+    def __init__(self, node_id: str):
+        self.node_id = node_id
+        self.current_term = 0
+        self.voted_for: Optional[str] = None
+        self.log: List[LogEntry] = [LogEntry(0, 0, "INIT")] # 1-based indexing
+        self.commit_index = 0
+
+    def handle_append_entries(
+        self,
+        leader_term: int,
+        leader_id: str,
+        prev_log_index: int,
+        prev_log_term: int,
+        entries: List[LogEntry],
+        leader_commit: int
+    ) -> (int, bool):
+        # Rule 1: Reply false if term < current_term
+        if leader_term < self.current_term:
+            return self.current_term, False
+
+        # Update local term if leader is newer
+        if leader_term > self.current_term:
+            self.current_term = leader_term
+            self.voted_for = None
+
+        # Rule 2: Reply false if log doesn't contain entry at prev_log_index with prev_log_term
+        if prev_log_index >= len(self.log):
+            return self.current_term, False
+        if self.log[prev_log_index].term != prev_log_term:
+            # Conflict detected: follower log differs from leader!
+            return self.current_term, False
+
+        # Rule 3: If existing entry conflicts with new one, delete existing entry and all following
+        insert_index = prev_log_index + 1
+        for entry in entries:
+            if insert_index < len(self.log):
+                if self.log[insert_index].term != entry.term:
+                    self.log = self.log[:insert_index] # Truncate conflicting suffix
+                    self.log.append(entry)
+            else:
+                self.log.append(entry)
+            insert_index += 1
+
+        # Rule 4: Update commit index
+        if leader_commit > self.commit_index:
+            self.commit_index = min(leader_commit, len(self.log) - 1)
+
+        return self.current_term, True
+\end{lstlisting}
+
+\section{Summary \& Key Takeaways}
+\begin{itemize}[leftmargin=18pt]
+  \item The CAP Theorem formally proves that an asynchronous network cannot simultaneously provide Linearizability ($C$) and 100\% non-failing availability ($A$) during network partitions ($P$).
+  \item Network partitions are an inescapable physical reality in WANs and cloud networks; systems must be designed explicitly as CP or AP.
+  \item The PACELC Theorem expands CAP to normal operations: if partitioned ($P$), trade Consistency ($C$) vs. Availability ($A$); else ($E$), trade Latency ($L$) vs. Consistency ($C$).
+  \item Consistency is a spectrum: Strict Serializability $\to$ Linearizability $\to$ Sequential $\to$ Causal $\to$ Read-Your-Writes $\to$ Eventual.
+  \item Linearizability governs single-operation real-time boundaries, whereas Serializability governs multi-operation transaction isolation.
+  \item Raft solves consensus via State Machine Replication, using randomized election timers, leader log matching invariants, and majority quorum validation.
+\end{itemize}
+
+\section{Exercises}
+
+\subsection{Mechanics}
+Consider a Raft cluster of 5 nodes ($N_1, N_2, N_3, N_4, N_5$). The cluster is partitioned into two subnets: $\{N_1, N_2\}$ and $\{N_3, N_4, N_5\}$.
+\begin{enumerate}[leftmargin=18pt]
+  \item Can the partition containing $\{N_1, N_2\}$ elect a new leader? Show the quorum calculation.
+  \item Can the partition containing $\{N_3, N_4, N_5\}$ elect a new leader and commit new client writes?
+  \item Suppose $N_1$ was the leader before the partition. What happens when a client submits write $W_A$ to $N_1$, and another client submits write $W_B$ to the newly elected leader in the majority partition?
+\end{enumerate}
+
+\subsection{Debugging}
+An engineer configures an Elasticsearch cluster with 3 master-eligible nodes. To prevent split-brain during network partitions, the legacy setting \texttt{discovery.zen.minimum\_master\_nodes} must be specified. The engineer sets this value to \texttt{1}. Explain the exact sequence of events during a switch failure that results in data corruption and loss.
+
+\subsection{Architecture}
+You are designing a globally distributed collaborative document editor (like Google Docs or Figma). Users in Tokyo and New York must edit the same text block simultaneously with zero input latency. Detail why a CP consensus model (like Raft or Spanner) is inappropriate for real-time keystroke processing, and architect a solution using Conflict-Free Replicated Data Types (CRDTs) or Operational Transformation (OT).
+
+\section{Detailed Solutions}
+
+\subsection{Solution to Mechanics Exercise}
+\begin{enumerate}[leftmargin=18pt]
+  \item In a 5-node cluster, a majority quorum requires $\lfloor 5/2 \rfloor + 1 = 3$ votes. The partition $\{N_1, N_2\}$ contains only 2 nodes. Even if both vote for the same candidate, $2 < 3$. Therefore, this partition cannot elect a leader.
+  \item The partition $\{N_3, N_4, N_5\}$ contains 3 nodes. Because $3 \ge 3$, they constitute a majority quorum. They can elect a new leader (e.g., $N_3$) and successfully commit client writes by replicating to each other.
+  \item When Client 1 submits $W_A$ to $N_1$, $N_1$ writes $W_A$ to its local log and dispatches \texttt{AppendEntries} to $N_2$. $N_2$ appends it, but $N_1$ cannot reach $N_3, N_4, N_5$. Because $N_1$ only gathers 2 acknowledgments (itself and $N_2$), it cannot commit $W_A$. It must either block or return a timeout to Client 1. Meanwhile, the leader in the majority partition receives $W_B$, replicates it to 3 nodes ($N_3, N_4, N_5$), commits it, and returns success to Client 2.
+  When the partition heals, the new leader sends \texttt{AppendEntries} to $N_1$ and $N_2$ with a higher term. $N_1$ steps down to Follower, and its uncommitted entry $W_A$ is overwritten and truncated by the leader's log.
+\end{enumerate}
+
+\subsection{Solution to Debugging Exercise}
+\textbf{The Split-Brain Failure Mode:}
+When \texttt{minimum\_master\_nodes} is set to 1 in a 3-node cluster:
+\begin{enumerate}[leftmargin=18pt]
+  \item Suppose a network partition separates Node $A$ from Nodes $B$ and $C$.
+  \item Node $A$ detects the loss of heartbeats, increments its term, and solicits votes. Because its threshold is $\ge 1$, Node $A$ votes for itself, reaches the threshold of 1, and declares itself active Master for the cluster.
+  \item Simultaneously, Nodes $B$ and $C$ elect Node $B$ as Master.
+  \item Clients routed to Node $A$ (via DNS round-robin or local load balancers) execute index and update operations on Node $A$.
+  \item Other clients execute updates on Node $B$.
+  \item Both nodes independently allocate document IDs, delete indices, and advance internal version counters along divergent timelines.
+  \item When the network heals, neither master will step down cleanly. If one is forcibly reconciled over the other, all writes accepted by the deposed master are silently and permanently deleted.
+\end{enumerate}
+\textbf{The Correct Rule:} The minimum master nodes must always satisfy $\lfloor N/2 \rfloor + 1$. For 3 nodes, this value must be 2. In modern Elasticsearch (v7+), the Raft-based cluster coordination subsystem handles this automatically.
+
+\subsection{Solution to Architecture Exercise}
+\textbf{Why CP / Raft is Inappropriate:}
+A CP consensus protocol requires a synchronous round-trip to a majority quorum for every single operation before acknowledging it to the client. At a physical speed of light latency of $80\text{ ms}$ to $120\text{ ms}$ between Tokyo and New York, a user typing at 60 words per minute would experience noticeable input lag on every keystroke. Furthermore, if a user goes through an airplane tunnel or loses WiFi, a CP system rejects all edits.
+
+\textbf{CRDT-Based Architecture:}
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.9,
+  user/.style={rectangle, draw=headingblue, fill=codebg, thick, rounded corners=2pt, minimum width=3.2cm, minimum height=1.2cm, align=center, font=\sffamily\footnotesize},
+  sync/.style={<->, thick, dashed, color=intuitionTeal}
+]
+  \node[user] (u1) at (0, 0) {\textbf{Client Tokyo}\\Local CRDT State\\Instant keystroke render};
+  \node[user] (u2) at (7, 0) {\textbf{Client New York}\\Local CRDT State\\Instant keystroke render};
+
+  \draw[sync] (u1) -- node[above, font=\sffamily\tiny] {Asynchronous P2P / WebSocket Gossip} node[below, font=\sffamily\tiny] {Operation Stream (Idempotent, Commutative)} (u2);
+\end{tikzpicture}
+\end{figure}
+
+1. \textbf{Local Optimistic Execution}: Use a sequence CRDT (such as Yjs or Automerge based on RGA---Replicated Growable Array). Every character insertion creates an element with a globally unique, fractional ID: $(\text{LamportTS}, \text{ClientID}, \text{Offset})$. Characters are rendered to the user's screen in $0\text{ ms}$.
+2. \textbf{Asynchronous Commutative Merging}: Edit operations are broadcast over WebSockets asynchronously. Because CRDT operations form a join-semilattice (associative, commutative, and idempotent), operations can arrive out of order, be duplicated, or be delayed by hours without corrupting the document.
+3. \textbf{Convergence}: When the network synchronizes, both Tokyo and New York mathematically converge to the exact same document string without locking or central coordinator intervention.
+
+\section{Further Reading \& Citations}
+\begin{itemize}[leftmargin=18pt]
+  \item Gilbert, S., \& Lynch, N. (2002). \emph{Brewer's conjecture and the feasibility of consistent, available, partition-tolerant web services}. ACM SIGACT News, 33(2), 51--59.
+  \item Abadi, D. J. (2012). \emph{Consistency tradeoffs in modern distributed database system design: CAP is only part of the story}. Computer, 45(2), 37--42.
+  \item Ongaro, D., \& Ousterhout, J. (2014). \emph{In search of an understandable consensus algorithm}. In USENIX Annual Technical Conference (ATC 14), 305--319.
+  \item Mahajan, P., Alvisi, L., \& Dahlin, M. (2011). \emph{Consistency, availability, and convergence}. UT Austin Technical Report TR-11-22.
+\end{itemize}

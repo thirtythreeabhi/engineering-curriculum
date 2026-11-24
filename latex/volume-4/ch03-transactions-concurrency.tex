@@ -1,0 +1,325 @@
+\chapter{Transactions and Concurrency}
+\label{ch:transactions-concurrency}
+
+\begin{chaptergoalsbox}
+\textbf{What you will learn:}
+\begin{itemize}[leftmargin=12pt]
+  \item The fundamental atomicity problem across autonomous nodes: why single-node ACID fails across network boundaries.
+  \item The Two-Phase Commit (2PC) protocol: Prepare phase, Commit phase, and failure state machines.
+  \item Coordinator crash modes, in-doubt participants, blocking hazards, and catastrophic single-point-of-failure locks.
+  \item The Three-Phase Commit (3PC) protocol: PreCommit phase, non-blocking guarantees, and network partition limitations.
+  \item Distributed deadlocks: wait-for graphs, cycle detection, Wound-Wait vs. Wait-Die deadlock prevention algorithms.
+\end{itemize}
+
+\textbf{What you should already understand:}
+\begin{itemize}[leftmargin=12pt]
+  \item Relational database transactions: ACID properties, write-ahead logging (WAL), two-phase locking (2PL).
+  \item Consensus algorithms (Raft) and quorum rules from Chapter~\ref{ch:cap-consistency}.
+\end{itemize}
+
+\textbf{Why this topic exists:}
+Enterprise systems must frequently coordinate state mutations across distinct, physically separated databases---such as deducting funds from an Oracle ledger and crediting loyalty points in a PostgreSQL cluster. Without atomic commit protocols, partial network failures leave balances permanently desynchronized.
+
+\textbf{Motivating practical problem:}
+A banking platform initiates an account transfer across two sharded databases. Database A successfully deducts \$10,000 from the sender. The application server coordinating the transfer crashes from an out-of-memory killer before sending the commit command to Database B. The sender's money is gone, the recipient never receives it, and the database locks on both accounts remain frozen indefinitely.
+\end{chaptergoalsbox}
+
+\section{The Distributed Atomicity Challenge}
+
+On a single relational database engine, atomicity is guaranteed by an append-only Write-Ahead Log (WAL) managed by a central recovery engine. When a transaction commits, the engine writes a single \texttt{COMMIT} record to disk and calls \texttt{fsync()}. If the machine crashes before this record hits disk, recovery rolls back the uncommitted changes; if it crashes after, recovery rolls forward.
+
+In a distributed system, a single logical transaction touches multiple independent databases (cohorts or participants) hosted on different servers. No single physical disk exists to host a shared WAL commit record. If participant $A$ commits its local transaction and participant $B$ crashes during its commit, the distributed transaction violates Atomicity: some changes persist while others vanish.
+
+\section{The Two-Phase Commit (2PC) Protocol}
+
+Two-Phase Commit, formalized by Jim Gray in 1978, is the foundational atomic commit protocol designed to ensure that all participants either commit or abort together, regardless of individual node crashes.
+
+\subsection{Protocol Flow}
+
+The protocol coordinates one \textbf{Coordinator} and $N$ \textbf{Participants} across two distinct phases:
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.9,
+  node distance=2.5cm,
+  entity/.style={rectangle, draw=headingblue, fill=codebg, thick, rounded corners=2pt, minimum width=2.6cm, minimum height=1.0cm, align=center, font=\sffamily\footnotesize},
+  timeline/.style={thick, dashed, color=gray!60},
+  msg/.style={-{Stealth[scale=1.0]}, thick, color=linkblue}
+]
+  \node[entity] (coord) at (0, 0) {\textbf{Coordinator}};
+  \node[entity] (p1) at (6, 0) {\textbf{Participant 1}};
+  \node[entity] (p2) at (11, 0) {\textbf{Participant 2}};
+
+  \draw[timeline] (0, -0.6) -- (0, -6.8);
+  \draw[timeline] (6, -0.6) -- (6, -6.8);
+  \draw[timeline] (11, -0.6) -- (11, -6.8);
+
+  % Phase 1
+  \node[anchor=west, font=\sffamily\bfseries\footnotesize, color=headingblue] at (-0.2, -1.0) {Phase 1: Prepare};
+  \draw[msg] (0, -1.3) -- node[above, sloped, font=\sffamily\tiny] {PREPARE} (6, -1.8);
+  \draw[msg] (0, -1.3) -- node[above, sloped, font=\sffamily\tiny] {PREPARE} (11, -2.1);
+
+  \draw[msg] (6, -2.5) -- node[above, sloped, font=\sffamily\tiny] {VOTE\_COMMIT} (0, -3.0);
+  \draw[msg] (11, -2.7) -- node[above, sloped, font=\sffamily\tiny] {VOTE\_COMMIT} (0, -3.3);
+
+  % Phase 2
+  \node[anchor=west, font=\sffamily\bfseries\footnotesize, color=headingblue] at (-0.2, -4.0) {Phase 2: Commit};
+  \draw[msg] (0, -4.3) -- node[above, sloped, font=\sffamily\tiny] {GLOBAL\_COMMIT} (6, -4.8);
+  \draw[msg] (0, -4.3) -- node[above, sloped, font=\sffamily\tiny] {GLOBAL\_COMMIT} (11, -5.1);
+
+  \draw[msg] (6, -5.5) -- node[above, sloped, font=\sffamily\tiny] {ACK} (0, -6.0);
+  \draw[msg] (11, -5.7) -- node[above, sloped, font=\sffamily\tiny] {ACK} (0, -6.3);
+\end{tikzpicture}
+\caption{Two-Phase Commit (2PC) Protocol Sequence with Successful Agreement}
+\label{fig:2pc-sequence}
+\end{figure}
+
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Phase 1: Prepare (Voting Phase)}
+  \begin{itemize}[leftmargin=12pt]
+    \item The coordinator assigns a globally unique transaction ID ($TxID$) and sends a \texttt{PREPARE} message to all participants.
+    \item Each participant executes the transaction locally: acquires row-level locks, writes mutations and undo logs to disk, but \textbf{does not commit}.
+    \item If the participant successfully prepares and guarantees it can commit even if it crashes and reboots, it logs a \texttt{PREPARED} record to its local WAL and replies with \texttt{VOTE\_COMMIT}.
+    \item If the participant fails to acquire locks, encounters a constraint violation, or runs out of disk space, it writes an \texttt{ABORT} record and replies with \texttt{VOTE\_ABORT}.
+  \end{itemize}
+  \item \textbf{Phase 2: Commit (Decision Phase)}
+  \begin{itemize}[leftmargin=12pt]
+    \item If \textbf{all} participants voted \texttt{VOTE\_COMMIT}, the coordinator writes a \texttt{GLOBAL\_COMMIT} record to its local WAL and broadcasts \texttt{GLOBAL\_COMMIT} to all participants.
+    \item If \textbf{any} participant voted \texttt{VOTE\_ABORT} (or timed out without responding), the coordinator writes a \texttt{GLOBAL\_ABORT} record to its WAL and broadcasts \texttt{GLOBAL\_ABORT}.
+    \item Participants receive the decision, apply or rollback the changes, release all held locks, and reply with an \texttt{ACK}.
+    \item Once all ACKs are collected, the coordinator writes an \texttt{END} record to its log.
+  \end{itemize}
+\end{enumerate}
+
+\subsection{The Blocking Problem: In-Doubt Participants}
+
+The fatal vulnerability of 2PC is that it is a \textbf{blocking protocol}. If the coordinator crashes after participants have voted to commit but before delivering the final decision, participants enter an \textbf{in-doubt} state.
+
+\begin{productionwarningbox}[The Catastrophic Blocking State of 2PC]
+Consider the scenario where Participant 1 votes \texttt{VOTE\_COMMIT}. At that instant, Participant 1 surrenders autonomous control over its local resources:
+\begin{itemize}[leftmargin=12pt]
+  \item It \textbf{cannot unilaterally abort}, because the coordinator may have received all votes and sent \texttt{GLOBAL\_COMMIT} to Participant 2 before crashing. Unilateral abort would violate Atomicity.
+  \item It \textbf{cannot unilaterally commit}, because Participant 2 might have voted \texttt{VOTE\_ABORT}, prompting the coordinator to decide abort. Unilateral commit would violate Atomicity.
+\end{itemize}
+Therefore, Participant 1 \textbf{must block indefinitely}, holding all row locks and preventing other transactions from accessing those rows until the coordinator recovers its WAL from disk! In cloud production environments, an in-doubt blocking state can lock tables for hours, cascading into thread pool exhaustion and complete platform outages.
+\end{productionwarningbox}
+
+\begin{lstlisting}[language=Python, caption={Python Demonstration of 2PC Participant Recovery Machine}]
+import enum
+
+class State(enum.Enum):
+    INIT = 1
+    PREPARED = 2
+    COMMITTED = 3
+    ABORTED = 4
+
+class Participant2PC:
+    def __init__(self, node_id: str):
+        self.node_id = node_id
+        self.state = State.INIT
+        self.wal_log = []
+
+    def on_receive_prepare(self, tx_id: str) -> bool:
+        # Step 1: Check constraints, acquire locks, write undo/redo log to disk
+        can_commit = self._acquire_locks_and_reserve(tx_id)
+        if can_commit:
+            self._write_wal(tx_id, "PREPARED")
+            self.state = State.PREPARED
+            return True # VOTE_COMMIT
+        else:
+            self._write_wal(tx_id, "ABORTED")
+            self.state = State.ABORTED
+            self._release_locks(tx_id)
+            return False # VOTE_ABORT
+
+    def on_receive_decision(self, tx_id: str, decision: str):
+        if decision == "GLOBAL_COMMIT":
+            self._write_wal(tx_id, "COMMITTED")
+            self._finalize_commit(tx_id)
+            self.state = State.COMMITTED
+        else:
+            self._write_wal(tx_id, "ABORTED")
+            self._rollback(tx_id)
+            self.state = State.ABORTED
+        self._release_locks(tx_id)
+
+    def recover_from_crash(self, tx_id: str):
+        """Executed upon node reboot by scanning local WAL."""
+        last_log = self._read_last_wal(tx_id)
+        if last_log == "COMMITTED":
+            self._finalize_commit(tx_id)
+        elif last_log == "ABORTED" or last_log is None:
+            self._rollback(tx_id)
+        elif last_log == "PREPARED":
+            # CRITICAL: We are IN-DOUBT!
+            # We cannot resolve independently. Must query coordinator or peers.
+            self._enter_blocking_in_doubt_state(tx_id)
+\end{lstlisting}
+
+\section{Three-Phase Commit (3PC)}
+
+In 1981, Dale Skeen developed the Three-Phase Commit (3PC) protocol to eliminate the blocking hazard of 2PC. 3PC introduces an intermediate state---\textbf{PreCommit}---and assumes a \textbf{synchronous network model} with a bounded failure detector.
+
+\subsection{Protocol Stages}
+
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Phase 1: Can-Commit?}: Coordinator queries participants. If all vote Yes, proceed.
+  \item \textbf{Phase 2: Pre-Commit}: Coordinator issues \texttt{PRECOMMIT}. Participants enter the \texttt{PreCommit} state and acknowledge. Entering \texttt{PreCommit} guarantees that all participants voted Yes, and that no node will abort.
+  \item \textbf{Phase 3: Do-Commit}: Coordinator issues \texttt{DO\_COMMIT}. All participants finalize their writes.
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.85,
+  state/.style={rectangle, draw=headingblue, fill=codebg, thick, rounded corners=2pt, minimum width=2.4cm, minimum height=1.0cm, align=center, font=\sffamily\footnotesize}
+]
+  \node[state] (init) at (0, 0) {Init};
+  \node[state, fill=mistakeBg] (prep) at (4, 0) {Prepared};
+  \node[state, fill=intuitionBg] (precommit) at (8, 0) {PreCommit};
+  \node[state, fill=exampleBg] (commit) at (12, 0) {Committed};
+  \node[state, fill=warningBg] (abort) at (4, -2) {Aborted};
+
+  \draw[-{Stealth[scale=1.0]}, thick] (init) -- node[above, font=\sffamily\tiny] {CanCommit?} (prep);
+  \draw[-{Stealth[scale=1.0]}, thick] (prep) -- node[above, font=\sffamily\tiny] {PreCommit} (precommit);
+  \draw[-{Stealth[scale=1.0]}, thick] (precommit) -- node[above, font=\sffamily\tiny] {DoCommit} (commit);
+  \draw[-{Stealth[scale=1.0]}, thick] (init) |- node[left, font=\sffamily\tiny] {Abort} (abort);
+  \draw[-{Stealth[scale=1.0]}, thick] (prep) -- node[left, font=\sffamily\tiny] {Abort} (abort);
+\end{tikzpicture}
+\caption{State Transitions of a Participant in Three-Phase Commit (3PC)}
+\label{fig:3pc-states}
+\end{figure}
+
+\subsection{Why 3PC is Rarely Used in Production}
+
+Although 3PC eliminates blocking under a fail-stop model in synchronous networks, it fails completely under real-world \textbf{network partitions}:
+\begin{itemize}[leftmargin=18pt]
+  \item If a network partition splits the cluster during the PreCommit phase, nodes on one side of the partition timeout and abort, while nodes on the other side advance from PreCommit to Commit.
+  \item This creates split-brain state corruption, violating Distributed Atomicity.
+\end{itemize}
+Because real networks are asynchronous and subject to partitions, modern distributed engines (CockroachDB, TiDB, YugabyteDB) reject 3PC. Instead, they implement \textbf{Two-Phase Commit layered on top of Raft or Paxos}: the 2PC transaction coordinator and transaction logs are themselves replicated state machines, guaranteeing that coordinator failure can never cause permanent blocking.
+
+\section{Distributed Deadlocks and Prevention}
+
+When transactions execute across multiple distributed nodes and acquire row-level locks incrementally (Two-Phase Locking, 2PL), circular wait conditions inevitably occur.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.9,
+  tx/.style={circle, draw=headingblue, fill=codebg, thick, minimum size=1.5cm, align=center, font=\sffamily\small},
+  res/.style={rectangle, draw=exampleBlue, fill=exampleBg, thick, rounded corners=2pt, minimum width=2.4cm, minimum height=1.0cm, align=center, font=\sffamily\footnotesize}
+]
+  \node[tx] (t1) at (0, 0) {$T_1$};
+  \node[tx] (t2) at (6, 0) {$T_2$};
+  \node[res] (r1) at (3, 1.8) {Row $A$ (Node 1)};
+  \node[res] (r2) at (3, -1.8) {Row $B$ (Node 2)};
+
+  \draw[-{Stealth[scale=1.0]}, thick, color=intuitionTeal] (r1) -- node[above, font=\sffamily\tiny] {Held by} (t1);
+  \draw[-{Stealth[scale=1.0]}, thick, dashed, color=warningRed] (t1) -- node[below, sloped, font=\sffamily\tiny] {Waiting for} (r2);
+
+  \draw[-{Stealth[scale=1.0]}, thick, color=intuitionTeal] (r2) -- node[below, font=\sffamily\tiny] {Held by} (t2);
+  \draw[-{Stealth[scale=1.0]}, thick, dashed, color=warningRed] (t2) -- node[above, sloped, font=\sffamily\tiny] {Waiting for} (r1);
+\end{tikzpicture}
+\caption{Distributed Deadlock Cycle: Transactions $T_1$ and $T_2$ Waiting across Physical Nodes}
+\label{fig:distributed-deadlock}
+\end{figure}
+
+\subsection{Wait-For Graphs and Centralized Detection}
+
+In centralized databases, the engine maintains an in-memory Wait-For Graph (WFG) where directed edges represent $T_i \to T_j$ ($T_i$ is waiting for a lock held by $T_j$). Deadlocks are detected by executing Tarjan's strongly connected components algorithm or cycle detection on the graph.
+
+In distributed systems, constructing a global WFG requires all nodes to transmit local lock wait events to a central deadlock detector service. Network transit delays cause \textbf{phantom deadlocks}: the detector observes a cycle based on delayed messages, even though one of the transactions has already released its lock and committed.
+
+\subsection{Deadlock Prevention: Wait-Die vs. Wound-Wait}
+
+To eliminate deadlock cycles without distributed graph traversal, systems assign each transaction a monotonically increasing, unique logical timestamp $TS(T)$ when the transaction begins. The older transaction has a smaller numerical timestamp ($TS(T_{\text{old}}) < TS(T_{\text{young}})$).
+
+Suppose transaction $T_i$ requests a lock currently held by transaction $T_j$:
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lp{5.8cm}p{5.8cm}}
+\toprule
+\textbf{Algorithm} & \textbf{When $T_i$ is Older ($TS(T_i) < TS(T_j)$)} & \textbf{When $T_i$ is Younger ($TS(T_i) > TS(T_j)$)} \\
+\midrule
+\textbf{Wait-Die} & \textbf{Wait}: $T_i$ is permitted to wait for the younger $T_j$. & \textbf{Die}: $T_i$ dies (aborts and restarts with its original timestamp). \\
+\textbf{Wound-Wait} & \textbf{Wound}: $T_i$ preempts $T_j$. $T_j$ is wounded (aborts and releases its locks). & \textbf{Wait}: $T_i$ is permitted to wait for the older $T_j$. \\
+\bottomrule
+\end{tabular}
+\caption{Comparison of Wait-Die and Wound-Wait Deadlock Prevention Protocols}
+\label{tab:deadlock-algorithms}
+\end{table}
+
+\begin{underthehoodbox}[Why Wound-Wait Minimizes Cascading Aborts]
+In \textbf{Wait-Die}, an older transaction waits for younger ones. As a transaction ages, it is forced to wait more frequently, and younger transactions continually die and restart, leading to high abort rates and wasted work.
+In \textbf{Wound-Wait}, an older transaction immediately ``wounds'' (preempts) any younger transaction blocking its path. Younger transactions only wait for older ones; they never block an older transaction. Consequently, as a transaction gets older, it accumulates priority and clears its own path without ever being aborted. When a wounded transaction restarts, it retains its original timestamp, guaranteeing it will eventually become the oldest transaction and finish without starvation.
+\end{underthehoodbox}
+
+\section{Summary \& Key Takeaways}
+\begin{itemize}[leftmargin=18pt]
+  \item Single-node ACID cannot guarantee cross-network atomicity; distributed transactions require atomic commit protocols.
+  \item Two-Phase Commit (2PC) separates execution into Prepare and Commit phases, requiring unanimous agreement before writing a global commit.
+  \item 2PC is fundamentally vulnerable to coordinator crashes: participants that vote to commit enter an \textbf{in-doubt} blocking state and cannot unilaterally resolve locks without risking state corruption.
+  \item Three-Phase Commit (3PC) eliminates blocking in synchronous networks by introducing a PreCommit phase, but partitions cause split-brain data corruption.
+  \item Modern distributed engines solve 2PC blocking by replicating the coordinator and transaction logs via Raft or Paxos quorums.
+  \item Distributed deadlocks can be prevented without global wait-for graph cycle detection using timestamp-ordered non-preemptive (\textbf{Wait-Die}) or preemptive (\textbf{Wound-Wait}) algorithms.
+\end{itemize}
+
+\section{Exercises}
+
+\subsection{Mechanics}
+Trace a 2PC execution involving Coordinator $C$ and three participants $P_1, P_2, P_3$:
+\begin{enumerate}[leftmargin=18pt]
+  \item $P_1$ and $P_2$ vote \texttt{VOTE\_COMMIT}. $P_3$ experiences a unique key violation and votes \texttt{VOTE\_ABORT}.
+  \item Detail the exact messages sent by the coordinator in Phase 2, the disk operations executed by $P_1$ and $P_2$, and the final state of all participants.
+\end{enumerate}
+
+\subsection{Debugging}
+An engineer analyzes a thread dump from a microservice deployment utilizing Java Transaction API (JTA) with XA two-phase commit over two PostgreSQL databases. All 200 HTTP worker threads are blocked waiting for database connections. The database connection pools are 100\% saturated. Querying \texttt{pg\_prepared\_xacts} reveals 15 transactions in the \texttt{prepared} state dating back 14 hours. Explain why the connection pool is exhausted and detail the query to safely unlock the database.
+
+\subsection{Architecture}
+CockroachDB executes distributed multi-shard ACID transactions without a centralized 2PC coordinator. Explain how CockroachDB implements 2PC using \textbf{Transaction Records} stored as normal keys in a Raft range, \textbf{Write Intents}, and \textbf{Wound-Wait} concurrency control.
+
+\section{Detailed Solutions}
+
+\subsection{Solution to Mechanics Exercise}
+\begin{enumerate}[leftmargin=18pt]
+  \item Coordinator $C$ collects votes: $P_1 \to \texttt{COMMIT}$, $P_2 \to \texttt{COMMIT}$, $P_3 \to \texttt{ABORT}$.
+  \item Because unanimous consent is required, the coordinator chooses \textbf{Abort}.
+  \item $C$ writes \texttt{GLOBAL\_ABORT} to its local WAL and flushes to disk.
+  \item $C$ broadcasts \texttt{GLOBAL\_ABORT} to $P_1, P_2, P_3$.
+  \item $P_1$ and $P_2$ receive \texttt{GLOBAL\_ABORT}: they parse their local undo logs, rollback all mutated rows to their pre-transaction values, write an \texttt{ABORTED} record to their local WAL, release all held locks on disk/RAM, and reply with \texttt{ACK}.
+  \item $P_3$ receives \texttt{GLOBAL\_ABORT}, writes an \texttt{ABORTED} log, and replies with \texttt{ACK}.
+  \item $C$ collects all ACKs and writes \texttt{END} to its WAL. All nodes finish in the \textbf{Aborted} state; Atomicity is preserved.
+\end{enumerate}
+
+\subsection{Solution to Debugging Exercise}
+\textbf{Root Cause:} The application server acting as the XA Transaction Manager crashed (or suffered a network split) after issuing \texttt{PREPARE TRANSACTION} to PostgreSQL, but before issuing \texttt{COMMIT PREPARED} or \texttt{ROLLBACK PREPARED}. In PostgreSQL, a prepared transaction survives client disconnects and server restarts. It holds its acquired row and table locks indefinitely until explicitly resolved. Any incoming web request attempting to update those same rows is blocked, exhausting the application connection pool.
+\textbf{Resolution Query:}
+To inspect the orphaned in-doubt transactions:
+\begin{lstlisting}[language=SQL]
+SELECT gid, prepared, owner, database FROM pg_prepared_xacts;
+\end{lstlisting}
+To manually rollback the stuck transaction and release all row locks:
+\begin{lstlisting}[language=SQL]
+ROLLBACK PREPARED 'tx_gid_string_from_above';
+\end{lstlisting}
+
+\subsection{Solution to Architecture Exercise}
+\textbf{CockroachDB's Distributed Transaction Architecture:}
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Transaction Record}: When a client initiates a transaction, it creates a Transaction Record in the Raft range containing the transaction's primary key. The record has states: \texttt{PENDING}, \texttt{STAGING}, \texttt{COMMITTED}, or \texttt{ABORTED}. Because this record is replicated via Raft, it cannot be lost to single-node crashes.
+  \item \textbf{Write Intents}: When the transaction updates rows across other ranges (secondary keys), it writes an inline marker called a \emph{Write Intent}. A Write Intent points to the Transaction Record and contains the uncommitted value alongside an in-memory lock.
+  \item \textbf{Concurrency via Wound-Wait}: If transaction $T_{\text{young}}$ encounters a Write Intent written by $T_{\text{old}}$, $T_{\text{young}}$ waits. If $T_{\text{old}}$ encounters a Write Intent written by $T_{\text{young}}$, $T_{\text{old}}$ wounds $T_{\text{young}}$ by setting $T_{\text{young}}$'s Transaction Record to \texttt{ABORTED}.
+  \item \textbf{Atomic Commit Point}: The entire distributed transaction commits atomically the exact instant the primary Transaction Record transitions from \texttt{PENDING} to \texttt{COMMITTED} in Raft. Asynchronously, the coordinator resolves the Write Intents into permanent MVCC records. If another client reads a Write Intent before resolution, it inspects the primary Transaction Record to determine whether to return the new or old value.
+\end{enumerate}
+
+\section{Further Reading \& Citations}
+\begin{itemize}[leftmargin=18pt]
+  \item Gray, J. (1978). \emph{Notes on data base operating systems}. Operating Systems, An Advanced Course, Springer-Verlag, 393--481.
+  \item Skeen, D. (1981). \emph{Nonblocking commit protocols}. In Proceedings of the 1981 ACM SIGMOD international conference on Management of data, 133--142.
+  \item Rosenkrantz, D. J., Stearns, R. E., \& Lewis, P. M. (1978). \emph{System level concurrency control for distributed database systems}. ACM Transactions on Database Systems (TODS), 3(2), 178--198.
+  \item Bernstein, P. A., Hadzilacos, V., \& Goodman, N. (1987). \emph{Concurrency control and recovery in database systems}. Addison-Wesley.
+\end{itemize}

@@ -1,0 +1,52 @@
+\documentclass[11pt,oneside]{book}
+\input{../common/preamble.tex}
+
+\begin{document}
+\frontmatter
+\pagestyle{empty}
+
+\begin{center}
+  \vspace*{2cm}
+  {\Huge\sffamily\bfseries\color{headingblue} Modern Engineering Curriculum}\\[12pt]
+  {\Large\sffamily\color{gray} Volume II: AI Engineering}\\[8pt]
+  {\large\sffamily\color{textdark} State Machines, Vector Databases, Production RAG, and LLMOps}\\[30pt]
+  \hrule height 1.2pt
+  \vspace*{25pt}
+  {\normalsize\sffamily A Production-Grade Systems Textbook for Staff Engineers and AI Architects}
+\end{center}
+
+\vspace{2.5cm}
+
+\begin{tcolorbox}[
+  enhanced,
+  colback=white,
+  colframe=gray!30!white,
+  boxrule=0.8pt,
+  arc=2pt,
+  left=15pt,right=15pt,top=12pt,bottom=12pt
+]
+\sffamily\small
+\textbf{About Volume II (AI Engineering):}
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{Prerequisites}: Proficiency in modern Python (asynchronous programming, Pydantic, type systems), vector mathematics (inner products, cosine metrics), and relational database fundamentals.
+  \item \textbf{Core Thesis}: Generative AI applications cannot survive in production as naive prompt chains. Robust AI engineering demands formal state machine topologies (Bulk Synchronous Parallelism / Pregel), mathematically grounded vector indexing (HNSW, DiskANN), two-stage hybrid retrieval cascades, autonomous error recovery loops, semantic evaluation gates, and OpenTelemetry distributed tracing.
+  \item \textbf{Curriculum Role}: Volume II bridges backend API engineering (Volume I) with distributed consensus systems (Volume IV) and architectural economics (Volume V).
+\end{itemize}
+\end{tcolorbox}
+
+\newpage
+\pagestyle{fancy}
+\tableofcontents
+\newpage
+
+\mainmatter
+
+\input{ch01-langgraph.tex}
+\input{ch02-production-rag.tex}
+\input{ch03-embeddings-vector-db.tex}
+\input{ch04-retrieval-reranking.tex}
+\input{ch05-agent-architectures.tex}
+\input{ch06-llm-evaluations.tex}
+\input{ch07-observability-tracing.tex}
+
+\end{document}

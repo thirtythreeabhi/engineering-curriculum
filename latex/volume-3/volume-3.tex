@@ -1,0 +1,199 @@
+\documentclass[11pt,oneside]{book}
+\input{../common/preamble.tex}
+
+% Custom listing language additions for YAML and HCL
+\lstdefinelanguage{yaml}{
+  keywords={true,false,null,y,n},
+  keywordstyle=\color{blue!80!black}\bfseries,
+  basicstyle=\ttfamily\footnotesize\color{textdark},
+  sensitive=false,
+  comment=[l]{\#},
+  morecomment=[s]{/*}{*/},
+  commentstyle=\color{gray!80!black}\itshape,
+  stringstyle=\color{green!50!black},
+  moredelim=[l][\color{headingblue}\bfseries]{:},
+  morestring=[b]',
+  morestring=[b]"
+}
+
+\lstdefinelanguage{hcl}{
+  keywords={terraform,provider,resource,data,variable,output,locals,module,dynamic,content,lifecycle,precondition,postcondition},
+  keywordstyle=\color{blue!80!black}\bfseries,
+  basicstyle=\ttfamily\footnotesize\color{textdark},
+  sensitive=true,
+  comment=[l]{\#},
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  commentstyle=\color{gray!80!black}\itshape,
+  stringstyle=\color{green!50!black},
+  morestring=[b]"
+}
+
+\begin{document}
+\frontmatter
+
+% Title Page
+\begin{titlepage}
+\begin{center}
+  \vspace*{2.0cm}
+  {\Huge\sffamily\bfseries\color{headingblue} Cloud Engineering\\and DevSecOps}\\[14pt]
+  {\Large\sffamily\color{gray} Architecture, Container Runtimes, Supply Chain Security, and Infrastructure as Code}\\[24pt]
+  {\normalsize\sffamily\scshape Volume III of the Modern Engineering Curriculum}\\[30pt]
+  \hrule height 1.2pt
+  \vspace*{30pt}
+  
+  {\large\sffamily\bfseries Modern Engineering Curriculum Initiative}\\[10pt]
+  {\small\sffamily Production-Grade Engineering for Enterprise Systems}
+  
+  \vfill
+  
+  \begin{tcolorbox}[
+    enhanced,
+    colback=white,
+    colframe=gray!30!white,
+    boxrule=0.8pt,
+    arc=2pt,
+    left=15pt,right=15pt,top=12pt,bottom=12pt
+  ]
+  \sffamily\footnotesize\centering
+  \textbf{Curriculum Track B: Cloud Infrastructure and DevSecOps}\\
+  Covering Microsoft Azure SDN, Enterprise AI Infrastructure, Linux Namespaces \& cgroups v2,\\
+  Kubernetes Control Plane Internals, Secure CI/CD Pipelines, Sigstore Software Supply Chains,\\
+  Terraform DAG Execution, and SPIFFE/SPIRE Zero Trust Security.
+  \end{tcolorbox}
+  
+  \vspace*{1.5cm}
+\end{center}
+\end{titlepage}
+
+% Copyright Page
+\newpage
+\thispagestyle{empty}
+\vspace*{\fill}
+\begin{minipage}{\textwidth}
+\sffamily\footnotesize\color{gray!80!black}
+\textbf{Modern Engineering Curriculum: Volume III -- Cloud Engineering and DevSecOps}\\
+\copyright\ 2026 Modern Engineering Curriculum Initiative. All rights reserved.\\[10pt]
+Published in the United States of America.\\[10pt]
+No part of this publication may be reproduced, stored in a retrieval system, or transmitted in any form or by any means, electronic, mechanical, photocopying, recording, scanning, or otherwise, without the prior written permission of the authors.\\[10pt]
+\textbf{Colophon:} This volume was typeset in \LaTeX\ using the Bitstream Charter and Helvetica typefaces, adhering to the Manning and O'Reilly professional publishing typography standards.\\[10pt]
+\textbf{First Edition:} November 2026
+\end{minipage}
+
+% Dedication
+\newpage
+\thispagestyle{empty}
+\vspace*{3.5cm}
+\begin{center}
+  \itshape\Large
+  Dedicated to the systems architects, platform engineers, and security researchers\\
+  who maintain the reliability, resilience, and integrity of global digital infrastructure.
+\end{center}
+
+% Table of Contents
+\newpage
+\tableofcontents
+
+% Preface
+\newpage
+\chapter*{Preface}
+\addcontentsline{toc}{chapter}{Preface}
+
+Welcome to \textbf{Volume III: Cloud Engineering and DevSecOps}, a foundational cornerstone of the \emph{Modern Engineering Curriculum}. 
+
+While Volume I explored backend application runtimes (PHP-FPM, Python/FastAPI, HTTP/3, and database engines) and Volume II investigated artificial intelligence architectures (LangGraph, vector spaces, HNSW, and hybrid RAG), Volume III addresses the foundational substratum upon which all modern applications execute: the cloud infrastructure, the containerized runtime layer, the continuous delivery pipeline, and the cryptographic security fabric.
+
+\section*{The Philosophy of Volume III: No Magic, No Hand-Waving}
+In commercial software engineering, cloud computing and DevOps are too often taught through superficial tutorials: clicking buttons in a cloud web console, copying YAML snippets without understanding their semantics, or relying on magical abstractions.
+
+This textbook is designed with a very different pedagogy:
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Kernel-First Understanding:} We do not treat containers as ``lightweight virtual machines.'' We examine the precise Linux kernel system calls (\texttt{clone}, \texttt{unshare}, \texttt{setns}), the unified \texttt{cgroups v2} hierarchy, and the Copy-on-Write storage mechanics of \texttt{overlay2}.
+  \item \textbf{Mathematical \& Algorithmic Rigor:} We do not merely state that systems scale or search; we derive the token bucket leaky equations for Azure OpenAI rate limits, the graph traversal algorithms ($M, efConstruction, efSearch$) of HNSW vector indexes, the Reciprocal Rank Fusion (RRF) formula, the Completely Fair Scheduler CPU quota math, the Kahn topological sort of Terraform's DAG engine, and the Shannon entropy equation for secret detection.
+  \item \textbf{Production Hardening \& Failure Analysis:} Every chapter includes real-world case studies detailing multi-million-dollar outages caused by subtle misconfigurations---from DNS split-brain loops in Private Link to PLEG deadlocks on worker nodes and plaintext secrets in Terraform state files.
+\end{enumerate}
+
+\section*{Structure of Track B}
+Volume III spans seven interconnected chapters:
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{Chapter 1: Azure Fundamentals and Architecture} -- Covers ARM management hierarchies, VNet software-defined networking, CIDR math, Route Tables, NSGs, Azure Firewall, and Private Endpoints.
+  \item \textbf{Chapter 2: Azure OpenAI and Azure AI Search} -- Deep-dives into enterprise LLM provisioning, PTU vs. Pay-As-You-Go economics, content safety filters, private vector indexing with HNSW, hybrid search, and semantic rankers.
+  \item \textbf{Chapter 3: Docker and Kubernetes Internals} -- Unpacks Linux namespaces, \texttt{cgroups v2}, \texttt{overlay2}, OCI runtimes (\texttt{runc}, \texttt{containerd}, shims), the Kubernetes control plane, \texttt{etcd} Raft, kubelet PLEG, and KEDA autoscaling.
+  \item \textbf{Chapter 4: CI/CD Pipelines} -- Explores GitHub Actions event models, runner security boundaries, caching mechanics, Blue-Green deployments, Canary rollouts, and automated Prometheus-gated rollbacks.
+  \item \textbf{Chapter 5: DevSecOps} -- Details the shift-left security paradigm, AST taint analysis with Semgrep, Trivy SCA scanning with EPSS scoring, TruffleHog secret scanning, Cosign keyless signing with Sigstore, SBOMs via Syft, and the SLSA framework.
+  \item \textbf{Chapter 6: Terraform and Infrastructure as Code} -- Analyzes declarative HCL2 AST parsing, DAG graph resolution, remote state security, distributed locking with Azure Blob leases, 3-way drift reconciliation, and reusable module design.
+  \item \textbf{Chapter 7: Infrastructure Security} -- Codifies Zero Trust Architecture (NIST SP 800-207), Azure RBAC with PIM JIT access, cryptographic workload identity using SPIFFE/SPIRE, OIDC Workload Identity Federation, and Azure Key Vault envelope encryption with Secrets Store CSI drivers.
+\end{itemize}
+
+Alongside these chapters, students are encouraged to implement the accompanying reference projects: \textbf{Project 8} (Azure Secure App with Managed Identity and Key Vault), \textbf{Project 9} (Modular Terraform Infrastructure), and \textbf{Project 10} (DevSecOps Pipeline with SAST, SCA, and SBOMs).
+
+\mainmatter
+
+\input{ch01-azure-fundamentals.tex}
+\input{ch02-azure-openai-search.tex}
+\input{ch03-docker-kubernetes.tex}
+\input{ch04-cicd-pipelines.tex}
+\input{ch05-devsecops.tex}
+\input{ch06-terraform-iac.tex}
+\input{ch07-infrastructure-security.tex}
+
+\backmatter
+
+\chapter{Appendix: Cloud Engineering \& DevSecOps Taxonomy}
+\label{app:taxonomy}
+
+\section*{Cloud Infrastructure and Compute Foundations}
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lp{9.5cm}}
+\toprule
+\textbf{Acronym} & \textbf{Full Definition and Architectural Context} \\
+\midrule
+\textbf{ACA} & \textbf{Azure Container Apps:} Serverless container runtime built on Kubernetes, Envoy, and KEDA. \\
+\textbf{ARM} & \textbf{Azure Resource Manager:} Unified control plane API gateway for all Azure resource lifecycle management. \\
+\textbf{ASG} & \textbf{Application Security Group:} Tag-based grouping of NICs for dynamic NSG rule definitions. \\
+\textbf{CFS} & \textbf{Completely Fair Scheduler:} Linux kernel default CPU scheduling algorithm governing cgroup bandwidth quotas. \\
+\textbf{CNI} & \textbf{Container Network Interface:} CNCF specification for configuring network interfaces in Linux containers. \\
+\textbf{CRI} & \textbf{Container Runtime Interface:} gRPC API enabling kubelet to communicate with container runtimes (containerd). \\
+\textbf{CSI} & \textbf{Container Storage Interface:} Standard specification for exposing storage volume plugins to container orchestrators. \\
+\textbf{DAG} & \textbf{Directed Acyclic Graph:} Mathematical graph with directed edges and no closed cycles, utilized by Terraform. \\
+\textbf{HNSW} & \textbf{Hierarchical Navigable Small World:} Multi-layer skip-graph algorithm for approximate nearest neighbor vector search. \\
+\textbf{HPA} & \textbf{Horizontal Pod Autoscaler:} Kubernetes control loop scaling replica counts based on observed metric ratios. \\
+\textbf{KEDA} & \textbf{Kubernetes Event-driven Autoscaling:} Operator and external metrics server enabling scale-to-zero microservices. \\
+\textbf{OCI} & \textbf{Open Container Initiative:} Linux Foundation governance body specifying container image and runtime standards. \\
+\textbf{PLEG} & \textbf{Pod Lifecycle Event Generator:} Kubelet component translating container runtime diffs into lifecycle events. \\
+\textbf{PTU} & \textbf{Provisioned Throughput Unit:} Reserved GPU inferencing compute capacity in Azure OpenAI. \\
+\textbf{RRF} & \textbf{Reciprocal Rank Fusion:} Parameter-free rank-aggregation algorithm combining dense vector and lexical search. \\
+\textbf{UDR} & \textbf{User-Defined Route:} Custom route table entry in Azure overriding default system SDN forwarding paths. \\
+\bottomrule
+\end{tabular}
+\caption{Infrastructure, Container, and Networking Taxonomy}
+\label{tab:infra-taxonomy}
+\end{table}
+
+\newpage
+\section*{Security, Supply Chain, and Identity Foundations}
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lp{9.5cm}}
+\toprule
+\textbf{Acronym} & \textbf{Full Definition and Architectural Context} \\
+\midrule
+\textbf{EPSS} & \textbf{Exploit Prediction Scoring System:} Data-driven metric estimating the probability of a CVE being weaponized in the wild. \\
+\textbf{OIDC} & \textbf{OpenID Connect:} Identity layer built on OAuth 2.0 enabling federated workload token exchange. \\
+\textbf{PIM} & \textbf{Privileged Identity Management:} Cloud identity governance tool providing Just-In-Time role activation. \\
+\textbf{SAST} & \textbf{Static Application Security Testing:} Analyzing source code ASTs for security vulnerabilities without executing the code. \\
+\textbf{SCA} & \textbf{Software Composition Analysis:} Scanning third-party dependencies and container base layers for known CVEs. \\
+\textbf{SLSA} & \textbf{Supply-chain Levels for Software Artifacts:} Security framework standardizing build integrity and provenance. \\
+\textbf{SPIFFE} & \textbf{Secure Production Identity Framework for Everyone:} Open standard for cryptographic workload identity. \\
+\textbf{SPIRE} & \textbf{SPIFFE Runtime Environment:} Production reference implementation of SPIFFE for automated mTLS issuance. \\
+\textbf{SVID} & \textbf{SPIFFE Verifiable Identity Document:} Cryptographic token (X.509 or JWT) asserting a SPIFFE ID. \\
+\bottomrule
+\end{tabular}
+\caption{Security, DevSecOps, and Identity Governance Taxonomy}
+\label{tab:sec-taxonomy}
+\end{table}
+
+\end{document}

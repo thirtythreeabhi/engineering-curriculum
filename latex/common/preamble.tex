@@ -1,0 +1,234 @@
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{charter}
+\usepackage{courier}
+\usepackage[scaled=0.92]{helvet}
+\usepackage{microtype}
+\usepackage{geometry}
+\geometry{
+  letterpaper,
+  left=1.1in,
+  right=1.1in,
+  top=1.0in,
+  bottom=1.0in,
+  headheight=24pt
+}
+
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{tcolorbox}
+\tcbuselibrary{skins,breakable}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,calc,decorations.pathreplacing,fit}
+
+% Color Palette - Manning / O'Reilly inspired muted functional palette
+\definecolor{textdark}{RGB}{30, 41, 59}       % Deep slate text
+\definecolor{headingblue}{RGB}{15, 23, 42}    % Slate 900
+\definecolor{codebg}{RGB}{248, 250, 252}       % Slate 50 background
+\definecolor{codeframe}{RGB}{226, 232, 240}   % Slate 200 border
+\definecolor{linkblue}{RGB}{2, 132, 199}      % Sky 600
+
+% Callout colors
+\definecolor{intuitionTeal}{RGB}{13, 148, 136}
+\definecolor{intuitionBg}{RGB}{240, 253, 250}
+\definecolor{hoodSlate}{RGB}{71, 85, 105}
+\definecolor{hoodBg}{RGB}{248, 250, 252}
+\definecolor{exampleBlue}{RGB}{37, 99, 235}
+\definecolor{exampleBg}{RGB}{239, 246, 255}
+\definecolor{mistakeAmber}{RGB}{217, 119, 6}
+\definecolor{mistakeBg}{RGB}{254, 252, 232}
+\definecolor{warningRed}{RGB}{220, 38, 38}
+\definecolor{warningBg}{RGB}{254, 242, 242}
+\definecolor{tryViolet}{RGB}{124, 58, 237}
+\definecolor{tryBg}{RGB}{245, 243, 255}
+
+% Typography & Spacing
+\linespread{1.14}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{7pt plus 2pt minus 1pt}
+
+% Section Titles Styling (Modern & Proportionate)
+\titleformat{\chapter}[display]
+  {\normalfont\sffamily\bfseries\color{headingblue}}
+  {\vspace{-20pt}\flushleft\normalsize\scshape\color{gray}CHAPTER \thechapter}
+  {6pt}
+  {\huge\raggedright}[\vspace{10pt}\hrule height 0.8pt\vspace{14pt}]
+\titlespacing*{\chapter}{0pt}{10pt}{20pt}
+
+\titleformat{\section}
+  {\normalfont\sffamily\Large\bfseries\color{headingblue}}
+  {\thesection}{1em}{}
+\titlespacing*{\section}{0pt}{16pt plus 3pt minus 2pt}{6pt}
+
+\titleformat{\subsection}
+  {\normalfont\sffamily\large\bfseries\color{headingblue}}
+  {\thesubsection}{1em}{}
+\titlespacing*{\subsection}{0pt}{12pt plus 2pt minus 2pt}{4pt}
+
+\titleformat{\subsubsection}
+  {\normalfont\sffamily\normalsize\bfseries\color{headingblue}}
+  {\thesubsubsection}{1em}{}
+\titlespacing*{\subsubsection}{0pt}{10pt plus 2pt minus 1pt}{3pt}
+
+% Header & Footer
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\sffamily\color{gray}\nouppercase{\leftmark}}
+\fancyhead[R]{\small\sffamily\bfseries\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\headrule}{\hbox to\headwidth{\color{gray!30}\leaders\hrule height \headrulewidth\hfill}}
+\fancypagestyle{plain}{
+  \fancyhf{}
+  \fancyfoot[C]{\small\sffamily\thepage}
+  \renewcommand{\headrulewidth}{0pt}
+}
+
+% Code Listings Styling
+\lstset{
+  backgroundcolor=\color{codebg},
+  basicstyle=\ttfamily\footnotesize\color{textdark},
+  breakatwhitespace=false,
+  breaklines=true,
+  captionpos=b,
+  commentstyle=\color{gray!80!black}\itshape,
+  frame=single,
+  rulecolor=\color{codeframe},
+  framerule=0.6pt,
+  keepspaces=true,
+  keywordstyle=\bfseries\color{blue!80!black},
+  stringstyle=\color{green!50!black},
+  numbers=left,
+  numbersep=8pt,
+  numberstyle=\tiny\color{gray!70},
+  showspaces=false,
+  showstringspaces=false,
+  showtabs=false,
+  tabsize=2,
+  xleftmargin=12pt,
+  framexleftmargin=10pt,
+  framexrightmargin=4pt,
+  framextopmargin=4pt,
+  framexbottommargin=4pt
+}
+
+% 6 Pedagogical Callout Boxes (Muted, Left-Border Styling)
+\newtcolorbox{intuitionbox}[1][]{
+  enhanced,
+  breakable,
+  colback=intuitionBg,
+  colframe=intuitionTeal,
+  arc=1pt,
+  boxrule=0pt,
+  leftrule=3.5pt,
+  top=6pt,bottom=6pt,left=10pt,right=10pt,
+  coltitle=intuitionTeal,
+  fonttitle=\sffamily\bfseries\small,
+  title={Intuition \ifstrempty{#1}{}{: #1}},
+  attach title to upper=\par\vspace{4pt}
+}
+
+\newtcolorbox{underthehoodbox}[1][]{
+  enhanced,
+  breakable,
+  colback=hoodBg,
+  colframe=hoodSlate,
+  arc=1pt,
+  boxrule=0pt,
+  leftrule=3.5pt,
+  top=6pt,bottom=6pt,left=10pt,right=10pt,
+  coltitle=hoodSlate,
+  fonttitle=\sffamily\bfseries\small,
+  title={Under the Hood \ifstrempty{#1}{}{: #1}},
+  attach title to upper=\par\vspace{4pt}
+}
+
+\newtcolorbox{realworldbox}[1][]{
+  enhanced,
+  breakable,
+  colback=exampleBg,
+  colframe=exampleBlue,
+  arc=1pt,
+  boxrule=0pt,
+  leftrule=3.5pt,
+  top=6pt,bottom=6pt,left=10pt,right=10pt,
+  coltitle=exampleBlue,
+  fonttitle=\sffamily\bfseries\small,
+  title={Real-World Scenario \ifstrempty{#1}{}{: #1}},
+  attach title to upper=\par\vspace{4pt}
+}
+
+\newtcolorbox{commonmistakebox}[1][]{
+  enhanced,
+  breakable,
+  colback=mistakeBg,
+  colframe=mistakeAmber,
+  arc=1pt,
+  boxrule=0pt,
+  leftrule=3.5pt,
+  top=6pt,bottom=6pt,left=10pt,right=10pt,
+  coltitle=mistakeAmber,
+  fonttitle=\sffamily\bfseries\small,
+  title={Common Mistake \ifstrempty{#1}{}{: #1}},
+  attach title to upper=\par\vspace{4pt}
+}
+
+\newtcolorbox{productionwarningbox}[1][]{
+  enhanced,
+  breakable,
+  colback=warningBg,
+  colframe=warningRed,
+  arc=1pt,
+  boxrule=0pt,
+  leftrule=3.5pt,
+  top=6pt,bottom=6pt,left=10pt,right=10pt,
+  coltitle=warningRed,
+  fonttitle=\sffamily\bfseries\small,
+  title={Production Warning \ifstrempty{#1}{}{: #1}},
+  attach title to upper=\par\vspace{4pt}
+}
+
+\newtcolorbox{tryityourselfbox}[1][]{
+  enhanced,
+  breakable,
+  colback=tryBg,
+  colframe=tryViolet,
+  arc=1pt,
+  boxrule=0pt,
+  leftrule=3.5pt,
+  top=6pt,bottom=6pt,left=10pt,right=10pt,
+  coltitle=tryViolet,
+  fonttitle=\sffamily\bfseries\small,
+  title={Try It Yourself \ifstrempty{#1}{}{: #1}},
+  attach title to upper=\par\vspace{4pt}
+}
+
+% Chapter Goals / Roadmaps Box
+\newtcolorbox{chaptergoalsbox}{
+  enhanced,
+  breakable,
+  colback=gray!4!white,
+  colframe=gray!40!white,
+  arc=2pt,
+  boxrule=0.8pt,
+  top=8pt,bottom=8pt,left=12pt,right=12pt,
+  coltitle=headingblue,
+  fonttitle=\sffamily\bfseries\small,
+  title={Roadmap \& Prerequisites},
+  attach title to upper=\par\vspace{4pt}
+}
+
+% Hyperref setup (Muted, readable links)
+\usepackage[
+  colorlinks=true,
+  linkcolor=headingblue,
+  citecolor=linkblue,
+  urlcolor=linkblue,
+  bookmarksnumbered=true,
+  pdfstartview=FitH
+]{hyperref}

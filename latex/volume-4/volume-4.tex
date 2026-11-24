@@ -1,0 +1,27 @@
+\documentclass[11pt,oneside]{book}
+\input{../common/preamble.tex}
+
+\title{\Huge\sffamily\bfseries Distributed Systems Engineering\\[12pt]
+\Large\sffamily Architectures, Consensus, Messaging, and Resilient Storage}
+\author{\sffamily Modern Engineering Curriculum --- Volume IV}
+\date{\sffamily 2026 Edition}
+
+\begin{document}
+\frontmatter
+\maketitle
+
+\tableofcontents
+
+\mainmatter
+
+\include{ch01-distributed-fundamentals}
+\include{ch02-cap-consistency}
+\include{ch03-transactions-concurrency}
+\include{ch04-messaging-systems}
+\include{ch05-kafka-rabbitmq}
+\include{ch06-redis-caching}
+\include{ch07-distributed-locking}
+\include{ch08-sagas-cqrs-eventsourcing}
+\include{ch09-reliability-fault-tolerance}
+
+\end{document}

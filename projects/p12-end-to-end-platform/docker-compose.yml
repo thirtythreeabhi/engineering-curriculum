@@ -1,0 +1,118 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: platform-postgres
+    environment:
+      POSTGRES_DB: platform_db
+      POSTGRES_USER: platform_user
+      POSTGRES_PASSWORD: platform_secret_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./init-db:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U platform_user -d platform_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: platform-redis
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: platform-rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: rabbit_user
+      RABBITMQ_DEFAULT_PASS: rabbit_password
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ai-recommender:
+    build:
+      context: ./services/fastapi-ai-recommendations
+      dockerfile: Dockerfile
+    container_name: platform-ai-recommender
+    ports:
+      - "8000:8000"
+    environment:
+      PORT: 8000
+    depends_on:
+      - redis
+
+  php-storefront:
+    build:
+      context: ./services/php-storefront
+      dockerfile: Dockerfile
+    container_name: platform-php-storefront
+    ports:
+      - "8080:8080"
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: platform_db
+      DB_USER: platform_user
+      DB_PASS: platform_secret_password
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      RECOMMENDER_URL: http://ai-recommender:8000
+      RABBITMQ_HOST: rabbitmq
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  async-worker:
+    build:
+      context: ./services/async-worker
+      dockerfile: Dockerfile
+    container_name: platform-async-worker
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      DB_HOST: postgres
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:v2.50.1
+    container_name: platform-prometheus
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - php-storefront
+      - ai-recommender
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: platform-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on:
+      - prometheus

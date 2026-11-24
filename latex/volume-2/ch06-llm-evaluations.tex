@@ -1,0 +1,367 @@
+\chapter{LLM Evaluations: The RAG Triad, Metrics, and Evals-Driven Development}
+\label{ch:llm_evaluations}
+
+\begin{chaptergoalsbox}
+\textbf{What You Will Learn:}
+\begin{itemize}[leftmargin=15pt]
+  \item Why deterministic unit testing, BLEU, and ROUGE fail on modern generative language systems.
+  \item The RAG Triad (TruLens) and component evaluation metrics (Ragas): Faithfulness, Answer Relevance, Context Precision, and Context Recall.
+  \item Mathematical formalization of claim extraction and natural language entailment verification.
+  \item Synthetic test dataset synthesis using Evol-Instruct multi-hop generation.
+  \item Mitigating LLM-as-a-Judge systematic vulnerabilities: Position bias, verbosity bias, and self-enhancement bias.
+  \item Implementing automated CI/CD evaluation gates and statistical regression boundaries.
+\end{itemize}
+
+\textbf{What You Should Already Understand:}
+\begin{itemize}[leftmargin=15pt]
+  \item Precision, Recall, and $F_1$ classification metrics.
+  \item Basic prompt engineering and structured JSON output generation.
+  \item CI/CD pipeline automation (GitHub Actions, GitLab CI).
+\end{itemize}
+
+\textbf{Why This Topic Exists:}
+In traditional software, \texttt{assert add(2, 2) == 4} provides binary truth. In LLM applications, changing a single word in a system prompt or upgrading from GPT-4o to Claude 3.5 Sonnet may improve 80\% of customer responses while subtly introducing catastrophic hallucinations into 5\% of edge cases. Without automated semantic evaluation metrics, engineering teams fly blind.
+
+\textbf{Motivating Practical Problem:}
+A health-insurance chatbot answers queries regarding policy coverage. An engineer updates the prompt to make responses "more empathetic and concise." While internal spot-checks look excellent, the new prompt silently causes the model to tell customers that experimental chemotherapy treatments are covered without prior authorization. By the time customer complaints escalate, the company faces significant regulatory fines.
+\end{chaptergoalsbox}
+
+\section{The Generative Evaluation Crisis}
+
+Traditional software engineering relies on deterministic assertion testing: given input $X$, output must strictly equal $Y$. In generative AI, this paradigm collapses:
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Non-Deterministic Semantic Equivalence}: The sentences \emph{"The engine requires 5W-30 synthetic oil"} and \emph{"Use 5W-30 full synthetic lubricant for the powertrain"} share identical semantic truth, but zero exact string equality.
+  \item \textbf{Failure of $n$-gram Overlap Metrics (BLEU and ROUGE)}: BLEU and ROUGE measure superficial surface-level $n$-gram overlap. If a model generates:
+  \begin{center}
+  \emph{"Patient should take 50mg of Atenolol"} $\longleftrightarrow$ \emph{"Patient should not take 50mg of Atenolol"}
+  \end{center}
+  The ROUGE-1 score is 0.86 (near perfect), despite the medical advice being completely inverted and potentially lethal.
+\end{itemize}
+
+To evaluate generative pipelines at scale, the industry transitioned to \textbf{Evals-Driven Development (EDD)}, employing smaller, highly-calibrated LLMs to audit generation traces against formal semantic contracts.
+
+\section{The RAG Triad and Core Metrics}
+
+Formalized by TruLens and expanded by frameworks like Ragas (Es et al., 2023), the \textbf{RAG Triad} models the three interdependent pillars of a retrieval-augmented system:
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  entity/.style={draw=headingblue, fill=codebg, rounded corners=3pt, font=\sffamily\small\bfseries, minimum width=3.2cm, minimum height=1.2cm, align=center},
+  metric/.style={draw=warningRed, fill=warningBg, rounded corners=2pt, font=\sffamily\scriptsize\bfseries, minimum width=3.0cm, minimum height=0.8cm, align=center, color=warningRed},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=headingblue}
+]
+
+\node[entity] (query) at (0, 0) {User Query\\$Q$};
+\node[entity] (context) at (4.5, 3.8) {Retrieved Context\\$C$};
+\node[entity] (answer) at (9.0, 0) {Generated Answer\\$A$};
+
+% Metrics along edges
+\draw[arrow] (query) -- (context) node[midway, left=4pt, font=\sffamily\scriptsize\bfseries, color=linkblue] {Context Precision / Relevance};
+\draw[arrow] (context) -- (answer) node[midway, right=4pt, font=\sffamily\scriptsize\bfseries, color=intuitionTeal] {Faithfulness / Groundedness};
+\draw[arrow] (query) -- (answer) node[midway, below=4pt, font=\sffamily\scriptsize\bfseries, color=warningRed] {Answer Relevance};
+
+\end{tikzpicture}
+\caption{The RAG Triad: Context Relevance, Faithfulness, and Answer Relevance form a closed evaluation loop.}
+\label{fig:rag_triad}
+\end{figure}
+
+\subsection{1. Faithfulness (Groundedness)}
+Faithfulness measures whether the generated answer $A$ is strictly derived from the retrieved context $C$, preventing hallucinations.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw=headingblue, fill=codebg, rounded corners=2pt, font=\sffamily\scriptsize, align=center, minimum height=0.9cm},
+  arrow/.style={-{Stealth[scale=0.8]}, thick, color=linkblue}
+]
+
+\node[box, minimum width=3.0cm] (ans) at (0, 0) {Generated Answer $A$};
+\node[box, minimum width=3.4cm, fill=intuitionBg] (claims) at (4.0, 0) {LLM Step 1:\\Claim Extraction\\$S = \{s_1, s_2, \dots, s_n\}$};
+\node[box, minimum width=3.4cm, fill=warningBg] (entail) at (8.2, 0) {LLM Step 2:\\Entailment Verification\\against Context $C$};
+\node[box, minimum width=2.4cm, fill=exampleBg] (score) at (12.0, 0) {Faithfulness\\$\frac{|S_{\text{supported}}|}{|S|}$};
+
+\draw[arrow] (ans) -- (claims);
+\draw[arrow] (claims) -- (entail);
+\draw[arrow] (entail) -- (score);
+
+\end{tikzpicture}
+\caption{Two-Step Algorithmic Verification of Faithfulness.}
+\label{fig:faithfulness_pipeline}
+\end{figure}
+
+The calculation proceeds in two deterministic steps:
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Decomposition}: The evaluation LLM decomposes $A$ into atomic factual propositions $S = \{s_1, s_2, \dots, s_{|S|}\}$.
+  \item \textbf{Entailment Check}: For each claim $s_i$, the evaluation model determines whether $C \models s_i$ (Natural Language Inference entailment).
+\end{enumerate}
+\begin{equation}
+\text{Faithfulness}(A, C) = \frac{|\{s_i \in S \mid C \models s_i\}|}{|S|} \in [0, 1]
+\end{equation}
+
+\subsection{2. Answer Relevance}
+Answer relevance measures whether the response directly addresses the user's inquiry, irrespective of factual truth. A response stating \emph{"Paris is the capital of France and the Eiffel Tower is 330m tall"} is 100\% faithful, but if the user asked \emph{"How do I reset my router password?"}, its Answer Relevance is 0.0.
+
+To compute this without human labels, Ragas generates $M$ hypothetical reverse questions $q_1, \dots, q_M$ from the generated answer $A$ and measures mean cosine similarity against the original query $Q$:
+\begin{equation}
+\text{Answer\_Relevance}(A, Q) = \frac{1}{M} \sum_{i=1}^M \frac{\vec{E}(q_i) \cdot \vec{E}(Q)}{\|\vec{E}(q_i)\| \|\vec{E}(Q)\|}
+\end{equation}
+
+\subsection{3. Context Precision (Context Relevance)}
+Context Precision evaluates the retrieval stage. Given retrieved chunks $C = [c_1, c_2, \dots, c_K]$, it calculates the Mean Average Precision (MAP) of whether relevant chunks are ranked at the top:
+\begin{equation}
+\text{Context\_Precision@K} = \frac{\sum_{k=1}^K (\text{Precision@}k \times v_k)}{\sum_{k=1}^K v_k}
+\end{equation}
+where $v_k \in \{0, 1\}$ denotes whether chunk $c_k$ contains ground-truth information necessary to answer the question.
+
+\begin{lstlisting}[language=Python, caption={Faithfulness Evaluator Implementation from Scratch}]
+import json
+from pydantic import BaseModel
+from typing import list
+
+class ClaimList(BaseModel):
+    claims: list[str]
+
+class ClaimVerification(BaseModel):
+    claim: str
+    is_supported: bool
+    verbatim_quote: str
+    reasoning: str
+
+class VerificationResult(BaseModel):
+    verifications: list[ClaimVerification]
+
+EXTRACT_CLAIMS_PROMPT = """
+You are a strict factual auditor. Break down the following text into atomic, independent factual claims.
+Each claim must contain exactly one verifiable fact.
+Text: {answer}
+Respond strictly in JSON matching the schema.
+"""
+
+VERIFY_CLAIMS_PROMPT = """
+You are a formal logic judge. For each of the following claims, determine whether it is strictly supported by the provided context.
+Context:
+{context}
+
+Claims to verify:
+{claims_json}
+
+A claim is supported ONLY if it can be directly inferred from the context. If the context does not mention the fact, is_supported must be FALSE.
+"""
+
+async def evaluate_faithfulness(llm_judge, context: str, answer: str) -> float:
+    # Step 1: Extract atomic propositions
+    prompt_1 = EXTRACT_CLAIMS_PROMPT.format(answer=answer)
+    res_1 = await llm_judge.generate_structured(prompt_1, schema=ClaimList)
+    claims = res_1.claims
+    
+    if not claims:
+        return 1.0 # Vacuously true
+        
+    # Step 2: Verify each claim against context
+    prompt_2 = VERIFY_CLAIMS_PROMPT.format(
+        context=context, 
+        claims_json=json.dumps(claims)
+    )
+    res_2 = await llm_judge.generate_structured(prompt_2, schema=VerificationResult)
+    
+    supported_count = sum(1 for v in res_2.verifications if v.is_supported)
+    return supported_count / len(claims)
+\end{lstlisting}
+
+\section{Synthetic Test Dataset Generation}
+
+Evaluating systems requires high-quality ground-truth evaluation sets (Query, Ground-Truth Context, Ground-Truth Answer). Relying entirely on manual human labeling costs tens of thousands of dollars and moves too slowly for rapid iteration.
+
+\textbf{Evol-Instruct Synthesis} (Xu et al., 2023) generates realistic, multi-faceted benchmark datasets directly from ingested technical documents:
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  chunk/.style={draw=headingblue, fill=codebg, rounded corners=2pt, font=\sffamily\scriptsize, minimum width=2.8cm, minimum height=1.0cm, align=center},
+  evol/.style={draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, font=\sffamily\scriptsize, minimum width=2.8cm, minimum height=0.9cm, align=center},
+  arrow/.style={-{Stealth[scale=0.8]}, thick, color=headingblue}
+]
+
+\node[chunk] (doc) at (0, 1.5) {Corpus Chunks\\$c_1, c_2$};
+\node[evol] (base) at (3.5, 1.5) {Base Question\\Generation};
+\node[evol, fill=warningBg, minimum width=3.8cm] (multi) at (7.8, 2.5) {Multi-Hop Evolution\\(Requires reasoning over $c_1 \cap c_2$)};
+\node[evol, fill=exampleBg, minimum width=3.8cm] (cond) at (7.8, 0.5) {Conditional Evolution\\("What happens if constraint $X$ fails?")};
+\node[chunk, fill=gray!10] (final) at (12.2, 1.5) {Synthetic Evaluation\\Triple $(Q, C, A^*)$};
+
+\draw[arrow] (doc) -- (base);
+\draw[arrow] (base) |- (multi);
+\draw[arrow] (base) |- (cond);
+\draw[arrow] (multi) -| (final);
+\draw[arrow] (cond) -| (final);
+
+\end{tikzpicture}
+\caption{Evol-Instruct Synthetic Question Generation Pipeline.}
+\label{fig:evol_instruct}
+\end{figure}
+
+\begin{lstlisting}[language=Python, caption={Generating Multi-Hop Synthetic Evaluation Triples}]
+SYNTHETIC_EVOLVE_PROMPT = """
+You are an expert curriculum examiner. Given these two related document fragments, generate a complex MULTI-HOP question.
+The question MUST NOT be answerable by reading Chunk 1 alone, nor by reading Chunk 2 alone.
+Answering the question MUST require combining a fact from Chunk 1 with a fact from Chunk 2.
+
+Chunk 1:
+{chunk_1}
+
+Chunk 2:
+{chunk_2}
+
+Provide your output as:
+Question: <complex multi-hop question>
+GroundTruthAnswer: <comprehensive answer citing both chunks>
+"""
+
+async def generate_synthetic_triple(llm, chunk_1: str, chunk_2: str) -> dict:
+    prompt = SYNTHETIC_EVOLVE_PROMPT.format(chunk_1=chunk_1, chunk_2=chunk_2)
+    response = await llm.generate(prompt)
+    # Parse into (question, ground_truth, [chunk_1, chunk_2])
+    return parse_synthetic_response(response, [chunk_1, chunk_2])
+\end{lstlisting}
+
+\section{LLM-as-a-Judge Calibration \& Bias Mitigation}
+
+While using an LLM to evaluate another LLM is scalable, naive judges exhibit severe systematic cognitive biases (Zheng et al., 2023):
+
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Position Bias (Order Effect)}: When comparing Candidate A vs Candidate B pairwise, models preferentially favor Candidate A up to 65\% of the time simply because it appears first in the prompt.
+  \item \textbf{Verbosity Bias}: Models systematically award higher scores to longer, fluffier responses containing conversational pleasantries over crisp, accurate 1-line answers.
+  \item \textbf{Self-Enhancement Bias}: Models preferentially award higher scores to completions generated by their own model family (e.g., GPT-4 favoring GPT-3.5 over Claude 3.5).
+\end{enumerate}
+
+\subsection{Engineering Mitigation Protocols}
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Pairwise Position Swap}: Evaluate twice: trial 1 with $(A, B)$, trial 2 with $(B, A)$. A win is counted if and only if Candidate $A$ wins both positions. If candidates split decisions, mark as a tie.
+  \item \textbf{G-Eval / Chain-of-Thought Rubrics}: Force the judge to output a structured step-by-step reasoning trace evaluating explicit criteria before emitting numeric scores.
+  \item \textbf{Few-Shot Calibration Anchors}: Provide the judge with fixed, standardized reference examples representing a score of 1, 3, and 5 to pin scale variance.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  stage/.style={draw=headingblue, fill=codebg, rounded corners=2pt, font=\sffamily\scriptsize, minimum height=1.0cm, align=center},
+  arrow/.style={-{Stealth[scale=0.8]}, thick, color=headingblue}
+]
+
+\node[stage, minimum width=2.5cm] (git) at (0, 0) {Git Push\\(PR opened)};
+\node[stage, minimum width=3.0cm, fill=intuitionBg] (runner) at (3.5, 0) {Run Pipeline on\\500 Synthetic Evals};
+\node[stage, minimum width=3.2cm, fill=warningBg] (calc) at (7.5, 0) {Compute Triad Metrics\\vs Baseline Branch};
+\node[draw=warningRed, fill=warningBg, rounded corners=2pt, font=\sffamily\scriptsize\bfseries, minimum width=2.4cm, align=center] (gate) at (11.5, 0) {Gate: Faith $\ge 0.95$\\Recall $\ge 0.90$};
+
+\draw[arrow] (git) -- (runner);
+\draw[arrow] (runner) -- (calc);
+\draw[arrow] (calc) -- (gate);
+
+\end{tikzpicture}
+\caption{Continuous Integration (CI/CD) Automated Evaluation Gate.}
+\label{fig:cicd_evals}
+\end{figure}
+
+\begin{productionwarningbox}[Never Use Zero-Shot Likert Scales]
+Prompts instructing an LLM to \emph{"Rate the quality of this response from 1 to 10"} are useless in production. LLM scores on unanchored 1-10 scales cluster entirely between 7 and 9 with immense stochastic variance. Always use binary assertions (Supported vs Not Supported) or strict qualitative rubrics with explicit failure definitions.
+\end{productionwarningbox}
+
+\begin{realworldbox}[Catching a Silent Regression in Production]
+A major retail banking application deployed a prompt optimization to reduce token usage by 18\%.
+The standard regression test suite (1,000 synthetic questions run through GitHub Actions) ran automatically. While overall Answer Relevance held steady at 0.94, the Context Recall metric for credit card dispute policies dropped from 0.98 to 0.76.
+The CI evaluation gate failed the pull request build, blocking a regression that would have cost the bank thousands of dollars in uncollected dispute fees.
+\end{realworldbox}
+
+\begin{tryityourselfbox}[Build an Automated PR Evaluation Gate]
+Write a GitHub Actions workflow script using Python:
+\begin{enumerate}
+  \item Load a golden dataset of 25 QA pairs from \texttt{evals/golden\_dataset.json}.
+  \item Execute the application's RAG pipeline against each query.
+  \item Score Faithfulness and Context Precision using the \texttt{evaluate\_faithfulness} function.
+  \item If the mean Faithfulness drops below 0.92, raise \texttt{sys.exit(1)} to block PR merge.
+\end{enumerate}
+\end{tryityourselfbox}
+
+\section{Chapter Summary \& Key Takeaways}
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Failure of Deterministic Tests}: String matching, BLEU, and ROUGE fail to capture semantic truth and penalize valid paraphrasing. Evals-Driven Development (EDD) uses LLM judges operating on formal semantic contracts.
+  \item \textbf{The RAG Triad}: Faithfulness audits the Answer against Context. Context Precision audits retrieval against the Query. Answer Relevance audits the Answer against the Query.
+  \item \textbf{Atomic Claim Verification}: Faithfulness is evaluated by breaking answers into atomic propositions and executing natural language entailment against retrieved context chunks.
+  \item \textbf{Synthetic Benchmarking}: Evol-Instruct synthesizes multi-hop, reasoning-heavy test datasets from raw documents, enabling automated testing without expensive manual labeling.
+  \item \textbf{Judge Calibration}: Mitigate LLM judge vulnerabilities (position bias, verbosity bias) via pairwise swaps, chain-of-thought grading rubrics, and strict anchor definitions.
+  \item \textbf{CI/CD Gates}: Treat semantic evaluation scores like unit test coverage; block deployment pipelines whenever Faithfulness or Context Precision drops below calibrated thresholds.
+\end{itemize}
+
+\section{Exercises}
+
+\subsection*{Mechanics}
+\textbf{Exercise 6.1}: A generated answer contains 5 atomic claims:
+\begin{itemize}
+  \item $s_1$: "PostgreSQL uses Write-Ahead Logging for durability."
+  \item $s_2$: "The default WAL buffer size is 16 Megabytes."
+  \item $s_3$: "PostgreSQL stores tables in 16 Kilobyte page blocks."
+  \item $s_4$: "Checkpointing flushes dirty pages from shared buffers to disk."
+  \item $s_5$: "MVCC creates a new tuple version for every SQL UPDATE."
+\end{itemize}
+Upon entailment check against the retrieved context, claims $s_1, s_2, s_4,$ and $s_5$ are supported, while the context explicitly states that page blocks are 8 Kilobytes ($s_3$ fails). Calculate the Faithfulness score.
+
+\textbf{Exercise 6.2}: Given a retrieval system that returns 4 chunks for a query, where chunks at rank 1, 2, and 4 are relevant ($v_1=1, v_2=1, v_3=0, v_4=1$), compute the Context Precision@4 score.
+
+\subsection*{Debugging}
+\textbf{Exercise 6.3}: In an A/B evaluation between Model Alpha and Model Beta, Model Alpha wins 82\% of pairwise comparisons. However, an engineer notices that Model Alpha was consistently placed as "Option 1" in the judge prompt. When the order is reversed, Model Beta wins 79\% of comparisons. Explain this discrepancy and prescribe the exact evaluation protocol to eliminate it.
+
+\subsection*{Architecture}
+\textbf{Exercise 6.4}: Design a continuous offline evaluation engine for a high-volume enterprise customer service agent processing 200,000 conversations daily. Your architecture must sample traces, execute Faithfulness/Relevance checks, detect drift, and alert engineers without saturating LLM API rate limits or budget caps.
+
+\section{Detailed Solutions}
+
+\subsection*{Solution 6.1}
+The total number of extracted atomic claims $|S| = 5$.
+The number of supported claims $|S_{\text{supported}}| = 4$ ($s_1, s_2, s_4, s_5$).
+\[
+\text{Faithfulness} = \frac{|S_{\text{supported}}|}{|S|} = \frac{4}{5} = 0.80 \quad (80\%)
+\]
+
+\subsection*{Solution 6.2}
+Precision@$k$ is the fraction of relevant documents in the top-$k$ results:
+\begin{itemize}
+  \item $k=1: v_1=1 \implies \text{Precision@}1 = \frac{1}{1} = 1.0$
+  \item $k=2: v_2=1 \implies \text{Precision@}2 = \frac{2}{2} = 1.0$
+  \item $k=3: v_3=0 \implies \text{Precision@}3 = \frac{2}{3} \approx 0.667$ (not included in sum since $v_3=0$)
+  \item $k=4: v_4=1 \implies \text{Precision@}4 = \frac{3}{4} = 0.75$
+\end{itemize}
+Context Precision@4 is:
+\[
+\text{Context Precision@4} = \frac{\sum_{k=1}^4 (\text{Precision@}k \times v_k)}{\sum_{k=1}^4 v_k} = \frac{1.0(1) + 1.0(1) + 0.667(0) + 0.75(1)}{1 + 1 + 0 + 1} = \frac{2.75}{3} \approx 0.9167
+\]
+
+\subsection*{Solution 6.3}
+The system is suffering from \textbf{Position Bias}: LLM judges preferentially select the first option presented in the context window.
+Fix: Implement the \textbf{Pairwise Swap Protocol}:
+\begin{enumerate}
+  \item Run Test 1: Present Option 1 = Alpha, Option 2 = Beta.
+  \item Run Test 2: Present Option 1 = Beta, Option 2 = Alpha.
+  \item Evaluation logic:
+  \[
+  \text{Score} = \begin{cases} 
+  \text{Alpha Win} & \text{if Alpha wins Test 1 AND Alpha wins Test 2} \\
+  \text{Beta Win} & \text{if Beta wins Test 1 AND Beta wins Test 2} \\
+  \text{Tie / Inconclusive} & \text{if winners disagree across positions}
+  \end{cases}
+  \]
+\end{enumerate}
+
+\subsection*{Solution 6.4}
+Architecture:
+\begin{enumerate}
+  \item \textbf{Stratified Sampling Queue}: Out of 200,000 daily traces, capture 1\% (2,000 traces) using reservoir sampling stratified across user intent categories and explicit negative feedback flags.
+  \item \textbf{Decoupled Worker Pool}: Push sampled trace IDs to an Amazon SQS / Celery queue processed by background workers running a lightweight, high-throughput judge (e.g., Llama-3.1-70B or GPT-4o-mini).
+  \item \textbf{Statistical Process Control (SPC)}: Aggregate daily scores into rolling 7-day Shewhart control charts. If the mean Faithfulness drops by more than $3\sigma$ below the moving average, trigger a PagerDuty alert to the AI platform team.
+\end{enumerate}
+
+\section{Further Reading \& Citations}
+\begin{itemize}[leftmargin=18pt]
+  \item Es, S., et al. (2023). \emph{Ragas: Automated Evaluation of Retrieval Augmented Generation}. arXiv preprint arXiv:2309.15217.
+  \item Zheng, L., et al. (2023). \emph{Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena}. Advances in Neural Information Processing Systems (NeurIPS).
+  \item Xu, C., et al. (2023). \emph{WizardLM: Empowering Large Language Models to Follow Complex Instructions (Evol-Instruct)}. arXiv preprint arXiv:2304.12244.
+\end{itemize}

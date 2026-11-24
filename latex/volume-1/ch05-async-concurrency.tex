@@ -1,0 +1,391 @@
+\chapter{Asynchronous Programming, Coroutines, and Concurrency Models}
+\label{chap:async-concurrency}
+
+\begin{chaptergoalsbox}
+\textbf{What You Will Learn:}
+\begin{itemize}[leftmargin=12pt,itemsep=2pt]
+  \item Fundamental concurrency primitives: Preemptive vs. Cooperative multitasking, kernel context switches, and TLB invalidation costs.
+  \item OS kernel threads (1:1) vs. userland green threads/fibers (M:N): stack memory footprint (8MB vs. 2KB) and scheduling latency.
+  \item Communicating Sequential Processes (CSP): Tony Hoare's calculus, unbuffered rendezvous synchronization, and channel multiplexing.
+  \item The Actor Model: Hewitt's axioms, mailboxes, supervision trees, and Erlang's ``let it crash'' fault-isolation philosophy.
+  \item Asynchronous PHP 8.1--8.4: Low-level \texttt{Fiber} stack manipulation, the Revolt event loop standard, and non-blocking I/O without native C extensions.
+\end{itemize}
+
+\textbf{What You Should Already Understand:}
+\begin{itemize}[leftmargin=12pt,itemsep=2pt]
+  \item CPU registers and stack pointer (\texttt{RSP}, \texttt{RIP}) mechanics.
+  \item Basic asynchronous event loops and non-blocking sockets (covered in Chapters 1 and 2).
+\end{itemize}
+
+\textbf{Why This Topic Exists:}
+Concurrency is the single most misunderstood domain in backend systems. Inexperienced teams default to spawning raw OS threads for concurrent operations, rapidly hitting kernel thread limits, thrashing CPU caches, and causing catastrophic deadlocks. Choosing the appropriate concurrency paradigm—whether cooperative coroutines, CSP channels, or isolated actors—dictates the resilience, throughput, and operational envelope of a distributed backend.
+
+\textbf{Motivating Practical Problem:}
+A telecommunications telemetry ingest service receives continuous heartbeat pings from 150,000 IoT sensors. Each incoming sensor reading requires enriching data against an external microservice and persisting the result to a database. When implemented using native OS threads, the server exhausts its 64GB RAM within minutes due to multi-megabyte thread stacks, while thread context switching consumes 80\% of all CPU cycles. Transitioning this architecture to lightweight userland fibers and event multiplexing slashes memory usage by 95\% while tripling request throughput.
+\end{chaptergoalsbox}
+
+\section{Preemptive vs. Cooperative Multitasking}
+
+At the hardware layer, a CPU core can execute only one sequence of instructions at any single instant. Concurrency—the illusion of simultaneous execution—is achieved via multitasking schedulers.
+
+\subsection{Preemptive Scheduling: Kernel-Driven Interruption}
+
+In a **preemptive multitasking** environment (standard Linux/Windows OS threads), the operating system kernel retains absolute authority over CPU execution time.
+
+\subsubsection{Timer Interrupts and Hardware Context Switches}
+The OS programs a hardware timer (such as the Local APIC timer). When the timer fires (typically every 1--10 milliseconds):
+\begin{enumerate}[leftmargin=15pt]
+  \item A hardware interrupt forces the CPU from User Mode (Ring 3) into Kernel Mode (Ring 0).
+  \item The kernel saves the active thread's entire hardware context: General Purpose Registers (\texttt{RAX}, \texttt{RBX}, \texttt{RCX}, etc.), Instruction Pointer (\texttt{RIP}), Stack Pointer (\texttt{RSP}), and SIMD vector registers (AVX/SSE) into memory.
+  \item The kernel scheduler selects the next runnable thread from its run-queue.
+  \item The kernel switches memory address spaces by loading the new process's Page Table root pointer into the \texttt{CR3} control register.
+  \item The CPU flushes the Translation Lookaside Buffer (TLB), invalidates L1/L2 data and instruction caches, restores the new thread's registers, and returns to Ring 3.
+\end{enumerate}
+
+\begin{underthehoodbox}[The Hidden Cost of Kernel Context Switches]
+A kernel thread context switch consumes between 1.5 to 5 microseconds of raw CPU time. However, the true penalty is the **indirect cost of cache pollution**: invalidating the CPU L1/L2 caches and flushing the TLB forces subsequent instructions to incur hundreds of nanoseconds of main RAM memory latency until hot cache lines are repopulated!
+\end{underthehoodbox}
+
+\subsection{Cooperative Multitasking: Voluntary Yield Points}
+
+In **cooperative multitasking** (coroutine engines, green threads, fibers), execution control is held voluntarily by the running routine. The scheduler cannot preempt a routine against its will.
+
+A routine yields execution by calling an explicit yield primitive (such as \texttt{await}, \texttt{Fiber::suspend()}, or channel send/receive). Because yield points occur at known, deterministic boundaries:
+\begin{itemize}[leftmargin=15pt]
+  \item Execution remains entirely in User Mode (Ring 3)—no kernel transitions.
+  \item The memory address space (\texttt{CR3}) does not change; zero TLB invalidation.
+  \item Only minimal caller-saved registers must be swapped.
+  \item Context switch time drops from microseconds to **under 20 nanoseconds**!
+\end{itemize}
+
+% ==========================================
+\section{OS Kernel Threads vs. Userland Green Threads and Fibers}
+
+The structural differences between kernel threads and userland green threads govern the scalability of backend systems.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.9, transform shape,
+  node distance=0.8cm and 1.5cm,
+  box/.style={rectangle, draw=headingblue, fill=codebg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily},
+  accent/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily\bfseries},
+  line/.style={draw=headingblue, -{Stealth[length=2.5mm]}, thick}
+]
+  % 1:1 Threading
+  \node[box, minimum width=4.5cm] (k1) {User Thread 1};
+  \node[box, right=0.3cm of k1, minimum width=4.5cm] (k2) {User Thread 2};
+  \node[accent, below=0.6cm of k1, minimum width=4.5cm] (os1) {Kernel Thread 1 (2--8MB Stack)};
+  \node[accent, below=0.6cm of k2, minimum width=4.5cm] (os2) {Kernel Thread 2 (2--8MB Stack)};
+  \draw[line, <->] (k1) -- (os1);
+  \draw[line, <->] (k2) -- (os2);
+  \node[above=0.2cm of k1, xshift=2.4cm, font=\small\sffamily\bfseries] {1:1 Kernel Threading (Pthreads, Java, C++)};
+
+  % M:N Threading
+  \node[box, below=1.8cm of os1, minimum width=2.1cm] (g1) {Fiber 1};
+  \node[box, right=0.2cm of g1, minimum width=2.1cm] (g2) {Fiber 2};
+  \node[box, right=0.2cm of g2, minimum width=2.1cm] (g3) {Fiber 3};
+  \node[box, right=0.2cm of g3, minimum width=2.1cm] (g4) {Fiber $N$};
+  \node[accent, below=0.6cm of g1, xshift=1.2cm, minimum width=4.0cm] (w1) {Kernel Worker Thread 1};
+  \node[accent, below=0.6cm of g3, xshift=1.2cm, minimum width=4.0cm] (w2) {Kernel Worker Thread 2};
+  
+  \draw[line] (g1) -- (w1);
+  \draw[line] (g2) -- (w1);
+  \draw[line] (g3) -- (w2);
+  \draw[line] (g4) -- (w2);
+  \node[above=0.2cm of g1, xshift=4.6cm, font=\small\sffamily\bfseries] {M:N Green Threading (Go Goroutines, Erlang, PHP Fibers)};
+\end{tikzpicture}
+\caption{Architectural comparison between 1:1 kernel threading and M:N green thread multiplexing.}
+\label{fig:thread-models}
+\end{figure}
+
+\subsection{Memory Footprint: Stack Sizing Mechanics}
+
+\begin{table}[htbp]
+\centering
+\small\sffamily
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Metric} & \textbf{OS Kernel Thread (1:1)} & \textbf{Green Thread / Fiber (M:N)} \\ \midrule
+\textbf{Default Stack Size} & 2 MB to 8 MB (Virtual Memory) & 2 KB to 4 KB (Dynamic heap allocated) \\
+\textbf{Max Concurrent Units} & $\approx 5,000 - 10,000$ per machine & $\approx 1,000,000+$ per machine \\
+\textbf{Creation Latency} & $\approx 50 - 100\ \mu\text{s}$ & $\approx 0.1 - 0.5\ \mu\text{s}$ \\
+\textbf{Switch Overhead} & $1.5 - 5.0\ \mu\text{s}$ (Kernel Ring 0) & $10 - 30\ \text{ns}$ (User Mode pointer swap) \\ \bottomrule
+\end{tabular}
+\caption{Performance metrics: OS threads versus lightweight fibers.}
+\label{tab:thread-comparison}
+\end{table}
+
+In Linux, a standard thread created via \texttt{pthread\_create()} allocates a virtual memory range (typically 8MB via \texttt{ulimit -s}) protected by non-readable **guard pages** to detect stack overflow. Spawning 10,000 threads consumes 80GB of virtual address space, quickly exhausting kernel memory descriptors.
+
+In contrast, green threads (such as Go goroutines or PHP Fibers) allocate tiny initial stacks (2KB--4KB) on the application heap. If deeper call recursion is required, the runtime allocates a larger stack frame and copies pointers, or links segmented stack chunks.
+
+% ==========================================
+\section{Communicating Sequential Processes (CSP)}
+
+Formalized by C.A.R. Hoare in 1978, **Communicating Sequential Processes (CSP)** provides a mathematical framework for concurrent systems where entities execute sequentially and interact exclusively by passing messages across **Channels**.
+
+\subsection{The CSP Core Axiom}
+$$\text{\textit{``Do not communicate by sharing memory; instead, share memory by communicating.''}}$$
+
+In shared-memory concurrency, multiple threads access the same variables, requiring complex mutex locks, condition variables, and memory barriers. If an engineer forgets a lock, race conditions silently corrupt data.
+
+In CSP, data ownership is transferred across channels. Once a value is pushed into a channel, the sender relinquishes ownership; only the receiving process can read and mutate it.
+
+\subsection{Channel Mechanics: Unbuffered vs. Buffered}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.9, transform shape,
+  node distance=0.8cm and 1.5cm,
+  node/.style={rectangle, draw=headingblue, fill=codebg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily},
+  accent/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily\bfseries},
+  line/.style={draw=headingblue, -{Stealth[length=2.5mm]}, thick}
+]
+  % Unbuffered
+  \node[node] (p1) {Process A};
+  \node[accent, right=of p1] (rendezvous) {Unbuffered Channel\\(Rendezvous Sync Point)};
+  \node[node, right=of rendezvous] (p2) {Process B};
+  \draw[line] (p1) -- node[above, font=\tiny\sffamily] {Blocks until ready} (rendezvous);
+  \draw[line] (rendezvous) -- node[above, font=\tiny\sffamily] {Hand-off} (p2);
+
+  % Buffered
+  \node[node, below=1.2cm of p1] (p3) {Process C};
+  \node[accent, right=of p3] (buf) {Buffered Channel $[V_1, V_2, V_3]$\\Circular Ring Buffer};
+  \node[node, right=of buf] (p4) {Process D};
+  \draw[line] (p3) -- node[above, font=\tiny\sffamily] {Non-blocking if not full} (buf);
+  \draw[line] (buf) -- node[above, font=\tiny\sffamily] {Pops FIFO} (p4);
+\end{tikzpicture}
+\caption{Channel synchronization semantics: Unbuffered rendezvous vs. Buffered ring queue.}
+\label{fig:csp-channels}
+\end{figure}
+
+\subsubsection{Unbuffered Channels (Rendezvous)}
+An unbuffered channel has zero capacity. When Process A sends a message:
+\begin{enumerate}[leftmargin=15pt]
+  \item Process A blocks and is removed from the runnable scheduler queue.
+  \item When Process B attempts to receive from the channel, the runtime copies data directly from A's stack to B's stack.
+  \item Both processes are marked runnable simultaneously. This guarantees **instantaneous synchronous hand-off**.
+\end{enumerate}
+
+\subsubsection{Buffered Channels}
+A buffered channel maintains an in-memory circular ring buffer of capacity $C$.
+\begin{itemize}[leftmargin=15pt]
+  \item Sends are asynchronous and non-blocking as long as buffer occupancy $< C$.
+  \item If the buffer is full ($= C$), the sender blocks until a receiver pops an item.
+  \item If the buffer is empty, receivers block until an item is pushed.
+\end{itemize}
+
+% ==========================================
+\section{The Actor Model: Isolated State and Supervision Trees}
+
+Introduced by Carl Hewitt, Peter Bishop, and Richard Steiger in 1973, and industrialized by Joe Armstrong in Erlang/OTP, the **Actor Model** treats the ``Actor'' as the universal primitive of concurrent computation.
+
+\subsection{Hewitt's Three Actor Axioms}
+
+An Actor is a computational entity that has a private, completely isolated state and a message mailbox. Upon receiving a message, an actor can concurrently perform exactly three operations:
+\begin{enumerate}[leftmargin=15pt]
+  \item **Create** a finite number of new actors.
+  \item **Send** a finite number of messages to other actors whose addresses it possesses.
+  \item **Designate** the behavior/state to be used for the next incoming message.
+\end{enumerate}
+
+\subsection{Zero Shared Memory and Asynchronous Mailboxes}
+
+Actors never share memory. All communication occurs via **asynchronous message passing**. When Actor A messages Actor B:
+\begin{enumerate}[leftmargin=15pt]
+  \item The message is serialized or cloned and appended to Actor B's FIFO **Mailbox**.
+  \item Actor A immediately continues executing without waiting for Actor B to process the message.
+  \item Actor B processes messages sequentially from its mailbox, eliminating internal race conditions.
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.9, transform shape,
+  node distance=0.8cm and 1.2cm,
+  actor/.style={rectangle, draw=headingblue, fill=codebg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily},
+  sup/.style={rectangle, draw=warningRed, fill=warningBg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily\bfseries},
+  line/.style={draw=headingblue, -{Stealth[length=2.5mm]}, thick}
+]
+  \node[sup] (sup) {\textbf{Root Supervisor}\\\small Strategy: \texttt{OneForOne}};
+  \node[actor, below=1.2cm of sup, xshift=-3.5cm] (w1) {\textbf{Worker Actor 1}\\\small Private State};
+  \node[actor, below=1.2cm of sup] (w2) {\textbf{Worker Actor 2}\\\small Crashes on Error!};
+  \node[actor, below=1.2cm of sup, xshift=3.5cm] (w3) {\textbf{Worker Actor 3}\\\small Private State};
+
+  \draw[line] (sup) -- node[left, font=\tiny\sffamily] {Monitors} (w1);
+  \draw[line, warningRed] (sup) -- node[right, font=\tiny\sffamily] {Restarts Fresh} (w2);
+  \draw[line] (sup) -- node[right, font=\tiny\sffamily] {Monitors} (w3);
+\end{tikzpicture}
+\caption{Actor supervision tree: Isolating failure domains and implementing ``let it crash''.}
+\label{fig:actor-tree}
+\end{figure}
+
+\subsection{Supervision Trees: The ``Let It Crash'' Philosophy}
+
+Traditional software development encourages defensive programming: wrapping every operation in deep \texttt{try-catch} blocks to prevent process crashes.
+
+The Actor Model adopts the opposite philosophy: **Let it crash**. 
+When an unexpected exception occurs (e.g., corrupt state, network failure), the actor terminates immediately. Its parent **Supervisor** intercepts the exit signal and enforces a deterministic recovery strategy:
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{OneForOne:} If a child actor crashes, the supervisor restarts only that specific crashed actor with clean initial state.
+  \item \textbf{OneForAll:} If any child actor crashes, the supervisor terminates and restarts all sibling actors managed under that tree.
+  \item \textbf{RestForOne:} If an actor crashes, any sibling actors created after it are terminated and restarted in chronological order.
+\end{itemize}
+
+% ==========================================
+\section{Modern Asynchronous PHP: Fibers and the Revolt Event Loop}
+
+With the release of PHP 8.1, the language introduced native **Fibers (RFC: Fibers)**, unlocking stackful, interruptible coroutines directly within the Zend Engine.
+
+\subsection{The Low-Level \texttt{Fiber} Primitive}
+
+A \texttt{Fiber} represents a distinct C execution stack. Unlike generators which are stackless (suspension is permitted only from the generator function itself), a Fiber can be suspended from **arbitrary nested depths of function calls**:
+
+\begin{lstlisting}[language=PHP,caption={Low-Level PHP 8.1 \texttt{Fiber} Execution}]
+<?php
+declare(strict_types=1);
+
+$fiber = new Fiber(function(string $name): void {
+    echo "Fiber {$name}: Started\n";
+    
+    // Suspend execution and yield control back to caller
+    $received = Fiber::suspend("Message from Fiber");
+    
+    echo "Fiber {$name}: Resumed with '{$received}'\n";
+});
+
+// Start the fiber
+$output = $fiber->start("Worker-A"); // Prints: Fiber Worker-A: Started
+echo "Caller: Received '{$output}'\n"; // Prints: Caller: Received 'Message from Fiber'
+
+// Resume the fiber
+$fiber->resume("Hello Fiber!"); // Prints: Fiber Worker-A: Resumed with 'Hello Fiber!'
+\end{lstlisting}
+
+\subsection{The Revolt Event Loop Standard}
+
+Historically, asynchronous PHP was fragmented between competing frameworks (Amp and ReactPHP). In 2022, both engineering teams joined forces to author **Revolt (\texttt{revolt/event-loop})**, establishing a unified, shared event loop kernel for the entire PHP ecosystem.
+
+\begin{lstlisting}[language=PHP,caption={Concurrent Non-Blocking HTTP with Revolt and Fibers}]
+<?php
+declare(strict_types=1);
+
+use Revolt\EventLoop;
+
+// Schedule a recurring timer (runs every 1 second)
+EventLoop::repeat(1.0, function (string $callbackId): void {
+    echo "Heartbeat tick at " . date('H:i:s') . "\n";
+});
+
+// Non-blocking socket listener
+$server = stream_socket_server("tcp://127.0.0.1:8080", $errno, $errstr);
+stream_set_blocking($server, false);
+
+EventLoop::onReadable($server, function (string $id, $server): void {
+    $conn = stream_socket_accept($server);
+    stream_set_blocking($conn, false);
+    
+    // Spawn an isolated Fiber per incoming connection!
+    \Fiber::suspend(); // Integrates seamlessly with Revolt driver
+});
+
+EventLoop::run();
+\end{lstlisting}
+
+\begin{intuitionbox}[Fibers Make Asynchronous Code Look Synchronous]
+In JavaScript or Python, writing asynchronous code requires poisoning function signatures with \texttt{async} and \texttt{await} throughout every layer of the call stack (the famous ``function color'' problem). 
+
+Because PHP Fibers are stackful, a deeply nested database driver can suspend a Fiber during socket reads without requiring callers to alter their signatures or return special Promise objects!
+\end{intuitionbox}
+
+% ==========================================
+\section{Chapter Summary \& Key Takeaways}
+
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{Preemptive vs Cooperative:} Preemptive scheduling is enforced by kernel timer interrupts, incurring register saves and TLB cache invalidation penalties. Cooperative multitasking yields voluntarily at known points, dropping context switch costs to nanoseconds.
+  \item \textbf{Stack Sizing Bottlenecks:} OS threads allocate 2MB--8MB virtual stacks, capping concurrent threads at thousands before memory exhaustion. Green threads/fibers allocate 2KB dynamic heap stacks, scaling to millions of concurrent units.
+  \item \textbf{CSP Calculus:} Replaces shared memory locks with communication channels. Unbuffered channels enforce synchronous rendezvous hand-offs; buffered channels provide FIFO decoupling.
+  \item \textbf{Actor Model Axioms:} Actors hold completely private state and communicate exclusively via asynchronous mailboxes. Supervision trees isolate failure domains using ``let it crash'' strategies.
+  \item \textbf{PHP 8.1+ Fibers:} Provides native stackful asymmetric coroutines in C. When orchestrated by the Revolt event loop standard, PHP executes high-throughput concurrent I/O without native C extensions.
+\end{itemize}
+
+% ==========================================
+\section{Exercises and Real-World Scenarios}
+
+\subsection{Mechanics Exercises}
+\begin{enumerate}
+  \item \textbf{Exercise 5.1:} Calculate the maximum theoretical number of concurrent OS threads a Linux 64-bit server with 32GB of physical RAM can sustain if each thread stack is configured to 4MB, assuming 25\% of RAM is reserved for the operating system kernel and page cache. Compare this with userland fibers with a 4KB initial stack.
+  \item \textbf{Exercise 5.2:} Trace the execution sequence of an unbuffered CSP channel when a sender attempts to write to a channel where no receiver has arrived yet.
+\end{enumerate}
+
+\subsection{Debugging Exercises}
+\begin{enumerate}
+  \item \textbf{Exercise 5.3:} A developer attempts to optimize a high-frequency trading calculation across multiple CPU cores in Python using the following snippet:
+\begin{lstlisting}[language=Python]
+import threading
+
+def compute_heavy_math(data):
+    # Pure CPU math operations
+    return [x ** 2 for x in data]
+
+threads = [threading.Thread(target=compute_heavy_math, args=(chunk,)) for chunk in chunks]
+for t in threads: t.start()
+for t in threads: t.join()
+\end{lstlisting}
+Benchmarking demonstrates that running with 8 threads is 40\% slower than running sequentially on a single thread. Explain the exact architectural root cause and provide the production fix.
+\end{enumerate}
+
+\subsection{Architecture Design Problem}
+\begin{enumerate}
+  \item \textbf{Exercise 5.4:} Design an IoT telemetry aggregation gateway in modern PHP using Revolt and Fibers. The system must maintain 20,000 concurrent persistent TCP socket connections, read inbound JSON metrics without blocking, batch metrics into 1,000-record chunks, and flush them to a PostgreSQL database every 500 milliseconds.
+\end{enumerate}
+
+% ==========================================
+\section{Detailed Solutions}
+
+\subsection{Solution 5.1: Thread Memory Capacity Calculation}
+\begin{enumerate}[leftmargin=15pt]
+  \item Available RAM for application: $32\text{ GB} \times 0.75 = 24\text{ GB} = 24,576\text{ MB}$.
+  \item \textbf{OS Kernel Threads (4MB stack):}
+  $$\text{Max Threads} = \frac{24,576\text{ MB}}{4\text{ MB}} = \mathbf{6,144\text{ threads}}$$
+  Attempting to spawn more than 6,144 threads will trigger \texttt{OutOfMemoryError} or crash the kernel.
+  \item \textbf{Lightweight Fibers (4KB stack):}
+  $$\text{Max Fibers} = \frac{24,576 \times 1,024\text{ KB}}{4\text{ KB}} = \mathbf{6,291,456\text{ fibers}}$$
+  Lightweight fibers accommodate over 6.2 million concurrent execution units!
+\end{enumerate}
+
+\subsection{Solution 5.2: Unbuffered Channel Execution Trace}
+\begin{enumerate}[leftmargin=15pt]
+  \item Sender process executes \texttt{ch <- value}.
+  \item The runtime inspects channel state; finds the receive queue empty.
+  \item The sender copies its payload pointer into the channel struct's \texttt{elem} buffer.
+  \item The runtime enqueues the sender's \texttt{sudog} execution descriptor into the channel's \texttt{sendq} wait list.
+  \item The sender yields its execution stack and is put into \texttt{Gwaiting} state.
+  \item When a receiver arrives: it dequeues the sender from \texttt{sendq}, copies data directly from the sender's stack to receiver's memory, transitions sender to \texttt{Grunnable}, and both continue.
+\end{enumerate}
+
+\subsection{Solution 5.3: Debugging Multi-Threaded Python Saturation}
+\textbf{Diagnosis:} Python's **Global Interpreter Lock (GIL)** permits only one native thread to execute Python bytecode at any instant. Because \texttt{compute\_heavy\_math} is purely CPU-bound (no I/O), the 8 OS threads constantly contend for the single GIL mutex, generating heavy thread preemption interrupts, cache line thrashing, and OS scheduler context switch overhead every 5 milliseconds.
+
+\textbf{Correction:} Use multi-processing to bypass the GIL and utilize all 8 physical CPU cores:
+\begin{lstlisting}[language=Python]
+from concurrent.futures import ProcessPoolExecutor
+
+with ProcessPoolExecutor(max_workers=8) as executor:
+    results = list(executor.map(compute_heavy_math, chunks))
+\end{lstlisting}
+
+\subsection{Solution 5.4: High-Scale IoT Telemetry Gateway}
+See Section 5.5 for the core Revolt socket architecture. The gateway maintains a persistent array of active socket streams registered via \texttt{EventLoop::onReadable}. Received payloads append to an in-memory batch buffer; an \texttt{EventLoop::repeat(0.5, ...)} callback flushes chunks exceeding 1,000 records to PostgreSQL in a single multi-row \texttt{INSERT} statement.
+
+% ==========================================
+\section{Further Reading \& Citations}
+
+\begin{itemize}[leftmargin=15pt]
+  \item Hoare, C. A. R. (1978). \textit{Communicating Sequential Processes}. Communications of the ACM, 21(8), 666--677.
+  \item Hewitt, C., Bishop, P., \& Steiger, R. (1973). \textit{A Universal Modular ACTOR Formalism for Artificial Intelligence}. IJCAI.
+  \item Armstrong, J. (2007). \textit{Programming Erlang: Software for a Concurrent World}. Pragmatic Bookshelf.
+  \item Revolt PHP Core Team. (2022). \textit{Revolt: The Event Loop for Modern PHP}. \url{https://revolt.run/}
+\end{itemize}

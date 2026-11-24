@@ -1,0 +1,406 @@
+\chapter{Testing, Verification, and Production Reliability Engineering}
+\label{chap:testing-reliability}
+
+\begin{chaptergoalsbox}
+\textbf{What You Will Learn:}
+\begin{itemize}[leftmargin=12pt,itemsep=2pt]
+  \item The Testing Pyramid economics: Unit, Integration, and End-to-End (E2E) confidence vs. latency trade-offs.
+  \item Test double taxonomy (Meszaros): Dummies, Stubs, Spies, Mocks, and Fakes, paired with property-based fuzzing.
+  \item Mutation testing: Why 100\% code coverage is a vanity metric, and how AST mutators (Infection, Mutmut) quantify test assertion strength via Mutation Score Indicators (MSI).
+  \item Ephemeral infrastructure testing with Testcontainers: Orchestrating real PostgreSQL and Redis Docker containers in CI pipelines.
+  \item Distributed resilience patterns: Circuit Breaker finite state machines (Closed, Open, Half-Open) and cascading failure prevention.
+  \item High-throughput distributed rate limiting: Token Bucket, Leaky Bucket, and race-free atomic Redis Lua script implementations.
+\end{itemize}
+
+\textbf{What You Should Already Understand:}
+\begin{itemize}[leftmargin=12pt,itemsep=2pt]
+  \item Basic automated testing frameworks (PHPUnit, pytest).
+  \item Containerization concepts (Docker containers, networking, and ports).
+\end{itemize}
+
+\textbf{Why This Topic Exists:}
+In distributed systems, code that is not rigorously verified will fail in production in unpredictable, catastrophic ways. High code coverage metrics often create a dangerous false sense of security while hiding complete absences of functional assertions. Furthermore, backend services must be architected for resilience against the inevitable failure of downstream databases, third-party APIs, and network fabrics.
+
+\textbf{Motivating Practical Problem:}
+A high-volume fintech billing microservice reports 98\% line test coverage in CI. However, during a database failover event, downstream network timeouts cause threads to pile up, exhausting the connection pool and triggering a cascading collapse across 14 upstream services. Simultaneously, an external payment gateway begins intermittently returning 500 errors, causing the billing service to endlessly retry in tight loops, accidentally double-charging 4,200 customers. Hardening this platform requires mutation testing, containerized integration suites, automated circuit breaking, and atomic distributed rate limiting.
+\end{chaptergoalsbox}
+
+\section{The Testing Pyramid and Test Double Taxonomy}
+
+Software verification is governed by economic trade-offs between execution speed, financial cost, determinism, and production fidelity.
+
+\subsection{The Testing Pyramid vs. The Ice Cream Cone Anti-Pattern}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.9, transform shape,
+  node distance=0.2cm,
+  lvl/.style={trapezium, trapezium left angle=60, trapezium right angle=120, draw=headingblue, thick, align=center, font=\small\sffamily}
+]
+  \node[lvl, minimum width=3.0cm, fill=warningBg] (e2e) {\textbf{End-to-End (E2E) Tests}\\\footnotesize Slow (Minutes) $\cdot$ Flaky $\cdot$ High Cost $\cdot$ Highest Scope};
+  \node[lvl, minimum width=6.0cm, fill=intuitionBg, below=of e2e] (int) {\textbf{Integration Tests (Testcontainers)}\\\footnotesize Medium Speed (Seconds) $\cdot$ Real DB/Redis $\cdot$ High Fidelity};
+  \node[lvl, minimum width=9.0cm, fill=codebg, below=of int] (unit) {\textbf{Unit Tests (Domain Logic \& Pure Functions)}\\\footnotesize Ultra-Fast (Milliseconds) $\cdot$ Deterministic $\cdot$ Zero I/O $\cdot$ High Volume};
+
+  \node[draw=none, left=1.2cm of e2e, font=\scriptsize\sffamily, align=right] {High Cost\\High Latency};
+  \node[draw=none, left=1.2cm of unit, font=\scriptsize\sffamily, align=right] {Low Cost\\Sub-Second};
+  \draw[-{Stealth[length=2.5mm]}, thick, gray] (-4.5, -2.5) -- (-4.5, 0.2);
+\end{tikzpicture}
+\caption{The classic Testing Pyramid: balancing test volume against execution economics.}
+\label{fig:testing-pyramid}
+\end{figure}
+
+The **Testing Pyramid** mandates that the vast majority of tests reside at the base (fast, in-memory unit tests), with a moderate layer of integration tests verifying persistence and boundaries, topped by a thin suite of end-to-end tests.
+
+\textbf{The Inverted Pyramid (Ice Cream Cone Anti-Pattern):} Teams that neglect unit testing and rely primarily on Selenium/Playwright browser tests suffer from slow CI pipelines (taking hours to complete), high flakiness from network transients, and skyrocketing cloud runner costs.
+
+\subsection{Gerard Meszaros Test Double Taxonomy}
+
+Engineers often loosely use the word ``mock'' to describe any fake object. Gerard Meszaros formalized five distinct **Test Doubles**:
+
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Dummy:} Passed to satisfy parameter signatures, but never actually read or invoked (e.g., passing \texttt{new DummyLogger()} to a constructor).
+  \item \textbf{Stub:} Provides canned, pre-programmed answers to method calls during the test, with no verification of how many times it was called.
+  \item \textbf{Spy:} Wraps a real object or stub to record runtime metrics: which methods were called, how many times, and with what exact arguments.
+  \item \textbf{Mock:} Pre-programmed with expected method calls and parameters before execution. If an expected call is omitted or invoked with incorrect arguments, the test fails automatically upon verification.
+  \item \textbf{Fake:} Possesses a working business implementation, but takes shortcuts that make it unsuitable for production (e.g., an in-memory \texttt{InMemoryUserRepository} backed by an associative array rather than PostgreSQL).
+\end{enumerate}
+
+\begin{intuitionbox}[Don't Mock What You Don't Own]
+Never mock third-party libraries (such as Stripe SDKs or database connections) in unit tests. When third-party APIs change, mocks continue to pass silently while production breaks! Instead, wrap external dependencies inside your own domain interface, mock that interface, and use real integration tests to verify the adapter against actual external services.
+\end{intuitionbox}
+
+% ==========================================
+\section{Mutation Testing: Evaluating Test Suite Integrity}
+
+Code coverage (line, branch, or statement) measures **what code was executed**, not **whether the tests made meaningful assertions**. A test suite can achieve 100\% code coverage with zero assertions!
+
+\subsection{Mutation Testing Mechanics}
+
+**Mutation Testing** (implemented via **Infection** for PHP and **Mutmut** for Python) tests the quality of your test suite by deliberately injecting bugs (mutants) into the Abstract Syntax Tree of production code and running the test suite against each mutation:
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.9, transform shape,
+  node distance=0.8cm and 1.2cm,
+  box/.style={rectangle, draw=headingblue, fill=codebg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily},
+  accent/.style={rectangle, draw=warningRed, fill=warningBg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily\bfseries},
+  pass/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily\bfseries},
+  line/.style={draw=headingblue, -{Stealth[length=2.5mm]}, thick}
+]
+  \node[box] (src) {\textbf{Production AST}\\\small \texttt{if (\$balance >= \$amount)}};
+  \node[accent, right=of src] (mut) {\textbf{Synthesize Mutant}\\\small Mutates operator: \texttt{if (\$balance > \$amount)}};
+  \node[box, below=1.0cm of mut] (run) {\textbf{Execute Test Suite}\\\small Run tests against mutated code};
+  
+  \node[pass, left=1.5cm of run] (killed) {\textbf{Mutant KILLED (Success)}\\\small Test failed as expected};
+  \node[accent, right=1.5cm of run] (escaped) {\textbf{Mutant ESCAPED (Failure)}\\\small Tests still passed! Missing assertion};
+
+  \draw[line] (src) -- (mut);
+  \draw[line] (mut) -- (run);
+  \draw[line, intuitionTeal] (run) -- node[above, font=\tiny\sffamily] {Test Fails} (killed);
+  \draw[line, warningRed] (run) -- node[above, font=\tiny\sffamily] {Test Passes} (escaped);
+\end{tikzpicture}
+\caption{The mutation testing lifecycle: verifying assertion strength through synthetic AST bugs.}
+\label{fig:mutation-testing}
+\end{figure}
+
+\subsubsection{Common Mutation Operators}
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{Conditional Boundary:} Mutates \texttt{>} to \texttt{>=}, or \texttt{<} to \texttt{<=}.
+  \item \textbf{Boolean Inversion:} Inverts \texttt{true} to \texttt{false}, or \texttt{\&\&} to \texttt{||}.
+  \item \textbf{Arithmetic Mutation:} Swaps \texttt{+} for \texttt{-}, or \texttt{*} for \texttt{/}.
+  \item \textbf{Return Value Removal:} Replaces return value with \texttt{null} or empty array.
+\end{itemize}
+
+\subsection{The Mutation Score Indicator (MSI)}
+
+The quality of the test suite is quantified via the **Mutation Score Indicator (MSI)**:
+$$\text{MSI} = \frac{\text{Total Killed Mutants} + \text{Timed Out Mutants}}{\text{Total Mutants}} \times 100\%$$
+
+If a mutant escapes (the tests still pass despite the broken logic), it reveals a gaping blind spot: **you lack an assertion verifying that specific boundary condition**.
+
+% ==========================================
+\section{Ephemeral Integration Testing with Testcontainers}
+
+For decades, developers tested database queries using in-memory SQLite instances. However, SQLite lacks PostgreSQL JSONB operators, CTEs, full-text search, and specific row-locking semantics (\texttt{SKIP LOCKED}). Code that passed against SQLite failed upon production deployment.
+
+**Testcontainers** provides programmable, lightweight Docker container orchestration directly within test execution lifecycles.
+
+\subsection{Architecture and the Ryuk Resource Reaper}
+
+When a test suite boots:
+\begin{enumerate}[leftmargin=15pt]
+  \item The Testcontainers client connects to the local Docker socket via the Docker API.
+  \item It spawns a specialized helper container called **Ryuk**. Ryuk attaches to the test runner process. Even if the test runner crashes or is killed with \texttt{SIGKILL}, Ryuk automatically reclaims and terminates all orphaned containers, volumes, and networks.
+  \item Real PostgreSQL and Redis containers are spun up with dynamic, unallocated host ports, eliminating port-conflict collisions during parallel CI builds.
+\end{enumerate}
+
+\begin{lstlisting}[language=Python,caption={Deterministic Testcontainers Integration Test in Pytest}]
+import pytest
+from testcontainers.postgres import PostgresContainer
+import asyncpg
+
+@pytest.fixture(scope="session")
+def postgres_container():
+    # Spawns real, isolated PostgreSQL 16 container
+    with PostgresContainer("postgres:16-alpine") as postgres:
+        yield postgres
+
+@pytest.mark.asyncio
+async def test_inventory_atomic_reservation(postgres_container):
+    # Connect directly to dynamically assigned container port
+    conn = await asyncpg.connect(postgres_container.get_connection_url())
+    
+    # Run migrations
+    await conn.execute("""
+        CREATE TABLE inventory (sku TEXT PRIMARY KEY, available INT);
+        INSERT INTO inventory VALUES ('PHONE-123', 5);
+    """)
+
+    # Verify atomic update
+    status = await conn.execute("UPDATE inventory SET available = available - 1 WHERE sku = 'PHONE-123'")
+    assert status == "UPDATE 1"
+    
+    val = await conn.fetchval("SELECT available FROM inventory WHERE sku = 'PHONE-123'")
+    assert val == 4
+    await conn.close()
+\end{lstlisting}
+
+% ==========================================
+\section{Resilience Patterns: Circuit Breakers and Cascading Failure Defense}
+
+In distributed microservice architectures, when a downstream service becomes slow or unresponsive, upstream callers continue sending requests. Incoming threads block waiting for socket timeouts, consuming thread pool slots and memory, until the upstream service also crashes. This cascading collapse can bring down an entire enterprise infrastructure within seconds.
+
+The **Circuit Breaker** pattern (standardized by Michael Nygard and popularized by Netflix Hystrix) isolates failing downstream dependencies.
+
+\subsection{The Circuit Breaker Finite State Machine}
+
+A circuit breaker operates as a deterministic three-state state machine:
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.9, transform shape,
+  node distance=1.2cm and 2.0cm,
+  state/.style={circle, draw=headingblue, thick, minimum size=2.2cm, align=center, font=\small\sffamily\bfseries},
+  line/.style={draw=headingblue, -{Stealth[length=2.5mm]}, thick}
+]
+  \node[state, fill=intuitionBg] (closed) {CLOSED\\\footnotesize Normal Flow};
+  \node[state, fill=warningBg, right=of closed] (open) {OPEN\\\footnotesize Fast Fail};
+  \node[state, fill=exampleBg, below=1.5cm of closed, xshift=2.5cm] (half) {HALF-OPEN\\\footnotesize Trial Probe};
+
+  \draw[line, warningRed] (closed) -- node[above, font=\scriptsize\sffamily] {Failure Threshold Exceeded} (open);
+  \draw[line] (open) |- node[right, font=\scriptsize\sffamily] {Sleep Window Elapsed} (half);
+  \draw[line, intuitionTeal] (half) -| node[left, font=\scriptsize\sffamily] {Trial Calls Succeed} (closed);
+  \draw[line, warningRed] (half) -| node[right, font=\scriptsize\sffamily] {Trial Call Fails} (open);
+\end{tikzpicture}
+\caption{The Circuit Breaker Finite State Machine.}
+\label{fig:circuit-breaker}
+\end{figure}
+
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Closed (Normal Operation):} All requests flow freely to the downstream service. The breaker maintains a rolling window of recent execution outcomes (successes, failures, timeouts).
+  \item \textbf{Open (Tripped State):} If the failure rate exceeds a configured threshold (e.g., $> 50\%$ failures over the last 20 requests), the circuit trips to **Open**. All subsequent requests **fail immediately without touching the network** (fast-fail), returning a fallback response or error. The downstream dependency is granted a quiet window to recover.
+  \item \textbf{Half-Open (Trial Probe):} After a configured sleep duration (e.g., 30 seconds), the circuit transitions to **Half-Open**. It permits a limited number of trial requests (e.g., 3 requests) to pass through:
+  \begin{itemize}
+    \item If all trial requests succeed: The downstream service is healthy. The circuit transitions back to **Closed**.
+    \item If any trial request fails: The service is still unhealthy. The circuit resets back to **Open** for another sleep window.
+  \end{itemize}
+\end{enumerate}
+
+% ==========================================
+\section{Distributed Rate Limiting Algorithms}
+
+Rate limiting protects backend systems from Denial of Service (DoS) attacks, brute-force credential stuffing, and abusive web scrapers.
+
+\subsection{Algorithmic Comparison: Token Bucket, Leaky Bucket, and Sliding Window}
+
+\begin{table}[htbp]
+\centering
+\small\sffamily
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Algorithm} & \textbf{Burst Handling} & \textbf{Memory Usage} & \textbf{Core Trade-Off} \\ \midrule
+\textbf{Token Bucket} & Accommodates burst up to $B$ & Minimal ($O(1)$) & Ideal for standard REST APIs \\
+\textbf{Leaky Bucket} & Smooths traffic; zero bursts & Constant ($O(1)$) & Ideal for data packet traffic shaping \\
+\textbf{Sliding Window Log} & Absolute precision & Expensive ($O(N)$) & Unbounded Redis memory under load \\
+\textbf{Sliding Window Counter} & Approximates sliding window & Minimal ($O(1)$) & Low memory, slight statistical error ($\approx 2\%$) \\ \bottomrule
+\end{tabular}
+\caption{Comparison of distributed rate limiting algorithms.}
+\label{tab:rate-limiters}
+\end{table}
+
+\subsection{The Token Bucket Algorithm Mechanics}
+
+The **Token Bucket** algorithm maintains a bucket with two parameters:
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{Capacity ($B$):} Maximum number of tokens the bucket can hold (maximum instantaneous burst size).
+  \item \textbf{Refill Rate ($r$):} Number of tokens added to the bucket per second.
+\end{itemize}
+
+When a request arrives, the algorithm calculates how many tokens accumulated since the last request timestamp, caps the value at capacity $B$, and decrements 1 token if available:
+$$\text{Tokens}_{\text{current}} = \min(B, \; \text{Tokens}_{\text{last}} + (t_{\text{now}} - t_{\text{last}}) \times r)$$
+
+\subsection{Atomic Distributed Token Bucket in Redis with Lua}
+
+In a multi-server cluster, multiple application instances access Redis concurrently. Calculating tokens in application memory and updating Redis introduces a **race condition** (Time-of-Check to Time-of-Use). 
+
+To ensure strictly atomic execution in a single network roundtrip, the logic must execute inside a **Redis Lua script**:
+
+\begin{lstlisting}[language=sh,caption={Atomic Token Bucket Implementation in Redis Lua}]
+-- KEYS[1]: Rate limit key (e.g., "ratelimit:ip:192.168.1.1")
+-- ARGV[1]: Bucket capacity (B)
+-- ARGV[2]: Refill rate per millisecond (r)
+-- ARGV[3]: Current timestamp in milliseconds (t_now)
+-- ARGV[4]: Requested tokens (cost, usually 1)
+
+local key = KEYS[1]
+local capacity = tonumber(ARGV[1])
+local refill_rate = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+local cost = tonumber(ARGV[4])
+
+-- Fetch current state from Redis Hash
+local data = redis.call("HMGET", key, "tokens", "last_updated")
+local tokens = tonumber(data[1])
+local last_updated = tonumber(data[2])
+
+if tokens == nil then
+    -- Bucket does not exist yet; initialize to full capacity
+    tokens = capacity
+    last_updated = now
+else
+    -- Compute delta time and refill tokens
+    local delta = math.max(0, now - last_updated)
+    tokens = math.min(capacity, tokens + (delta * refill_rate))
+    last_updated = now
+end
+
+-- Check if sufficient tokens exist
+if tokens >= cost then
+    tokens = tokens - cost
+    redis.call("HMSET", key, "tokens", tokens, "last_updated", last_updated)
+    -- Expire bucket after it would naturally be 100% full to prevent memory leaks
+    local ttl = math.ceil(capacity / (refill_rate * 1000)) + 60
+    redis.call("EXPIRE", key, ttl)
+    return 1 -- Request Allowed!
+else
+    -- Insufficient tokens; update timestamp and deny
+    redis.call("HSET", key, "last_updated", last_updated)
+    return 0 -- Request Denied (HTTP 429 Too Many Requests)!
+end
+\end{lstlisting}
+
+\begin{underthehoodbox}[Why Redis Lua Scripts Guarantee Atomicity]
+Redis is single-threaded in its command execution engine. While a Lua script executes via \texttt{EVALSHA}, Redis halts all other command processing on that database instance. The check-and-decrement sequence executes with absolute atomicity—zero possibility of concurrent race conditions, and zero distributed lock contention!
+\end{underthehoodbox}
+
+% ==========================================
+\section{Chapter Summary \& Key Takeaways}
+
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{Testing Pyramid Economics:} Prioritize thousands of fast, deterministic in-memory unit tests; validate real persistence via Testcontainers; restrict flaky E2E tests to critical business flows.
+  \item \textbf{Test Doubles:} Differentiate Stubs (canned return values) from Mocks (pre-programmed expectations) and Fakes (simplified in-memory implementations). Avoid mocking unowned external libraries.
+  \item \textbf{Mutation Testing Rigor:} High line coverage is meaningless without assertion verification. Mutation frameworks (Infection, Mutmut) synthesize AST mutations to calculate the true Mutation Score Indicator (MSI).
+  \item \textbf{Testcontainers Fidelity:} Replace brittle SQLite mocks with real PostgreSQL/Redis containers orchestrated by the Ryuk resource reaper, eliminating environment desynchronization.
+  \item \textbf{Circuit Breakers:} Prevent cascading microservice failures by fast-failing traffic during downstream outages across Closed, Open, and Half-Open states.
+  \item \textbf{Atomic Rate Limiting:} Implement Token Bucket rate limiters using atomic Redis Lua scripts to prevent concurrent TOCTOU race conditions across distributed server clusters.
+\end{itemize}
+
+% ==========================================
+\section{Exercises and Real-World Scenarios}
+
+\subsection{Mechanics Exercises}
+\begin{enumerate}
+  \item \textbf{Exercise 7.1:} A Token Bucket rate limiter has a capacity of $B = 100$ tokens and a refill rate of $r = 10$ tokens per second. The bucket is currently empty at timestamp $t = 0$. 
+  \begin{itemize}
+    \item At $t = 5\text{ seconds}$, a burst of 60 requests arrives simultaneously. How many requests are allowed, and how many tokens remain?
+    \item At $t = 8\text{ seconds}$, another burst of 40 requests arrives. How many requests are allowed, and how many are rejected with HTTP 429?
+  \end{itemize}
+  \item \textbf{Exercise 7.2:} Identify three distinct mutation operators applied by Infection/Mutmut and describe an exact unit test assertion that would kill each mutant.
+\end{enumerate}
+
+\subsection{Debugging Exercises}
+\begin{enumerate}
+  \item \textbf{Exercise 7.3:} A development team implements a distributed rate limiter in Python by fetching the current count from Redis, incrementing it in Python, and writing it back:
+\begin{lstlisting}[language=Python]
+current_count = int(redis_client.get(user_key) or 0)
+if current_count < 100:
+    redis_client.set(user_key, current_count + 1, ex=60)
+    return True
+return False
+\end{lstlisting}
+Under high concurrency (1,000 requests per second from the same user), the rate limiter consistently allows over 600 requests to slip through. Explain the exact concurrency failure and provide the corrected atomic single-command fix.
+\end{enumerate}
+
+\subsection{Architecture Design Problem}
+\begin{enumerate}
+  \item \textbf{Exercise 7.4:} Architect a resilient payment processing client in modern backend code that integrates with an external, flaky payment gateway. The client must implement a 3-state Circuit Breaker, automatic retries with exponential backoff and jitter for transient 503 errors, and an atomic distributed rate limiter restricting requests to 500 requests per minute per merchant account.
+\end{enumerate}
+
+% ==========================================
+\section{Detailed Solutions}
+
+\subsection{Solution 7.1: Token Bucket Math Calculations}
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{At $t = 5\text{ seconds}$:}
+  \begin{itemize}
+    \item Tokens accumulated: $\min(100, 0 + (5 \times 10)) = 50\text{ tokens}$.
+    \item A burst of 60 requests arrives: **50 requests are allowed**, 10 requests are rejected with HTTP 429.
+    \item Remaining tokens: $50 - 50 = \mathbf{0\text{ tokens}}$.
+  \end{itemize}
+  \item \textbf{At $t = 8\text{ seconds}$:}
+  \begin{itemize}
+    \item Elapsed time: $8 - 5 = 3\text{ seconds}$.
+    \item Tokens accumulated: $\min(100, 0 + (3 \times 10)) = 30\text{ tokens}$.
+    \item A burst of 40 requests arrives: **30 requests are allowed**, 10 requests are rejected with HTTP 429.
+    \item Remaining tokens: $30 - 30 = \mathbf{0\text{ tokens}}$.
+  \end{itemize}
+\end{enumerate}
+
+\subsection{Solution 7.2: Mutation Operators and Killing Assertions}
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Conditional Boundary Mutator (\texttt{>=} to \texttt{>}):}
+  \begin{itemize}
+    \item Code: \texttt{if (\$age >= 18) return true; return false;}
+    \item Mutant: \texttt{if (\$age > 18) return true; return false;}
+    \item Killing Assertion: Test with boundary input: \texttt{assertIsTrue(isAdult(18))}. The mutant returns \texttt{false}, causing the test to fail and killing the mutant.
+  \end{itemize}
+  \item \textbf{Return Value Mutator:}
+  \begin{itemize}
+    \item Code: \texttt{return \$items;} $\rightarrow$ Mutant: \texttt{return [];}
+    \item Killing Assertion: Assert that the returned array contains expected elements and correct length: \texttt{assertCount(3, \$items)}.
+  \end{itemize}
+  \item \textbf{Logical Mutator (\texttt{\&\&} to \texttt{||}):}
+  \begin{itemize}
+    \item Code: \texttt{if (\$hasToken \&\& \$isNotExpired)}
+    \item Mutant: \texttt{if (\$hasToken || \$isNotExpired)}
+    \item Killing Assertion: Provide a test case where \texttt{\$hasToken = false} and \texttt{\$isNotExpired = true}. The original returns false; the mutant evaluates true.
+  \end{itemize}
+\end{enumerate}
+
+\subsection{Solution 7.3: Debugging Rate Limiter Race Condition}
+\textbf{Diagnosis:} The snippet suffers from a classic **Time-of-Check to Time-of-Use (TOCTOU)** race condition. When 1,000 requests arrive concurrently, hundreds of application threads execute \texttt{redis\_client.get(user\_key)} simultaneously, reading the identical count value (e.g., 0). All hundreds pass the condition \texttt{current\_count < 100} and write back 1, completely bypassing the limit!
+
+\textbf{Correction:} Use Redis's atomic single-step \texttt{INCR} primitive:
+\begin{lstlisting}[language=Python]
+# Atomic single-command increment in Redis
+count = redis_client.incr(user_key)
+if count == 1:
+    redis_client.expire(user_key, 60)
+return count <= 100
+\end{lstlisting}
+
+\subsection{Solution 7.4: Resilient Payment Client Architecture}
+See Section 7.4 and Section 7.5 for the combined Circuit Breaker and Token Bucket architectures. The client wraps outbound calls inside a state machine that monitors rolling error rates, evaluates local Redis rate limits via Lua scripts before opening sockets, and employs jittered backoff on network failures.
+
+% ==========================================
+\section{Further Reading \& Citations}
+
+\begin{itemize}[leftmargin=15pt]
+  \item Meszaros, G. (2007). \textit{xUnit Test Patterns: Refactoring Test Code}. Addison-Wesley.
+  \item Nygard, M. T. (2018). \textit{Release It!: Design and Deploy Production-Ready Software} (2nd ed.). Pragmatic Bookshelf.
+  \item Infection PHP Core Team. (2023). \textit{Infection: Mutation Testing Framework for PHP}. \url{https://infection.github.io/}
+  \item Testcontainers Community. (2024). \textit{Testcontainers: Atomic, Throwaway Instances of Databases and Message Brokers}. \url{https://testcontainers.com/}
+\end{itemize}

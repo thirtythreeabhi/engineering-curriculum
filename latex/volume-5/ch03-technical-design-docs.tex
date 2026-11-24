@@ -1,0 +1,302 @@
+\chapter{Technical Design Documents}
+\label{ch:technical-design-docs}
+
+\begin{chaptergoalsbox}
+\textbf{What You Will Learn:}
+\begin{itemize}[leftmargin=12pt]
+  \item Master the standard engineering Request for Comments (RFC) and Technical Design Document (TDD) structure utilized at Google, Uber, Amazon, and Stripe.
+  \item Formulate crisp, measurable Goals and establish ruthless Non-Goals to prevent scope creep and align cross-functional stakeholder expectations.
+  \item Author formal architecture specifications, data schemas (Protobuf/JSON Schema), and state machine invariants.
+  \item Engineer comprehensive migration strategies: zero-downtime cutovers, dual-writing verification pipelines, shadow traffic replay, and irreversible rollback mitigations.
+  \item Construct an Operational Readiness Review (ORR), complete with Failure Mode and Effects Analysis (FMEA), alerting topologies, and runbooks.
+\end{itemize}
+
+\textbf{What You Should Already Understand:}
+\begin{itemize}[leftmargin=12pt]
+  \item Production software lifecycles: code review, automated CI/CD pipelines, canary deployments.
+  \item Basic database migration challenges: schema alterations on tables with billions of rows, index locks.
+  \item Core observability principles: metrics, distributed traces, and log aggregation.
+\end{itemize}
+
+\textbf{Why This Topic Exists:}
+Writing production code is cheap compared to the cost of maintaining, refactoring, or abandoning the wrong architecture. In high-performing engineering organizations, senior and staff engineers spend more time writing and reviewing design documents than writing raw source code. Technical Design Documents force rigorous trade-off evaluation, surface hidden edge cases, and secure organizational consensus before capital and engineering quarters are invested.
+
+\textbf{Motivating Practical Problem:}
+A platform team spends six months building a real-time event streaming pipeline to replace batch invoicing. Two weeks before the planned launch, the security compliance team discovers the new system transfers unencrypted European PII across US cloud regions, violating GDPR. Concurrently, database administrators discover the pipeline requires 40,000 continuous write IOPS on an RDS PostgreSQL primary, which will exhaust IOPS credits in 45 minutes. The project is cancelled, wasting \$750,000 in engineering salaries.
+\end{chaptergoalsbox}
+
+\section{The Anatomy of a Production-Grade Technical Design Document}
+
+A Technical Design Document (TDD), often termed an Engineering RFC (Request for Comments), is an internal engineering proposal that articulates the motivation, architecture, trade-offs, and rollout strategy for a non-trivial software system.
+
+The industry-standard TDD adheres to a proven, battle-tested section hierarchy:
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lp{10.5cm}}
+\toprule
+\textbf{Section} & \textbf{Core Purpose \& Contents} \\
+\midrule
+\textbf{1. Metadata} & Title, Authors, Status (\textit{Draft, Under Review, Approved, Superseded}), Reviewers, Target Date. \\
+\textbf{2. Executive Summary} & High-level abstract (under 250 words) summarizing the problem, solution, and primary metrics. \\
+\textbf{3. Context \& Motivation} & Current architecture limitations, business justification, traffic growth forecasts, pain points. \\
+\textbf{4. Goals \& Non-Goals} & Explicit bulleted lists defining what the project \textit{will} and \textit{will not} accomplish. \\
+\textbf{5. Proposed Architecture} & High-level C4 diagrams, container topologies, data flow, and technology justifications. \\
+\textbf{6. Detailed Design} & API contracts (Protobuf/OpenAPI), database schemas, concurrency models, algorithm pseudocode. \\
+\textbf{7. Alternatives Considered} & 2--4 competing approaches evaluated against explicit criteria, explaining why they were rejected. \\
+\textbf{8. Cross-Cutting Concerns} & Security, authentication, multi-tenancy, GDPR/data privacy, compliance, and cloud costs. \\
+\textbf{9. Migration \& Rollout} & Dark launching, shadow traffic, dual-writing, canary thresholds, feature flags, backfills. \\
+\textbf{10. Operational Readiness} & FMEA table, capacity planning, SLO targets, alerts, runbooks, and disaster recovery. \\
+\bottomrule
+\end{tabular}
+\caption{The Standard Enterprise Technical Design Document Template}
+\label{tab:tdd-template}
+\end{table}
+
+\begin{intuitionbox}[Blueprinting a Skyscraper]
+No civil engineer pours concrete for a 50-story skyscraper based on casual hallway conversations. They produce detailed architectural blueprints, structural stress calculations, electrical schematics, and emergency evacuation plans. In software, code is the concrete; the TDD is the blueprint. Discovering a structural flaw on paper costs twenty minutes with an eraser; discovering it in production costs millions of dollars and weeks of emergency downtime.
+\end{intuitionbox}
+
+\section{Defining Crisp Goals and Ruthless Non-Goals}
+
+The most critical section of any TDD is \textbf{Goals and Non-Goals}. Projects fail far more often from unbounded scope than from flawed algorithms.
+
+\subsection{Structuring Architectural Goals}
+
+Effective goals are unambiguous, quantitative, and testable:
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Anti-Pattern}: \textit{``Make checkout faster and improve database scalability.''}
+  \item \textbf{Production Pattern}: \textit{``Reduce p99 checkout processing latency from 450ms to $<120$ms under a sustained load of 5,000 requests per second, maintaining zero lost orders.''}
+\end{itemize}
+
+Every goal must map directly to an architectural metric, a business outcome, or an operational SLA.
+
+\subsection{The Art of the Non-Goal}
+
+A \textbf{Non-Goal} is an explicit declaration of what the team intentionally chooses \textit{not} to do, even though it may appear related, desirable, or logical. Non-goals protect the team from scope creep, deflect distractions during design review, and establish clear project boundaries.
+
+\begin{lstlisting}[language=bash, caption={Sample Goals and Non-Goals from a Distributed Caching TDD}]
+Goals:
+1. Provide sub-5ms p99 cache reads for user profile data under 50,000 QPS.
+2. Ensure cache consistency with the PostgreSQL primary within 500ms using CDC (Debezium).
+3. Implement automatic failover across 3 AWS Availability Zones with zero data loss.
+
+Non-Goals:
+1. Supporting arbitrary SQL queries across cached data; key-value lookup only.
+2. Guaranteeing ACID transactional updates across multiple cache keys.
+3. Migrating historical user session state; existing sessions will naturally expire.
+4. Building a generic caching framework for other engineering teams (scoped exclusively to Identity).
+\end{lstlisting}
+
+\section{Detailed Design: Data Contracts and Schemas}
+
+A technical design document must never rely on informal English to describe APIs and data structures. It must provide formal, machine-readable interface definitions. In modern cloud-native architectures, Protocol Buffers (Protobuf) or OpenAPI 3.1 specifications serve as the authoritative contract.
+
+\begin{lstlisting}[language=C, caption={Production Protobuf Contract with Validation Rules}]
+syntax = "proto3";
+
+package payment.v1;
+
+option go_package = "github.com/org/payment/v1;paymentv1";
+
+service PaymentGatewayService {
+  // Authorizes and captures a multi-currency transaction idempotently
+  rpc Charge(ChargeRequest) returns (ChargeResponse);
+}
+
+message ChargeRequest {
+  // UUIDv4 idempotency key generated by client; prevents duplicate debits
+  string idempotency_key = 1;
+  
+  // High-precision monetary amount in minor units (e.g., cents: $10.50 -> 1050)
+  int64 amount_in_cents = 2;
+  
+  // ISO-4217 three-letter currency code (e.g., "USD", "EUR")
+  string currency = 3;
+  
+  string customer_id = 4;
+  string payment_method_token = 5;
+}
+
+message ChargeResponse {
+  string transaction_id = 1;
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_SUCCEEDED = 1;
+    STATUS_PENDING = 2;
+    STATUS_DECLINED = 3;
+  }
+  Status status = 2;
+  int64 settled_timestamp_epoch_ms = 3;
+}
+\end{lstlisting}
+
+\section{Migration, Backfills, and Zero-Downtime Rollouts}
+
+Replacing an active production system is akin to changing an aircraft engine mid-flight. A design document that specifies a target architecture without an exhaustive, phased migration plan is incomplete and un-approvable.
+
+\subsection{The Dual-Writing and Shadow Verification Pipeline}
+
+The industry gold standard for database or service replacement is the **Four-Phase Cutover**:
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1.2cm and 1.8cm,
+  phase/.style={rectangle, draw=headingblue!80, fill=headingblue!5, rounded corners=3pt, text width=11.5cm, minimum height=1.1cm, inner sep=6pt, font=\sffamily\small},
+  title/.style={font=\sffamily\bfseries\color{headingblue}}
+]
+
+\node[phase] (p1) {
+  \textbf{Phase 1: Shadow Dual-Write with Async Mirroring}\\
+  App writes to Old DB (Primary/Sync) and asynchronously writes to New DB via Outbox/Kafka. Existing reads remain 100\% on Old DB. Background reconciler backfills historical records.
+};
+
+\node[phase, below=0.5cm of p1] (p2) {
+  \textbf{Phase 2: Dark Read Verification (Shadowing)}\\
+  App writes to both databases. App reads from Old DB (returns to client) and asynchronously reads from New DB in background. A comparator diffs payloads; logs mismatches to metric dashboards.
+};
+
+\node[phase, below=0.5cm of p2] (p3) {
+  \textbf{Phase 3: Live Read Cutover via Canary Feature Flag}\\
+  Dynamic feature flag routes 1\% $\rightarrow$ 5\% $\rightarrow$ 25\% $\rightarrow$ 100\% of live customer reads to New DB. Writes still dual-write to Old DB to retain instantaneous rollback capability.
+};
+
+\node[phase, below=0.5cm of p3] (p4) {
+  \textbf{Phase 4: Deprecation and Teardown}\\
+  Verify 100\% read/write stability for 14 days. Sever dual-writing to Old DB. Archive Old DB snapshot to S3 Cold Glacier; tear down legacy infrastructure.
+};
+
+\draw[-{Stealth[scale=1.0]}, thick, color=headingblue!70] (p1) -- (p2);
+\draw[-{Stealth[scale=1.0]}, thick, color=headingblue!70] (p2) -- (p3);
+\draw[-{Stealth[scale=1.0]}, thick, color=headingblue!70] (p3) -- (p4);
+
+\end{tikzpicture}
+\caption{The Four-Phase Zero-Downtime Migration Pipeline}
+\label{fig:zero-downtime-migration}
+\end{figure}
+
+\begin{productionwarningbox}[Irreversible Schema Alterations without Rollback]
+Never execute destructive schema modifications (such as dropping columns, renaming fields, or modifying primary key constraints) in a single deployment. If a bug is discovered in the new binary, reverting the application code will immediately crash because the old code expects the dropped column. Always employ **Expand and Contract** (Parallel Run):
+\begin{enumerate}
+  \item \textbf{Expand}: Add new nullable column; write to both old and new.
+  \item \textbf{Backfill}: Populate historical rows in background.
+  \item \textbf{Switch}: Update application reads to use new column.
+  \item \textbf{Contract}: Deprecate and drop old column in a subsequent release weeks later.
+\end{enumerate}
+\end{productionwarningbox}
+
+\section{Operational Readiness and FMEA}
+
+A brilliant architecture that cannot be operated during a network partition is a failed design. The Operational Readiness section must include a **Failure Mode and Effects Analysis (FMEA)** table.
+
+\begin{table}[htbp]
+\centering\scriptsize
+\begin{tabular}{p{2.5cm}p{2.8cm}p{1.2cm}p{2.8cm}p{2.8cm}}
+\toprule
+\textbf{Failure Mode} & \textbf{System Effect} & \textbf{Severity} & \textbf{Mitigation Strategy} & \textbf{Detection / Alert} \\
+\midrule
+Primary PostgreSQL DB fails unannounced & Writes fail; API returns 500 errors & Critical & Multi-AZ Patroni automated failover; read replicas serve reads & PagerDuty alert: \texttt{PostgresPrimaryDown} within 15s \\
+Kafka message broker disk fills to 100\% & Producers block or drop events & High & Local disk outbox buffer; retention policy auto-purge; horizontal broker scale & Prometheus alert: \texttt{KafkaDiskSpace < 15\%} \\
+Downstream Tax API latency spikes to 10s & Thread pool exhaustion in checkout & Critical & Circuit breaker (Resilience4j) opens at 50\% failure; fallback to cached tax tables & Alert: \texttt{CircuitBreakerOpen: TaxClient} \\
+Redis cache cluster network partition & Cache miss storm floods primary DB & High & Connection pool bulkhead; cache lease pattern; database read replicas auto-scale & Alert: \texttt{DbConnectionPoolSaturation > 85\%} \\
+\bottomrule
+\end{tabular}
+\caption{Failure Mode and Effects Analysis (FMEA) Matrix}
+\label{tab:fmea-matrix}
+\end{table}
+
+\begin{underthehoodbox}[How Google and Uber Scale RFC Reviews]
+At Google, design docs are shared via Google Docs with commenting permissions granted across relevant engineering orgs. Critical designs undergo a formal architectural review board (often dubbed ``EngX'' or domain-specific review groups). Uber utilizes an internal web portal called \textit{RFC Engine}, where RFCs are submitted via Markdown in Git repositories. Automated linters verify that mandatory sections (Goals, Non-Goals, Rollout, FMEA) exist before engineers are tagged for peer review. RFCs require sign-off from domain Security, SRE, and Staff engineering leads before code merges.
+\end{underthehoodbox}
+
+\begin{commonmistakebox}[The Post-Hoc Rationalization TDD]
+A widespread anti-pattern in dysfunctional engineering teams is writing the Technical Design Document after 85\% of the software has already been coded. In this scenario, the TDD is not an instrument of architectural exploration or trade-off evaluation; it is merely an exercise in retrospective justification. If code has already been written, authors become defensive against constructive feedback, defeating the entire purpose of peer review.
+\end{commonmistakebox}
+
+\begin{realworldbox}[Production TDD Excerpt: Sharding a Core Billing Ledger]
+When Stripe scaled to hundreds of millions of daily API transactions, their primary billing database experienced extreme write lock contention. A staff engineering team authored an RFC proposing an account-based sharding strategy. The RFC evaluated three key options: (1) Range-based sharding, (2) Consistent hashing on \texttt{merchant\_id}, and (3) Virtual buckets with a central metadata routing service. The team selected virtual buckets (1,024 logical partitions mapped to 32 physical Aurora clusters). The TDD detailed a 14-month shadow verification pipeline where millions of transactions were verified down to the exact cent before a single merchant was migrated.
+\end{realworldbox}
+
+\begin{tryityourselfbox}[Exercise: Draft Goals and Non-Goals for an Image Resizer]
+Imagine you are the lead architect for an enterprise Media Processing Service that resizes user-uploaded avatars, banner photos, and product images. Draft an explicit Goals and Non-Goals section for the TDD. Include:
+\begin{enumerate}
+  \item Throughput and latency targets under peak load.
+  \item Supported input image formats (JPEG, PNG, WebP) and maximum file size constraints.
+  \item At least three explicit Non-Goals defining what the service will intentionally reject or omit.
+\end{enumerate}
+\end{tryityourselfbox}
+
+\section{Summary \& Key Takeaways}
+
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Preventing Waste}: The primary economic purpose of a Technical Design Document is catching architectural, security, and scalability flaws before writing expensive production code.
+  \item \textbf{Scope Defense}: Rigorous Goals and ruthless Non-Goals prevent project creep and focus engineering energy on high-leverage deliverables.
+  \item \textbf{Unambiguous Contracts}: Specify APIs and database schemas using formal definition languages (Protobuf, OpenAPI, SQL DDL) rather than vague prose.
+  \item \textbf{Zero-Downtime Rollout}: Every major architectural overhaul must specify a multi-phase migration: shadow writes, shadow reads, canary gating, and reversible rollbacks.
+  \item \textbf{Operational Ownership}: An architecture is incomplete without an FMEA matrix, alerting thresholds, runbooks, and disaster recovery validation.
+\end{itemize}
+
+\section{Exercises}
+
+\subsection*{Mechanics}
+\begin{enumerate}[leftmargin=18pt]
+  \item List the ten standard sections of an enterprise Technical Design Document and explain why the ``Alternatives Considered'' section is mandatory for staff-level designs.
+  \item Define the ``Expand and Contract'' (Parallel Run) pattern for relational database schema refactoring and explain why a single \texttt{ALTER TABLE DROP COLUMN} is hazardous in a continuous deployment pipeline.
+\end{enumerate}
+
+\subsection*{Debugging}
+\begin{enumerate}[leftmargin=18pt]
+  \item Review the following goal from a junior architect's TDD: \textit{``The new microservice will be highly available, maintainable, and built using Go with Docker and Kubernetes.''} Rewrite this into two proper architectural Goals and identify which part belongs in the Technology Justification section rather than Goals.
+\end{enumerate}
+
+\subsection*{Architecture Design}
+\begin{enumerate}[leftmargin=18pt]
+  \item Construct an FMEA (Failure Mode and Effects Analysis) table for a high-volume Webhook Dispatch Engine that delivers millions of webhook notifications per hour to external merchant servers. Identify at least three distinct failure modes (e.g., slow merchant endpoints, network timeouts, poison-pill payloads), the system effect, severity, and concrete mitigation.
+\end{enumerate}
+
+\section{Detailed Solutions}
+
+\subsection*{Mechanics Solution}
+\begin{enumerate}[leftmargin=18pt]
+  \item The ten sections are: Metadata, Executive Summary, Context \& Motivation, Goals \& Non-Goals, Proposed Architecture, Detailed Design, Alternatives Considered, Cross-Cutting Concerns (Security/Privacy/FinOps), Migration \& Rollout, and Operational Readiness.
+  
+  The \textbf{Alternatives Considered} section is mandatory because any architecture decision involves trade-offs. If a design document presents only one solution, the author has either not deeply analyzed the problem space or is falling victim to confirmation bias. Exploring alternatives forces the author to document why competing approaches (e.g., choosing DynamoDB over PostgreSQL, or REST over gRPC) were evaluated and rejected against specific constraints (latency, cost, complexity).
+  
+  \item \textbf{Expand and Contract}: In a zero-downtime rolling deployment, old and new versions of an application run concurrently for minutes or hours. If an \texttt{ALTER TABLE DROP COLUMN} is executed immediately, any older instance still servicing requests will crash when executing a \texttt{SELECT} or \texttt{INSERT} referencing that column. Expand and Contract prevents this by: (1) Deprecating the column in code, (2) Stopping all application reads/writes to it while keeping the column in the DB, (3) Deploying the new code across 100\% of the fleet, and (4) Executing the drop script days later once no running binary references the column.
+\end{enumerate}
+
+\subsection*{Debugging Solution}
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Flaws}: ``Highly available'' and ``maintainable'' are unquantified buzzwords. Mentioning ``Go'', ``Docker'', and ``Kubernetes'' confuses implementation mechanisms with architectural objectives.
+  
+  \textbf{Rewritten Goals}:
+  \begin{itemize}
+    \item \textit{Goal 1}: Achieve 99.95\% uptime availability (less than 21.6 minutes of unscheduled downtime per month) under a peak workload of 10,000 requests per second.
+    \item \textit{Goal 2}: Maintain p99 service response latency below 50ms across all read operations.
+  \end{itemize}
+  The choice of Go, Docker, and Kubernetes belongs in the \textbf{Proposed Architecture / Technology Justification} section, where their memory footprint and deployment concurrency are justified against alternatives.
+\end{enumerate}
+
+\subsection*{Architecture Design Solution}
+\begin{table}[htbp]
+\centering\scriptsize
+\begin{tabular}{p{2.5cm}p{2.8cm}p{1.2cm}p{2.8cm}p{2.8cm}}
+\toprule
+\textbf{Failure Mode} & \textbf{System Effect} & \textbf{Severity} & \textbf{Mitigation Strategy} & \textbf{Detection / Alert} \\
+\midrule
+Merchant server takes 30s to respond to HTTP POST & Worker thread starvation; queue backlog grows & High & Enforce strict 3s HTTP client timeout; isolate slow merchants into low-priority queues & Alert: \texttt{WebhookDeliveryLag > 50,000} \\
+Poison-pill payload causes JSON serializer to crash & Worker enters crash-loop; message is continuously redelivered & High & Catch serialization exceptions; route failed payload to Dead Letter Queue (DLQ) after 3 retries & Alert: \texttt{DLQRate > 10/min} \\
+Merchant server returns HTTP 429 Too Many Requests & Dispatch engine floods merchant, worsening rate limit & Medium & Exponential backoff with jitter; dynamically reduce per-merchant concurrency limit & Metrics: \texttt{HTTP429ResponseRate per merchant} \\
+\bottomrule
+\end{tabular}
+\caption{FMEA Matrix for Webhook Dispatch Engine}
+\end{table}
+
+\section{Further Reading \& Citations}
+\begin{itemize}[leftmargin=18pt]
+  \item Kleppmann, M. (2017). \textit{Designing Data-Intensive Applications}. O'Reilly Media. (Chapter 4: Encoding and Evolution).
+  \item Fowler, M. (2014). \textit{Refactoring Databases: Evolutionary Database Design}. Addison-Wesley.
+  \item Nygard, M. (2018). \textit{Release It! Design and Deploy Production-Ready Software} (2nd ed.). Pragmatic Bookshelf.
+  \item Google SRE Team. (2016). \textit{Site Reliability Engineering: How Google Runs Production Systems}. O'Reilly Media.
+\end{itemize}

@@ -1,0 +1,430 @@
+\chapter{Authentication, Authorization, and Defensive Backend Security}
+\label{chap:auth-security}
+
+\begin{chaptergoalsbox}
+\textbf{What You Will Learn:}
+\begin{itemize}[leftmargin=12pt,itemsep=2pt]
+  \item Modern password hashing mechanics: Argon2id (RFC 9106) vs. bcrypt, memory-hard resistance against GPU/ASIC arrays, and runtime re-hashing transitions.
+  \item Hardened session engineering: session fixation defenses, modern cookie security flags (\texttt{HttpOnly}, \texttt{Secure}, \texttt{SameSite}), and \texttt{\_\_Host-} prefixes.
+  \item JSON Web Token (JWT) architecture and cryptographic exploit paths: \texttt{alg: none} stripping, RS256-to-HS256 key-confusion attacks, and revocation mechanics.
+  \item OAuth 2.0 and OpenID Connect (OIDC) with PKCE (RFC 7636): cryptographic code verifiers, $S256$ challenges, and refresh token rotation.
+  \item Access control topologies: Role-Based (RBAC), Attribute-Based (ABAC), and Google Zanzibar Relationship-Based Access Control (ReBAC).
+  \item OWASP Top 10 deep dive: SQL injection mechanics, Insecure Direct Object References (IDOR), and Server-Side Request Forgery (SSRF) cloud metadata bypasses.
+\end{itemize}
+
+\textbf{What You Should Already Understand:}
+\begin{itemize}[leftmargin=12pt,itemsep=2pt]
+  \item Basic cryptography (symmetric AES encryption vs. asymmetric RSA/ECC keypairs, cryptographic hashes).
+  \item HTTP header exchange mechanics and stateless token passing.
+\end{itemize}
+
+\textbf{Why This Topic Exists:}
+Security is not a feature layered on at the end of a project; it is an architectural property woven into every line of backend code. Security breaches rarely occur because of broken mathematical algorithms; they occur because of flawed implementation assumptions—such as trusting user-supplied JWT header algorithms, naively trusting client IP addresses, or failing to validate tenant ownership in database queries.
+
+\textbf{Motivating Practical Problem:}
+A healthcare technology platform exposes a patient portal and medical record API. An external security audit discovers three catastrophic vulnerabilities: (1) an attacker can forge admin JWTs by exploiting an RS256/HS256 algorithm confusion flaw using the platform's public certificate, (2) an IDOR flaw in the prescription download endpoint allows any authenticated patient to read arbitrary patient records, and (3) an SSRF vulnerability in the profile avatar importer allows exfiltrating AWS IAM credentials from the EC2 instance metadata service (\texttt{169.254.169.254}). Hardening this platform demands a comprehensive, defense-in-depth engineering overhaul.
+\end{chaptergoalsbox}
+
+\section{Modern Password Hashing: Argon2id vs. bcrypt}
+
+Storing plaintext passwords or simple cryptographic hashes (such as MD5, SHA-1, or SHA-256) is catastrophic negligence. Cryptographic hash functions are engineered for speed, enabling an attacker with an array of modern GPUs to compute over 100 billion SHA-256 hashes per second.
+
+\subsection{bcrypt: Architecture and 72-Byte Truncation Limitation}
+
+Introduced in 1999 by Niels Provos and David Mazières, **bcrypt** is based on the Blowfish block cipher. It introduces an adaptive work factor (cost) $2^{\text{cost}}$, scaling computation time exponentially.
+
+\subsubsection{The 72-Byte Truncation Flaw}
+The Blowfish cipher key schedule accepts keys up to 448 bits (56 bytes), expanded in bcrypt to a maximum password length of **72 bytes**. If a user enters a 100-character passphrase:
+\begin{lstlisting}[language=sh]
+password = "a" * 72 + "completely_different_ending_12345"
+\end{lstlisting}
+bcrypt silently truncates the password at byte 72, completely discarding all subsequent characters!
+
+Furthermore, bcrypt requires only 4KB of RAM, making it highly vulnerable to mass hardware parallelization on Field-Programmable Gate Arrays (FPGAs) and Application-Specific Integrated Circuits (ASICs).
+
+\subsection{Argon2id (RFC 9106): The Memory-Hard Standard}
+
+Winner of the Password Hashing Competition (PHC), **Argon2** is the modern gold standard. It is fundamentally **memory-hard**, designed to demand gigabytes of memory access bandwidth, neutralizing GPU and ASIC cracking rigs.
+
+Argon2 provides three variants:
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Argon2d (Data-Dependent):} Accesses memory in an order determined by password and salt. Maximizes resistance against GPU cracking, but is vulnerable to cache side-channel timing attacks.
+  \item \textbf{Argon2i (Data-Independent):} Accesses memory in a fixed, password-independent sequence, eliminating side-channel timing attacks, but requires more iterations to deter GPUs.
+  \item \textbf{Argon2id (Hybrid):} The recommended production variant. Operates as Argon2i during the first half of the first pass over memory to eliminate side-channel leaks, and transitions to Argon2d for the remainder to defeat GPU cracking.
+\end{enumerate}
+
+\subsubsection{Configuring Argon2id Parameters}
+Argon2id relies on three tunable dimensions:
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{Memory Cost ($m$):} RAM allocated to the hash in kibibytes (e.g., $65,536\text{ KiB} = 64\text{ MB}$).
+  \item \textbf{Time Cost ($t$):} Number of linear passes over the memory matrix (e.g., $t = 3$ or $4$).
+  \item \textbf{Parallelism ($p$):} Number of concurrent execution threads/lanes (e.g., $p = 1$ to $4$).
+\end{itemize}
+
+\begin{lstlisting}[language=PHP,caption={Production Password Hashing and Seamless Upgrades in PHP}]
+<?php
+declare(strict_types=1);
+
+// Hash using Argon2id with 64MB memory cost
+$options = [
+    'memory_cost' => 65536, // 64 MB
+    'time_cost'   => 4,     // 4 iterations
+    'threads'     => 1,     // 1 lane
+];
+
+$hash = password_hash($rawPassword, PASSWORD_ARGON2ID, $options);
+
+// On user login: Verify and seamlessly rehash if parameters changed
+if (password_verify($inputPassword, $storedHash)) {
+    if (password_needs_rehash($storedHash, PASSWORD_ARGON2ID, $options)) {
+        $newHash = password_hash($inputPassword, PASSWORD_ARGON2ID, $options);
+        $userRepository->updatePasswordHash($user->id, $newHash);
+    }
+}
+\end{lstlisting}
+
+% ==========================================
+\section{Hardened Session Management and Cookie Security}
+
+Session-based authentication stores state on the server (e.g., in Redis) and identifies the user via a cryptographically random session token stored in an HTTP cookie.
+
+\subsection{Session Fixation and Regeneration}
+
+In a **session fixation attack**, an attacker obtains a valid session identifier (e.g., by visiting the login page), tricks a victim into authenticating using that identifier (via a crafted link), and then uses the now-authenticated session ID to hijack the victim's account.
+
+\begin{productionwarningbox}[Mandatory Session ID Regeneration]
+Whenever a user's privilege level changes—such as successful login, password change, or multi-factor authentication (MFA) verification—the backend **must immediately regenerate the session ID** and invalidate the old session:
+\begin{lstlisting}[language=PHP]
+session_regenerate_id(true); // true deletes the old session file/record
+\end{lstlisting}
+\end{productionwarningbox}
+
+\subsection{Defensive Cookie Flags and Modern Prefixes}
+
+Cookies must be configured with defense-in-depth flags to prevent theft via Cross-Site Scripting (XSS) or Cross-Site Request Forgery (CSRF):
+
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{\texttt{HttpOnly}:} Blocks JavaScript access via \texttt{document.cookie}. Even if the application has an XSS vulnerability, the attacker cannot read the session cookie.
+  \item \textbf{\texttt{Secure}:} Restricts cookie transmission exclusively to encrypted TLS (HTTPS) connections, preventing plaintext sniffing over unencrypted networks.
+  \item \textbf{\texttt{SameSite=Lax / Strict}:} Controls whether cookies are attached to cross-site requests:
+  \begin{itemize}
+    \item \texttt{Strict}: Never sent on cross-site requests (e.g., clicking a link from an external website).
+    \item \texttt{Lax}: Sent on top-level cross-site navigations using safe HTTP methods (\texttt{GET}), but withheld from cross-site \texttt{POST} requests, image loads, and iframes, neutralizing CSRF attacks.
+  \end{itemize}
+  \item \textbf{The \texttt{\_\_Host-} Cookie Prefix:} A browser security standard. A cookie named \texttt{\_\_Host-SessionId} is accepted by the browser **only if**:
+  \begin{enumerate}
+    \item It is marked with the \texttt{Secure} flag.
+    \item It originates from an HTTPS origin.
+    \item It has \texttt{Path=/}.
+    \item It has **no Domain attribute** specified (preventing malicious subdomains from overwriting parent domain session cookies!).
+  \end{enumerate}
+\end{itemize}
+
+% ==========================================
+\section{JWT Mechanics and Cryptographic Vulnerabilities}
+
+A **JSON Web Token (JWT, RFC 7519)** is a compact, URL-safe means of representing claims between two parties. It consists of three Base64URL-encoded strings separated by dots:
+$$\text{JWT} = \text{Header} \;.\; \text{Payload} \;.\; \text{Signature}$$
+
+\subsection{The \texttt{alg: none} Stripping Attack}
+
+The JWT specification includes an algorithm identifier: \texttt{"alg": "none"}, intended for unauthenticated debugging. 
+
+In vulnerable implementations, an attacker modifies the token header:
+\begin{lstlisting}[language=sh]
+{"alg": "none", "typ": "JWT"}
+\end{lstlisting}
+Modifies the payload to grant admin privileges:
+\begin{lstlisting}[language=sh]
+{"user_id": 42, "role": "admin"}
+\end{lstlisting}
+And removes the signature entirely (leaving the trailing dot):
+\begin{lstlisting}[language=sh]
+eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJ1c2VyX2lkIjo0Miwicm9sZSI6ImFkbWluIn0.
+\end{lstlisting}
+If the backend library naively inspects the token header to determine how to verify the signature, it treats the token as valid without verifying anything!
+
+\begin{commonmistakebox}[Never Let the Untrusted Token Dictate the Algorithm]
+Production JWT verification code must **never** let the token header select the algorithm. Always enforce the expected algorithm on the server:
+\begin{lstlisting}[language=Python]
+# SECURE: Explicitly whitelist the algorithm on the verifier
+jwt.decode(token, PUBLIC_KEY, algorithms=["RS256"])
+\end{lstlisting}
+\end{commonmistakebox}
+
+\subsection{The RS256 vs. HS256 Key Confusion Attack}
+
+This is one of the most severe cryptographic bugs in token-based systems. It occurs when a server expects an asymmetric RSA signature (**RS256**), but uses a library that accepts symmetric HMAC signatures (**HS256**).
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.9, transform shape,
+  node distance=0.8cm and 1.5cm,
+  box/.style={rectangle, draw=headingblue, fill=codebg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily},
+  accent/.style={rectangle, draw=warningRed, fill=warningBg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily\bfseries},
+  line/.style={draw=headingblue, -{Stealth[length=2.5mm]}, thick}
+]
+  \node[box] (pubkey) {\textbf{Server Public RSA Key}\\\small Publicly available at \texttt{/.well-known/jwks.json}};
+  \node[accent, right=of pubkey] (atk) {\textbf{Attacker Forges Token}\\\small Changes header to \texttt{alg: HS256}\\Signs with Public RSA Key as HMAC Secret};
+  \node[accent, below=1.2cm of atk] (srv) {\textbf{Vulnerable Server}\\\small Passes public key to generic \texttt{verify(token, key)}\\Library treats RSA public key string as HMAC secret!};
+  \node[box, left=of srv] (bypass) {\textbf{Authentication Bypassed}\\\small Signature matches! Attacker is Admin};
+
+  \draw[line] (pubkey) -- (atk);
+  \draw[line] (atk) -- (srv);
+  \draw[line] (srv) -- (bypass);
+\end{tikzpicture}
+\caption{The RS256 vs HS256 key confusion exploit flow.}
+\label{fig:jwt-confusion}
+\end{figure}
+
+\subsubsection{Exploitation Mechanics}
+\begin{enumerate}[leftmargin=15pt]
+  \item In RS256, the server signs with an asymmetric private key and verifies with a public key. The public key is public knowledge.
+  \item In HS256, both signing and verification use the **same shared secret**.
+  \item The attacker grabs the server's public RSA key (PEM format).
+  \item The attacker crafts an administrative JWT, changes the header to \texttt{\{"alg": "HS256"\}}, and signs the token using standard HMAC-SHA256, providing the **public RSA key string as the secret**.
+  \item When the backend receives the token, it fetches its public RSA key and calls \texttt{jwt.decode(token, public\_key)}.
+  \item If the library supports multiple algorithms, it sees \texttt{"HS256"}, uses the public key string as the HMAC secret, computes HMAC-SHA256, finds an exact signature match, and logs the attacker in as super-admin!
+\end{enumerate}
+
+% ==========================================
+\section{OAuth 2.0 and OpenID Connect (OIDC) with PKCE}
+
+**OAuth 2.0 (RFC 6749)** is a delegation framework; **OpenID Connect (OIDC)** is an identity authentication layer built directly on top of OAuth 2.0.
+
+\subsection{Proof Key for Code Exchange (PKCE, RFC 7636)}
+
+Historically, single-page applications (SPAs) and mobile native apps used the insecure **Implicit Grant Flow**, which returned access tokens directly in URL hash fragments. This exposed tokens to browser history, referrer logs, and malicious browser extensions.
+
+Modern security standards deprecate the Implicit Grant and enforce the **Authorization Code Flow with PKCE**:
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.85, transform shape,
+  node distance=0.8cm and 1.2cm,
+  party/.style={rectangle, draw=headingblue, fill=codebg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily\bfseries},
+  line/.style={draw=headingblue, -{Stealth[length=2.5mm]}, thick}
+]
+  \node[party] (client) {Client App\\(Mobile / SPA)};
+  \node[party, right=4.5cm of client] (auth) {Authorization Server\\(Auth0 / Okta / Keycloak)};
+
+  \draw[line] (client.north east) -- node[above, font=\scriptsize\sffamily] {1. Generate \texttt{code\_verifier} \& \texttt{code\_challenge} (S256)} ++(0,0) -- node[below, font=\scriptsize\sffamily] {Redirect with \texttt{challenge}} (auth.north west);
+  \draw[line] (auth.west) -- node[above, font=\scriptsize\sffamily] {2. User Authenticates $\rightarrow$ Returns \texttt{authorization\_code}} (client.east);
+  \draw[line] (client.south east) -- node[above, font=\scriptsize\sffamily] {3. POST \texttt{/token} with \texttt{code} + \texttt{code\_verifier}} (auth.south west);
+  \draw[line] (auth.south) -- ++(0,-0.8) -| node[pos=0.25, below, font=\scriptsize\sffamily] {4. Verify $\text{SHA-256}(\text{verifier}) == \text{challenge} \rightarrow$ Returns \texttt{access\_token} + \texttt{id\_token}} (client.south);
+\end{tikzpicture}
+\caption{The OAuth 2.0 Authorization Code flow with PKCE.}
+\label{fig:pkce-flow}
+\end{figure}
+
+\subsubsection{PKCE Cryptographic Equations}
+\begin{enumerate}[leftmargin=15pt]
+  \item The client generates a high-entropy cryptographically random string: the \texttt{code\_verifier} (43 to 128 characters).
+  \item The client computes the \texttt{code\_challenge}:
+  $$\text{code\_challenge} = \text{Base64URL}(\text{SHA-256}(\text{code\_verifier}))$$
+  \item The client sends \texttt{code\_challenge} and \texttt{code\_challenge\_method=S256} during the initial authorization request.
+  \item When exchanging the returned authorization code for tokens, the client provides the raw \texttt{code\_verifier}.
+  \item The authorization server hashes the verifier using SHA-256 and compares it against the stored challenge. Even if an attacker intercepts the authorization code in a custom mobile URI scheme, they cannot redeem it without the \texttt{code\_verifier}!
+\end{enumerate}
+
+% ==========================================
+\section{Access Control Architectures: RBAC, ABAC, and ReBAC}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.9, transform shape,
+  node distance=0.8cm and 1.2cm,
+  node/.style={rectangle, draw=headingblue, fill=codebg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily},
+  accent/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily\bfseries}
+]
+  \node[node, minimum width=4cm] (rbac) {\textbf{RBAC}\\\small User $\rightarrow$ Role $\rightarrow$ Permissions};
+  \node[accent, right=1.2cm of rbac, minimum width=4cm] (abac) {\textbf{ABAC}\\\small $P = f(\text{Subject}, \text{Resource}, \text{Env})$};
+  \node[node, right=1.2cm of abac, minimum width=4cm] (rebac) {\textbf{ReBAC (Zanzibar)}\\\small Graph Tuples: \texttt{doc\#viewer@user}};
+\end{tikzpicture}
+\caption{The evolution of authorization models: RBAC to ABAC to Google Zanzibar ReBAC.}
+\label{fig:access-models}
+\end{figure}
+
+\subsection{Role-Based Access Control (RBAC) and Role Explosion}
+
+In RBAC, permissions are assigned to roles, and roles are assigned to users (e.g., \texttt{User $\rightarrow$ Manager $\rightarrow$ approve\_expense}).
+\textbf{The Flaw:} RBAC cannot handle fine-grained context. What if a manager can only approve expenses under \$5,000 within their own department? Teams invent hundreds of hyper-specific roles (\texttt{DEPT\_MARKETING\_MANAGER\_TIER\_2}), resulting in catastrophic **Role Explosion**.
+
+\subsection{Attribute-Based Access Control (ABAC)}
+
+ABAC evaluates policies dynamically based on four attribute dimensions:
+$$P = f(\text{Subject Attributes}, \; \text{Resource Attributes}, \; \text{Action}, \; \text{Environment Attributes})$$
+Example policy: ``Allow \texttt{Action: READ} on \texttt{Resource: MedicalRecord} IF \texttt{Subject.department == Resource.department} AND \texttt{Environment.time} is between 08:00 and 18:00.''
+
+\subsection{Relationship-Based Access Control (ReBAC / Google Zanzibar)}
+
+Published by Google in 2019, **Zanzibar** models authorization as a Directed Acyclic Graph (DAG) of relationships. Permissions are expressed as relation tuples:
+$$\langle\text{object}\rangle \# \langle\text{relation}\rangle @ \langle\text{user / object\#relation}\rangle$$
+Example:
+\begin{lstlisting}[language=sh]
+document:quarterly_report#parent@folder:finance
+folder:finance#viewer@group:auditors#member
+\end{lstlisting}
+Authorization checks execute as high-speed graph traversals: ``Is Alice a viewer of Document 101?'' Zanzibar scales to millions of checks per second with sub-10ms latency across global datacenters.
+
+% ==========================================
+\section{OWASP Top 10 Deep Dive: Injection, IDOR, and SSRF}
+
+\subsection{SQL Injection (SQLi) and Parameterized Queries}
+
+SQLi occurs when untrusted user input alters the syntactic structure of an SQL query:
+\begin{lstlisting}[language=PHP]
+// VULNERABLE: Direct string interpolation
+$sql = "SELECT * FROM users WHERE email = '" . $_POST['email'] . "'";
+\end{lstlisting}
+If input is \texttt{' OR '1'='1}, the parser parses \texttt{'1'='1'} as a boolean literal condition, bypassing authentication.
+
+\begin{underthehoodbox}[How Parameterized Queries Neutralize SQLi]
+When using parameterized queries (\texttt{PDO::prepare} or ORM bindings), the database engine compiles the SQL string into an execution tree **before** binding user values. The user input is transmitted over the wire protocol as raw data literals. Even if the input contains SQL syntax (\texttt{'; DROP TABLE users;--}), the database treats it strictly as literal string characters, never as executable instructions!
+\end{underthehoodbox}
+
+\subsection{Insecure Direct Object References (IDOR)}
+
+An IDOR occurs when an application exposes a direct reference to an internal database identifier (e.g., \texttt{GET /api/documents/8451}) without verifying that the authenticated user possesses authorization to access that specific entity.
+
+\subsubsection{Defensive Rule: Enforce Tenant and Owner Scoping in the Query}
+Never fetch an entity by ID alone and perform an authorization check in userland memory. Enforce ownership directly in the database query:
+\begin{lstlisting}[language=SQL]
+-- SECURE: Query scopes access by authenticated user_id
+SELECT * FROM documents 
+WHERE id = :document_id 
+  AND organization_id = :auth_user_organization_id;
+\end{lstlisting}
+
+\subsection{Server-Side Request Forgery (SSRF) and Cloud Metadata Exfiltration}
+
+SSRF occurs when an attacker tricks the server into making an outbound HTTP request to an unintended destination (e.g., an avatar image importer that fetches a user-supplied URL).
+
+In cloud environments (AWS, GCP, Azure), the internal **Instance Metadata Service (IMDS)** runs at the non-routable link-local IP address:
+$$\texttt{http://169.254.169.254/latest/meta-data/}$$
+An attacker supplying this URL can exfiltrate temporary IAM role credentials, gaining full control over the cloud environment!
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.9, transform shape,
+  node distance=0.8cm and 1.5cm,
+  box/.style={rectangle, draw=headingblue, fill=codebg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily},
+  accent/.style={rectangle, draw=warningRed, fill=warningBg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily\bfseries},
+  line/.style={draw=headingblue, -{Stealth[length=2.5mm]}, thick}
+]
+  \node[box] (atk) {\textbf{Attacker}\\\small Supplies \texttt{avatar\_url = http://169.254.169.254/...}};
+  \node[box, right=of atk] (app) {\textbf{Application Server}\\\small Downloads URL without IP validation};
+  \node[accent, right=of app] (imds) {\textbf{Cloud IMDS}\\\small \texttt{169.254.169.254}\\Returns IAM Access Keys};
+
+  \draw[line] (atk) -- node[above, font=\tiny\sffamily] {POST /avatar} (app);
+  \draw[line, warningRed] (app) -- node[above, font=\tiny\sffamily] {Outbound GET} (imds);
+  \draw[line, warningRed] (imds) -- node[below, font=\tiny\sffamily] {AWS Secret Keys} (app);
+  \draw[line, warningRed] (app) -- node[below, font=\tiny\sffamily] {Leaked Credentials} (atk);
+\end{tikzpicture}
+\caption{SSRF attack chain targeting Cloud Instance Metadata Service (IMDS).}
+\label{fig:ssrf-imds}
+\end{figure}
+
+\subsubsection{SSRF Defenses}
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Resolve and Validate IP Addresses:} Resolve the hostname via DNS, check that the IP does not belong to private/internal ranges (\texttt{10.0.0.0/8}, \texttt{172.16.0.0/12}, \texttt{192.168.0.0/16}, \texttt{127.0.0.0/8}, \texttt{169.254.169.254}), and open the socket directly to the validated IP.
+  \item \textbf{Enforce IMDSv2:} Enforce AWS IMDSv2, which mandates a session token obtained via a \texttt{PUT} request with a custom header (\texttt{X-aws-ec2-metadata-token}), neutralizing simple GET-based SSRF.
+\end{enumerate}
+
+% ==========================================
+\section{Chapter Summary \& Key Takeaways}
+
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{Argon2id Memory Hardness:} Neutralizes GPU/ASIC cracking rigs through tunable memory cost, time iterations, and parallelism. Replaces vulnerable bcrypt with its 72-byte truncation flaw.
+  \item \textbf{Session Hardening:} Regenerate session IDs on every privilege boundary. Enforce \texttt{HttpOnly}, \texttt{Secure}, \texttt{SameSite=Lax/Strict}, and the \texttt{\_\_Host-} prefix.
+  \item \textbf{JWT Pitfalls:} Never trust token headers to select cryptographic algorithms. Whitelist explicit algorithms to eliminate \texttt{alg: none} and RS256/HS256 key confusion exploits.
+  \item \textbf{OAuth 2.0 PKCE:} Deprecates Implicit Grants. Secures public and confidential clients using high-entropy \texttt{code\_verifier} strings and $S256$ SHA-256 challenges.
+  \item \textbf{Access Control Models:} Move beyond rigid RBAC to dynamic ABAC policies or relationship-driven Google Zanzibar graph models.
+  \item \textbf{OWASP Defensive Engineering:} Neutralize SQLi via parameterized query literals; eliminate IDOR via database-level ownership scoping; defeat SSRF via strict DNS resolution and link-local IP filtering.
+\end{itemize}
+
+% ==========================================
+\section{Exercises and Real-World Scenarios}
+
+\subsection{Mechanics Exercises}
+\begin{enumerate}
+  \item \textbf{Exercise 6.1:} Given an RSA public key in PEM format, demonstrate how an attacker constructs a forged JWT with payload \texttt{\{"user": "admin"\}} using the RS256/HS256 key confusion attack in Python.
+  \item \textbf{Exercise 6.2:} Explain the exact difference between the \texttt{\_\_Secure-} cookie prefix and the \texttt{\_\_Host-} cookie prefix. Under what specific architectural scenario will a browser reject a \texttt{\_\_Host-} cookie?
+\end{enumerate}
+
+\subsection{Debugging Exercises}
+\begin{enumerate}
+  \item \textbf{Exercise 6.3:} A developer attempts to prevent SSRF in an image downloader using the following validation logic:
+\begin{lstlisting}[language=Python]
+import socket
+from urllib.parse import urlparse
+
+def is_safe_url(url: str) -> bool:
+    hostname = urlparse(url).hostname
+    ip = socket.gethostbyname(hostname)
+    if ip.startswith("127.") or ip.startswith("169.254."):
+        return False
+    return True
+
+# If safe: requests.get(url)
+\end{lstlisting}
+Identify the critical security vulnerability (hint: Time-of-Check to Time-of-Use) and demonstrate how an attacker bypasses this check using **DNS Rebinding**.
+\end{enumerate}
+
+\subsection{Architecture Design Problem}
+\begin{enumerate}
+  \item \textbf{Exercise 6.4:} Architect an enterprise-grade multi-tenant authorization gateway for a SaaS application. The system must support role hierarchies, fine-grained object ownership, tenant data isolation, and low-latency token revocation (under 500ms propagation) across 50 microservices.
+\end{enumerate}
+
+% ==========================================
+\section{Detailed Solutions}
+
+\subsection{Solution 6.1: RS256/HS256 Key Confusion Forgery}
+\begin{lstlisting}[language=Python]
+import jwt
+
+# Attacker loads victim server's public key (retrieved from /.well-known/jwks.json)
+with open("server_public_key.pem", "r") as f:
+    public_key_pem = f.read()
+
+# Forged administrative payload
+payload = {"user_id": 1, "role": "admin"}
+
+# Attacker signs token using HS256 with the PUBLIC key as HMAC secret!
+forged_token = jwt.encode(
+    payload,
+    key=public_key_pem, # Treated as raw HMAC secret string!
+    algorithm="HS256"
+)
+\end{lstlisting}
+
+\subsection{Solution 6.2: Cookie Prefixes Comparison}
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{\texttt{\_\_Secure-}:} Requires the \texttt{Secure} flag and an HTTPS origin. May include a \texttt{Domain} attribute and arbitrary \texttt{Path}.
+  \item \textbf{\texttt{\_\_Host-}:} Strictly more secure. Requires \texttt{Secure}, HTTPS, must have \texttt{Path=/}, and **must NOT include a Domain attribute**. If an application attempts to set \texttt{Set-Cookie: \_\_Host-id=123; Domain=example.com; Secure; Path=/}, modern browsers **reject and discard the cookie entirely** because the \texttt{Domain} attribute would allow subdomains to manipulate it!
+\end{itemize}
+
+\subsection{Solution 6.3: DNS Rebinding SSRF Exploit}
+\textbf{Diagnosis:} The code suffers from a **Time-of-Check to Time-of-Use (TOCTOU)** race condition. It performs DNS resolution during \texttt{socket.gethostbyname(hostname)}, but \texttt{requests.get(url)} performs a **second independent DNS lookup** moments later!
+
+\textbf{Exploit:} The attacker configures a custom DNS server with a TTL of 0 seconds. On the first DNS query (\texttt{is\_safe\_url}), the server returns a benign public IP (\texttt{93.184.216.34}). On the second DNS query executed by \texttt{requests.get()}, the server returns \texttt{169.254.169.254}. The check passes, but the request hits the cloud metadata service!
+
+\textbf{Remedy:} Resolve the IP once, validate it against all private/link-local ranges, and make the HTTP connection directly to that specific IP address, passing the original hostname inside the HTTP \texttt{Host} header.
+
+\subsection{Solution 6.4: SaaS Authorization Gateway Architecture}
+See Section 6.5 and Section 6.2. Microservices validate short-lived (5-minute) asymmetric JWTs issued by the Auth Gateway. For immediate revocation, the gateway publishes revocation events to a Redis Pub/Sub channel connected to all microservice nodes, updating an in-memory token blacklist filter. All database queries enforce tenant isolation at the SQL query level (\texttt{WHERE tenant\_id = :tenant\_id}).
+
+% ==========================================
+\section{Further Reading \& Citations}
+
+\begin{itemize}[leftmargin=15pt]
+  \item Biryukov, A., Dinu, D., \& Khovratovich, D. (2016). \textit{Argon2: New Generation of Memory-Hard Functions for Password Hashing and Other Applications}. RFC 9106.
+  \item Jones, M., Bradley, J., \& Sakimura, N. (2015). \textit{JSON Web Token (JWT)}. RFC 7519.
+  \item Sakimura, N., et al. (2015). \textit{Proof Key for Code Exchange by OAuth Public Clients (PKCE)}. RFC 7636.
+  \item Pang, R., et al. (2019). \textit{Zanzibar: Google's Consistent, Global Authorization System}. USENIX ATC.
+  \item OWASP Foundation. (2021). \textit{OWASP Top 10: 2021 The Ten Most Critical Web Application Security Risks}. \url{https://owasp.org/Top10/}
+\end{itemize}

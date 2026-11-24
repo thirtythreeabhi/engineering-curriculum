@@ -1,0 +1,535 @@
+\chapter{Databases, SQL Engine Internals, and ORM Design}
+\label{chap:databases-sql-orm}
+
+\begin{chaptergoalsbox}
+\textbf{What You Will Learn:}
+\begin{itemize}[leftmargin=12pt,itemsep=2pt]
+  \item PostgreSQL physical storage architecture: 8KB page layout, line pointers (\texttt{ItemIdData}), tuple headers, and MVCC visibility tracking.
+  \item Buffer pool management and Write-Ahead Logging (WAL): ARIES recovery, checkpointing, and \texttt{fsync} durability semantics.
+  \item B-Tree index structures: root/branch/leaf page layout, page splits, and access method execution (Index Scan vs Bitmap Scan vs Index Only Scan).
+  \item Query execution plan disassembly using \texttt{EXPLAIN (ANALYZE, BUFFERS)}: join operators, cost estimation models, and buffer hit profiling.
+  \item Transaction isolation levels and concurrency anomalies: Read Committed, Repeatable Read, Write Skew, and Serializable Snapshot Isolation (SSI).
+  \item High-throughput concurrency patterns: \texttt{SELECT FOR UPDATE SKIP LOCKED} for race-free distributed job queues.
+  \item Architectural design patterns: Active Record vs. Data Mapper, the Unit of Work, Identity Maps, and resolving the N+1 query problem.
+\end{itemize}
+
+\textbf{What You Should Already Understand:}
+\begin{itemize}[leftmargin=12pt,itemsep=2pt]
+  \item Relational database basics (tables, primary/foreign keys, relational algebra).
+  \item Standard SQL syntax (\texttt{SELECT}, \texttt{JOIN}, \texttt{GROUP BY}, \texttt{TRANSACTION}).
+\end{itemize}
+
+\textbf{Why This Topic Exists:}
+Application backends live and die by their database interactions. Object-Relational Mappers (ORMs) simplify CRUD development, but they frequently obscure the underlying storage engine, leading to catastrophic table bloat, lock contention, sub-optimal query plans, and transaction wraparound crashes. Mastering database internals enables engineers to design high-throughput schemas, debug elusive locks, and write rock-solid persistence layers.
+
+\textbf{Motivating Practical Problem:}
+A logistics company operates an inventory reservation system processing 10,000 reservations per minute during flash sales. As concurrency spikes, database CPU hits 100\%, queries experience massive lock-wait timeouts, and multiple customer orders successfully reserve the same physical warehouse inventory item. Meanwhile, autovacuum falls behind, table size balloons from 5GB to 85GB, and an impending 32-bit transaction ID wraparound threatens to force the database into emergency read-only shutdown. Resolving this requires deep mastery of PostgreSQL pages, MVCC, and row locking primitives.
+\end{chaptergoalsbox}
+
+\section{PostgreSQL Storage Engine Architecture: Heap Pages and Tuples}
+
+PostgreSQL stores table data in **heap files** partitioned into fixed-size **8KB pages (blocks)** on disk.
+
+\subsection{The 8KB Page Layout}
+
+Every 8KB page follows a disciplined binary layout designed to balance row insertion speed with fragmentation management:
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.9, transform shape,
+  node distance=0.1cm,
+  blk/.style={rectangle, draw=headingblue, fill=codebg, thick, minimum height=1.0cm, align=center, font=\scriptsize\sffamily}
+]
+  \node[blk, minimum width=2.5cm, fill=intuitionBg] (hdr) {\textbf{PageHeaderData}\\(24 bytes)};
+  \node[blk, minimum width=2.5cm, right=of hdr] (ptrs) {\textbf{Line Pointers}\\(4 bytes each)};
+  \node[blk, minimum width=3.5cm, right=of ptrs, fill=gray!10] (free) {\textbf{Free Space Window}\\\small Grows inward from both ends};
+  \node[blk, minimum width=2.5cm, right=of free] (t2) {\textbf{Tuple 2}};
+  \node[blk, minimum width=2.5cm, right=of t2] (t1) {\textbf{Tuple 1}};
+
+  \draw[-{Stealth[length=2mm]}, thick, intuitionTeal] (ptrs.east) -- ++(0.6,0) node[above, font=\tiny\sffamily] {Fills Down};
+  \draw[-{Stealth[length=2mm]}, thick, warningRed] (t2.west) -- ++(-0.6,0) node[above, font=\tiny\sffamily] {Fills Up};
+  
+  \node[draw=headingblue, dashed, fit=(hdr) (ptrs) (free) (t2) (t1), inner sep=5pt, label=above:{\small\sffamily\bfseries PostgreSQL Standard 8KB Page Block Layout}] {};
+\end{tikzpicture}
+\caption{The internal structure of an 8KB PostgreSQL heap page.}
+\label{fig:postgres-page}
+\end{figure}
+
+The page consists of five discrete regions:
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{PageHeaderData (24 bytes):} Contains general page metadata, including the LSN (Log Sequence Number) of the last WAL record modifying this page, checksum, and offsets to free space:
+  \begin{itemize}
+    \item \texttt{pd\_lower}: Offset to the start of unallocated free space (immediately after the last line pointer).
+    \item \texttt{pd\_upper}: Offset to the end of unallocated free space (immediately before the newest tuple).
+  \end{itemize}
+  \item \textbf{Line Pointers (\texttt{ItemIdData}, 4 bytes each):} An array of pointers growing downward. Each pointer contains an offset to the physical tuple and flags indicating tuple status (used, unused, dead, redirected).
+  \item \textbf{Free Space Window:} The unallocated gap between \texttt{pd\_lower} and \texttt{pd\_upper}.
+  \item \textbf{Heap Tuples:} Row data growing upward from the bottom of the page.
+  \item \textbf{Special Space:} Used by index access methods (empty in regular heap tables).
+\end{enumerate}
+
+\subsubsection{Item Pointer (\texttt{ItemPointerData} / TID)}
+A row in PostgreSQL is identified by a physical address called a **Tuple Identifier (TID)**:
+$$\text{TID} = (\text{block\_number}, \; \text{offset\_number})$$
+For example, $(42, 7)$ refers to block 42, line pointer 7.
+
+\subsection{The Heap Tuple Header and MVCC Visibility Fields}
+
+Every tuple on disk contains a binary header (\texttt{HeapTupleHeaderData}, typically 23 bytes) preceding the user column data:
+
+\begin{lstlisting}[language=C,caption={Core Fields of \texttt{HeapTupleHeaderData} (\texttt{access/htup\_details.h})}]
+struct HeapTupleHeaderData {
+    union {
+        HeapTupleFields t_heap;
+        DatumTupleFields t_datum;
+    } t_choice;
+
+    ItemPointerData t_ctid;      /* Current TID of this tuple or newer version */
+    uint16_t        t_infomask2; /* Attribute count + flags */
+    uint16_t        t_infomask;  /* Visibility flags (XMIN_COMMITTED, XMAX_INVALID) */
+    uint8_t         t_hoff;      /* Offset to user data (includes NULL bitmap) */
+    /* User column data starts here */
+};
+\end{lstlisting}
+
+Within \texttt{t\_choice.t\_heap}, two critical transaction fields govern MVCC visibility:
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{\texttt{t\_xmin}:} The transaction ID (XID) that inserted this tuple.
+  \item \textbf{\texttt{t\_xmax}:} The transaction ID that updated or deleted this tuple (or 0 if not deleted).
+\end{itemize}
+
+\subsection{Table Bloat, VACUUM, and Transaction ID Wraparound}
+
+In PostgreSQL, an \texttt{UPDATE} statement does not mutate the existing row in place. Instead, it leaves the old tuple on disk, sets its \texttt{t\_xmax} to the current transaction ID, and writes an entirely new tuple with its \texttt{t\_xmin} set to the current transaction ID.
+
+\subsubsection{Dead Tuples and Autovacuum}
+Once transactions that could view the old version finish, the old tuple becomes a **dead tuple**. Dead tuples occupy space in heap pages and index pages, resulting in **table bloat**.
+
+The **Autovacuum daemon** periodically scans tables:
+\begin{enumerate}[leftmargin=15pt]
+  \item Identifies dead tuples whose \texttt{xmax} is older than all active transaction snapshots.
+  \item Marks line pointers as unused or redirected, defragmenting free space within the 8KB page.
+  \item Updates the **Free Space Map (FSM)** and **Visibility Map (VM)**.
+\end{enumerate}
+
+\begin{productionwarningbox}[Preventing 32-Bit Transaction Wraparound Catastrophe]
+PostgreSQL transaction IDs are 32-bit unsigned integers, providing $\approx 4.29$ billion transactions. Because transactions are compared cyclically modulo $2^{32}$, if a database runs for 2 billion transactions without freezing old tuples, past transactions will suddenly appear in the future, rendering past data invisible!
+
+Autovacuum prevents this by **freezing** old tuples (setting the \texttt{HEAP\_XMIN\_FROZEN} bit in \texttt{t\_infomask}), treating them as universally committed in the past. If autovacuum cannot keep up (due to long-running queries or lock contention), PostgreSQL will abruptly enter **read-only emergency shutdown** to prevent catastrophic data loss! Always tune:
+\begin{lstlisting}[language=sh]
+autovacuum_vacuum_cost_limit = 2000
+autovacuum_vacuum_scale_factor = 0.05
+\end{lstlisting}
+\end{productionwarningbox}
+
+% ==========================================
+\section{Buffer Management and Write-Ahead Logging (WAL)}
+
+PostgreSQL cannot afford to flush dirty 8KB pages to disk on every \texttt{COMMIT}, as random disk I/O would bring transactions per second to a standstill.
+
+\subsection{The Shared Buffers Cache Pool and Clock Sweep}
+
+PostgreSQL allocates a dedicated shared memory segment called **Shared Buffers** (configured via \texttt{shared\_buffers}, typically 25\% of system RAM).
+
+When a page is required by a query:
+\begin{enumerate}[leftmargin=15pt]
+  \item The engine checks the buffer pool hash table.
+  \item If present (\textbf{Buffer Hit}), the page is pinned and read directly from RAM.
+  \item If missing (\textbf{Buffer Read}), the engine reads the page from the OS page cache or disk into a buffer frame.
+\end{enumerate}
+
+\subsubsection{The Clock Sweep Eviction Algorithm}
+When the buffer pool is full, the engine executes a Clock Sweep algorithm:
+\begin{itemize}[leftmargin=15pt]
+  \item A sweep hand iterates through buffer headers arranged in a ring.
+  \item Each buffer holds a usage counter (0 to 5).
+  \item If usage counter $> 0$, the hand decrements it and advances.
+  \item If usage counter $= 0$ and the buffer is unpinned, that frame is selected for replacement. If the page is dirty, it is flushed to disk before eviction.
+\end{itemize}
+
+\subsection{Write-Ahead Logging (WAL) and ARIES Recovery}
+
+Durability is guaranteed by the **Write-Ahead Logging (WAL)** principle:
+$$\text{\textit{No dirty data page may be written to disk before the WAL record describing the change has been flushed!}}$$
+
+WAL records represent an append-only, sequential byte stream of byte-level diffs. Sequential writes to the WAL are orders of magnitude faster than random 8KB page writes.
+
+\subsubsection{The Checkpoint Process}
+Periodically, a background **Checkpointer** process executes:
+\begin{enumerate}[leftmargin=15pt]
+  \item Records a \texttt{CHECKPOINT} record in the WAL stream.
+  \item Flushes all dirty buffer pool pages to disk.
+  \item Issues an \texttt{fsync()} system call to force physical storage controller writes.
+\end{enumerate}
+In the event of a power failure, PostgreSQL crash recovery begins at the last completed checkpoint and replays subsequent WAL records using the **ARIES (Algorithms for Recovery and Isolation Exploiting Semantics)** algorithm: Analysis pass $\rightarrow$ Redo pass $\rightarrow$ Undo pass.
+
+% ==========================================
+\section{B-Tree Index Internals and Access Methods}
+
+Indexes are physical data structures that accelerate row retrieval without scanning entire heap tables. The default and most powerful index in PostgreSQL is the **Lehman and Yao B-Tree**.
+
+\subsection{B-Tree Page Hierarchy: Metapage, Branches, and Leaves}
+
+A B-Tree index is organized as a balanced tree of 8KB index pages:
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{Metapage:} Block 0, storing the index version, root page block number, and tree depth.
+  \item \textbf{Internal (Branch) Pages:} Store keys paired with downlinks (block pointers) to child pages. Each internal page stores a **High Key**, defining the upper bound of keys in that subtree.
+  \item \textbf{Leaf Pages:} Form a doubly linked list (with left and right sibling pointers). Leaf pages store the actual indexed value paired with the target heap \textbf{TID (Block, Offset)}.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.9, transform shape,
+  node distance=0.8cm and 1.2cm,
+  node/.style={rectangle, draw=headingblue, fill=codebg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily},
+  leaf/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily\bfseries},
+  line/.style={draw=headingblue, -{Stealth[length=2.5mm]}, thick}
+]
+  \node[node] (root) {\textbf{Root Page (Block 3)}\\\small Keys: [50, 100]};
+  \node[node, below=1.0cm of root, xshift=-3.5cm] (b1) {\textbf{Branch Page}\\\small Keys: [10, 30]};
+  \node[node, below=1.0cm of root, xshift=3.5cm] (b2) {\textbf{Branch Page}\\\small Keys: [60, 80]};
+  
+  \node[leaf, below=1.0cm of b1, xshift=-1.5cm] (l1) {Leaf: [1..9]\\TIDs};
+  \node[leaf, below=1.0cm of b1, xshift=1.5cm] (l2) {Leaf: [10..29]\\TIDs};
+  \node[leaf, below=1.0cm of b2, xshift=-1.5cm] (l3) {Leaf: [50..59]\\TIDs};
+  \node[leaf, below=1.0cm of b2, xshift=1.5cm] (l4) {Leaf: [100..]\\TIDs};
+
+  \draw[line] (root) -- (b1);
+  \draw[line] (root) -- (b2);
+  \draw[line] (b1) -- (l1);
+  \draw[line] (b1) -- (l2);
+  \draw[line] (b2) -- (l3);
+  \draw[line] (b2) -- (l4);
+
+  \draw[line, <->, intuitionTeal] (l1) -- (l2);
+  \draw[line, <->, intuitionTeal] (l2) -- (l3);
+  \draw[line, <->, intuitionTeal] (l3) -- (l4);
+\end{tikzpicture}
+\caption{B-Tree page hierarchy and leaf-level sibling pointers enabling range scans.}
+\label{fig:btree-arch}
+\end{figure}
+
+\subsection{Index Access Methods: Scan Types Compared}
+
+When executing a query, the cost-based optimizer chooses between four access strategies:
+
+\begin{table}[htbp]
+\centering
+\small\sffamily
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Scan Method} & \textbf{Operational Mechanics} & \textbf{Optimal Query Scenario} \\ \midrule
+\textbf{Sequential Scan} & Reads every 8KB heap block linearly from start to end. & Retrieving $> 15\%$ of total table rows. \\
+\textbf{Index Scan} & Traverses B-Tree, fetches matching TID, jumps to heap. & Point queries (\texttt{id = 42}) or tight ranges. \\
+\textbf{Bitmap Index Scan} & Reads index, creates in-memory TID bitmap, sorts by block. & Moderate selectivity ranges ($2\% - 10\%$). \\
+\textbf{Index Only Scan} & Reads index only; verifies visibility via Visibility Map. & Queries where all columns reside in index. \\ \bottomrule
+\end{tabular}
+\caption{Comparison of PostgreSQL table access methods.}
+\label{tab:scans}
+\end{table}
+
+\begin{underthehoodbox}[Why Bitmap Index Scans Prevent Random I/O Trashing]
+An Index Scan fetches matching TIDs in index order (sorted by key value). If rows were inserted over many months, adjacent index keys may reside in completely random physical disk blocks. A naive Index Scan forces the disk head to seek back and forth across gigabytes of storage. 
+
+A **Bitmap Index Scan** reads the index, builds a bitmap where bit $(B, O)$ represents block $B$ offset $O$, and then reads the heap table in **strictly ascending physical block order**, transforming random I/O into sequential disk reads!
+\end{underthehoodbox}
+
+% ==========================================
+\section{Query Plan Disassembly: \texttt{EXPLAIN (ANALYZE, BUFFERS)}}
+
+Optimizing database performance requires reading execution plans generated by the PostgreSQL query planner.
+
+\subsection{Anatomy of an Execution Plan}
+
+\begin{lstlisting}[language=SQL,caption={Analyzing a Query Execution Plan with Buffer Profiling}]
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE)
+SELECT u.name, COUNT(o.id)
+FROM users u
+JOIN orders o ON o.user_id = u.id
+WHERE o.created_at >= '2026-01-01'
+GROUP BY u.name;
+\end{lstlisting}
+
+Output:
+\begin{lstlisting}[language=sh]
+HashAggregate (cost=1450.20..1520.40 rows=7020 width=40) (actual time=12.450..14.120 rows=6850 loops=1)
+  Group Key: u.name
+  Buffers: shared hit=420 read=15
+  -> Hash Join (cost=210.00..1380.00 rows=14040 width=36) (actual time=2.100..9.500 rows=14200 loops=1)
+       Hash Cond: (o.user_id = u.id)
+       Buffers: shared hit=380 read=12
+       -> Seq Scan on orders o (cost=0.00..1020.00 rows=14040 width=8) (actual time=0.040..4.100 rows=14200 loops=1)
+            Filter: (created_at >= '2026-01-01'::timestamp)
+            Buffers: shared hit=290 read=10
+       -> Hash (cost=120.00..120.00 rows=7200 width=36) (actual time=1.950..1.950 rows=7200 loops=1)
+            Buckets: 8192 Batches: 1 Memory Usage: 480kB
+            Buffers: shared hit=90 read=2
+            -> Seq Scan on users u (cost=0.00..120.00 rows=7200 width=36) (actual time=0.020..1.100 rows=7200 loops=1)
+                 Buffers: shared hit=90 read=2
+Planning Time: 0.280 ms
+Execution Time: 15.200 ms
+\end{lstlisting}
+
+\subsubsection{Key Metrics to Scrutinize}
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Estimated Cost (\texttt{cost=1450.20..1520.40}):} Expressed in arbitrary units where 1.0 equals the cost of reading one sequential 8KB page (\texttt{seq\_page\_cost}). The first number is the startup cost; the second is total completion cost.
+  \item \textbf{Actual Rows vs. Estimated Rows:} If the planner estimated 10 rows but actual was 1,000,000 rows, table statistics are stale! Run \texttt{ANALYZE table\_name;}.
+  \item \textbf{Buffers (\texttt{hit=420 read=15}):}
+  \begin{itemize}
+    \item \texttt{hit}: 8KB blocks retrieved directly from PostgreSQL \texttt{shared\_buffers} RAM.
+    \item \texttt{read}: Blocks read from OS filesystem cache or physical disk. High read values indicate I/O bottlenecks.
+    \item \texttt{dirtied}: Blocks modified during the query.
+  \end{itemize}
+\end{enumerate}
+
+\subsection{Join Algorithms: Nested Loop, Hash Join, Merge Join}
+
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{Nested Loop Join:} For each row in outer table, scans inner table. Excellent when outer table is small and inner table has a matching B-Tree index.
+  \item \textbf{Hash Join:} Builds an in-memory hash table of the inner table, then scans the outer table probing the hash table. Requires sufficient \texttt{work\_mem}; spills to disk batches if memory is exceeded.
+  \item \textbf{Merge Join:} Both inputs must be pre-sorted on the join key. Merges two streams in $O(M + N)$ time. Highly efficient for large, sorted datasets.
+\end{itemize}
+
+% ==========================================
+\section{MVCC, Isolation Levels, and Concurrency Control}
+
+Multi-Version Concurrency Control (MVCC) ensures that **readers never block writers, and writers never block readers**.
+
+\subsection{The Four SQL Isolation Levels}
+
+\begin{table}[htbp]
+\centering
+\small\sffamily
+\begin{tabular}{@{}lllll@{}}
+\toprule
+\textbf{Isolation Level} & \textbf{Dirty Read} & \textbf{Non-Repeatable Read} & \textbf{Phantom Read} & \textbf{Write Skew} \\ \midrule
+\textbf{Read Committed} (Default) & Prevented & Allowed & Allowed & Allowed \\
+\textbf{Repeatable Read} & Prevented & Prevented & Prevented & Allowed \\
+\textbf{Serializable} (SSI) & Prevented & Prevented & Prevented & Prevented \\ \bottomrule
+\end{tabular}
+\caption{PostgreSQL transaction isolation levels and concurrency anomaly prevention.}
+\label{tab:isolation}
+\end{table}
+
+\begin{intuitionbox}[Understanding Write Skew]
+Consider two doctors on call. System constraint: At least one doctor must be on call at all times. 
+\begin{enumerate}
+  \item Doctor A runs: \texttt{SELECT count(*) FROM on\_call;} (returns 2).
+  \item Doctor B runs: \texttt{SELECT count(*) FROM on\_call;} (returns 2).
+  \item Doctor A updates: \texttt{UPDATE on\_call SET active=false WHERE id=1; COMMIT;}
+  \item Doctor B updates: \texttt{UPDATE on\_call SET active=false WHERE id=2; COMMIT;}
+\end{enumerate}
+Under Repeatable Read, **both transactions commit successfully**, leaving zero doctors on call! This is **Write Skew**. Only **Serializable** (or explicit locking) prevents it.
+\end{intuitionbox}
+
+\subsection{Row-Level Locking: \texttt{SELECT FOR UPDATE SKIP LOCKED}}
+
+When building distributed task queues or inventory reservation systems, multiple workers race to claim pending records:
+
+\begin{lstlisting}[language=SQL,caption={High-Throughput Queue Processing with \texttt{SKIP LOCKED}}]
+-- Transaction in Worker 1
+BEGIN;
+SELECT id, payload
+FROM job_queue
+WHERE status = 'PENDING'
+ORDER BY priority DESC, id ASC
+LIMIT 10
+FOR UPDATE SKIP LOCKED;
+
+-- Worker processes jobs and marks complete
+UPDATE job_queue SET status = 'COMPLETED' WHERE id IN (...);
+COMMIT;
+\end{lstlisting}
+
+\begin{underthehoodbox}[Why \texttt{SKIP LOCKED} Revolutionized Database Queues]
+Without \texttt{SKIP LOCKED}, using \texttt{FOR UPDATE} causes Worker 2 to freeze, waiting for Worker 1 to release its row lock. With 50 concurrent workers, all workers serialize behind a single database lock. 
+
+\texttt{SKIP LOCKED} instructs the database engine: If a row is locked by another transaction, **do not wait—skip it immediately and return the next free row!** All 50 workers run concurrently at maximum speed with zero lock contention!
+\end{underthehoodbox}
+
+% ==========================================
+\section{ORM Design: Active Record vs. Data Mapper and the N+1 Problem}
+
+Application persistence layers are broadly structured around two foundational Martin Fowler patterns.
+
+\subsection{Active Record vs. Data Mapper Architectural Comparison}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.9, transform shape,
+  node distance=0.8cm and 1.5cm,
+  box/.style={rectangle, draw=headingblue, fill=codebg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily},
+  accent/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, thick, align=center, inner sep=6pt, font=\small\sffamily\bfseries},
+  line/.style={draw=headingblue, -{Stealth[length=2.5mm]}, thick}
+]
+  % Active Record
+  \node[accent, minimum width=5cm] (ar) {\textbf{Active Record (Eloquent, Rails)}\\Entity encapsulates data + DB queries};
+  \node[box, below=0.4cm of ar, minimum width=5cm] (ardb) {Database Table \texttt{users}};
+  \draw[line, <->] (ar) -- node[right, font=\tiny\sffamily] {\texttt{\$user->save()}} (ardb);
+
+  % Data Mapper
+  \node[accent, right=2.0cm of ar, minimum width=5cm] (dm_ent) {\textbf{Domain Entity (Doctrine, Hibernate)}\\Pure POPO/POCO (Zero DB awareness)};
+  \node[box, below=0.4cm of dm_ent, minimum width=5cm] (dm_map) {\textbf{Data Mapper (EntityManager / Unit of Work)}\\Transforms domain objects to SQL};
+  \node[box, below=0.4cm of dm_map, minimum width=5cm] (dm_db) {Database Table \texttt{users}};
+
+  \draw[line] (dm_ent) -- node[right, font=\tiny\sffamily] {Handed to} (dm_map);
+  \draw[line, <->] (dm_map) -- node[right, font=\tiny\sffamily] {SQL Statements} (dm_db);
+\end{tikzpicture}
+\caption{Architectural topology: Active Record (coupled) vs Data Mapper (decoupled).}
+\label{fig:orm-patterns}
+\end{figure}
+
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{Active Record (e.g., Laravel Eloquent, Django ORM):} The model class represents both the in-memory domain entity and the database row. It exposes methods like \texttt{\$user->save()} and \texttt{User::where(...)}. Highly productive for CRUD apps; tightly couples business domain models to database schema.
+  \item \textbf{Data Mapper (e.g., Doctrine ORM, SQLAlchemy DataMapper):} Pure separation of concerns. Entities are Plain Old PHP/Python Objects with no database dependencies. An external \textbf{EntityManager} and \textbf{Unit of Work} track changes and orchestrate SQL queries. Superior for complex Domain-Driven Design (DDD) enterprise architectures.
+\end{itemize}
+
+\subsection{The N+1 Query Problem and Modern Mitigation}
+
+The N+1 problem occurs when an ORM naively executes 1 query to fetch $N$ parent records, followed by $N$ individual queries inside a loop to fetch each parent's children:
+
+\begin{lstlisting}[language=PHP,caption={The Fatal N+1 Anti-Pattern}]
+// 1 Query: SELECT * FROM orders LIMIT 100;
+$orders = Order::limit(100)->get();
+
+foreach ($orders as $order) {
+    // Executes 100 additional queries! (101 total DB roundtrips)
+    echo $order->customer->name; 
+}
+\end{lstlisting}
+
+\subsubsection{Mitigation: Eager Loading via \texttt{JOIN} vs \texttt{WHERE IN}}
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Eager Loading via \texttt{WHERE IN} (2 Queries):}
+  \begin{lstlisting}[language=SQL]
+  -- Query 1
+  SELECT * FROM orders LIMIT 100;
+  -- Query 2 (Batch fetch all customers in 1 roundtrip)
+  SELECT * FROM customers WHERE id IN (1, 4, 12, 19, ...);
+  \end{lstlisting}
+  The ORM in memory associates each customer with their respective order in $O(N)$ time.
+  \item \textbf{Dataloader Pattern:} In GraphQL and microservice APIs, DataLoader batches requests across tick cycles, collecting unique IDs into a single batch query.
+\end{enumerate}
+
+% ==========================================
+\section{Chapter Summary \& Key Takeaways}
+
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{PostgreSQL Heap Layout:} Data resides in 8KB pages. Line pointers grow down; tuples grow up. Rows are physically addressed by Tuple Identifiers: $\text{TID} = (\text{block}, \text{offset})$.
+  \item \textbf{MVCC and Dead Tuples:} Updates create new tuple versions rather than overwriting. Autovacuum reclaims dead tuple space and freezes transaction IDs to avert catastrophic 32-bit integer wraparound.
+  \item \textbf{Buffer Pool \& WAL:} Changes are written sequentially to the WAL before dirty pages are flushed to disk. ARIES recovery reconstructs state following power failure.
+  \item \textbf{B-Tree Access Methods:} Index Scans fetch TIDs individually. Bitmap Index Scans assemble an in-memory page map, reading heap blocks in physical disk order to eliminate random I/O thrashing.
+  \item \textbf{Execution Plan Profiling:} Always analyze plans with \texttt{EXPLAIN (ANALYZE, BUFFERS)}. Monitor shared buffer hits and compare estimated rows against actual rows to detect stale statistics.
+  \item \textbf{High-Concurrency Task Queues:} Use \texttt{SELECT FOR UPDATE SKIP LOCKED} to allow hundreds of parallel workers to claim jobs simultaneously with zero lock-wait serialization.
+  \item \textbf{Active Record vs Data Mapper:} Active Record couples entities directly to SQL tables; Data Mapper isolates business domain entities from database persistence using the Unit of Work pattern.
+\end{itemize}
+
+% ==========================================
+\section{Exercises and Real-World Scenarios}
+
+\subsection{Mechanics Exercises}
+\begin{enumerate}
+  \item \textbf{Exercise 4.1:} Calculate the physical byte storage requirements of an uncompressed table containing 1,000,000 rows where each row contains an integer ID, an 8-byte timestamp, a 32-byte string, and a nullable boolean, taking into account page headers, line pointers, tuple headers, and 8-byte alignment padding.
+  \item \textbf{Exercise 4.2:} Explain the exact difference between an Index Scan and an Index Only Scan in PostgreSQL. Under what precise condition will an Index Only Scan be forced to read the underlying heap page?
+\end{enumerate}
+
+\subsection{Debugging Exercises}
+\begin{enumerate}
+  \item \textbf{Exercise 4.3:} A production database server experiences 100\% CPU utilization on a single query:
+\begin{lstlisting}[language=SQL]
+SELECT * FROM audit_logs WHERE metadata->>'tenant_id' = 'acme_corp';
+\end{lstlisting}
+The table contains 50,000,000 rows. The engineer created an index using:
+\begin{lstlisting}[language=SQL]
+CREATE INDEX idx_audit_logs_metadata ON audit_logs (metadata);
+\end{lstlisting}
+Explain why PostgreSQL refuses to use the index and executes a full sequential table scan, and provide the exact DDL to correct the problem.
+\end{enumerate}
+
+\subsection{Architecture Design Problem}
+\begin{enumerate}
+  \item \textbf{Exercise 4.4:} Architect an inventory reservation system in PostgreSQL that allows 5,000 concurrent shopping carts to reserve limited flash-sale inventory (e.g., 500 units of a gaming console). Provide the complete SQL schema, isolation level specification, and reservation transaction queries guaranteeing zero overselling, zero deadlocks, and sub-10ms response times.
+\end{enumerate}
+
+% ==========================================
+\section{Detailed Solutions}
+
+\subsection{Solution 4.1: Row and Heap Storage Calculation}
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Per-Tuple Overhead:}
+  \begin{itemize}
+    \item \texttt{ItemIdData} line pointer: 4 bytes.
+    \item \texttt{HeapTupleHeaderData}: 23 bytes $\rightarrow$ aligned to 24 bytes.
+    \item Columns: \texttt{int} (4 bytes), \texttt{timestamp} (8 bytes), \texttt{varchar(32)} (33 bytes), \texttt{bool} (1 byte).
+    \item User data with alignment padding: $\approx 48$ bytes.
+    \item Total tuple size on page: $24 + 48 = 72$ bytes.
+    \item Including line pointer: $72 + 4 = 76$ bytes per row.
+  \end{itemize}
+  \item \textbf{Page Capacity:}
+  \begin{itemize}
+    \item Usable space per 8KB page: $8192 - 24 \text{ (PageHeader)} = 8168$ bytes.
+    \item Tuples per page: $\lfloor 8168 / 76 \rfloor = 107$ tuples/page.
+  \end{itemize}
+  \item \textbf{Total Size:}
+  \begin{itemize}
+    \item Total pages required: $\lceil 1,000,000 / 107 \rceil \approx 9,346$ pages.
+    \item Total storage: $9,346 \times 8\text{KB} \approx \mathbf{74.77\text{ MB}}$ (excluding indexes and FSM).
+  \end{itemize}
+\end{enumerate}
+
+\subsection{Solution 4.2: Index Only Scan and Visibility Map}
+An **Index Scan** traverses the B-Tree to find matching keys and immediately reads the physical heap page for each matching TID to fetch requested columns and verify transaction visibility. 
+
+An **Index Only Scan** retrieves all requested columns directly from the B-Tree leaf pages without touching the heap table. However, because B-Trees do not store \texttt{xmin} and \texttt{xmax} transaction IDs, the engine consults the **Visibility Map (VM)**. If the VM bit for that heap page is 1 (all tuples on the page are visible to all active transactions), the heap read is skipped entirely. If the VM bit is 0, the engine is forced to read the underlying heap page to verify MVCC visibility!
+
+\subsection{Solution 4.3: Debugging JSONB Index Scans}
+\textbf{Diagnosis:} The index \texttt{idx\_audit\_logs\_metadata} was created on the entire \texttt{metadata} column using a default B-Tree. The query filters using the JSON operator \texttt{metadata->>'tenant\_id'}. B-Trees cannot match expressions unless an **Expression Index** is defined, or a **GIN (Generalized Inverted Index)** is utilized with the JSON containment operator (\texttt{@>}).
+
+\textbf{Correction:}
+\begin{lstlisting}[language=SQL]
+-- Solution A: Dedicated Expression Index (Fastest for single key)
+CREATE INDEX idx_audit_logs_tenant 
+ON audit_logs ((metadata->>'tenant_id'));
+
+-- Solution B: GIN Index (Supports arbitrary JSON queries)
+CREATE INDEX idx_audit_logs_metadata_gin 
+ON audit_logs USING GIN (metadata jsonb_path_ops);
+-- Query with containment operator:
+-- WHERE metadata @> '{"tenant_id": "acme_corp"}'
+\end{lstlisting}
+
+\subsection{Solution 4.4: Flash-Sale Inventory Reservation Schema}
+\begin{lstlisting}[language=SQL]
+CREATE TABLE inventory_items (
+    sku VARCHAR(64) PRIMARY KEY,
+    total_stock INT NOT NULL CHECK (total_stock >= 0),
+    reserved_stock INT NOT NULL DEFAULT 0 CHECK (reserved_stock <= total_stock)
+);
+
+-- Reservation Transaction (Run in default READ COMMITTED)
+BEGIN;
+UPDATE inventory_items
+SET reserved_stock = reserved_stock + 1
+WHERE sku = 'CONSOLE-PS5'
+  AND (total_stock - reserved_stock) >= 1;
+
+-- Check affected rows
+-- If rows_affected == 1: Stock reserved! Insert reservation record & COMMIT.
+-- If rows_affected == 0: Sold out! ROLLBACK and return HTTP 409 Conflict.
+COMMIT;
+\end{lstlisting}
+This single atomic \texttt{UPDATE} statement leverages PostgreSQL row locks on the primary key, eliminating race conditions without distributed lock overhead.
+
+% ==========================================
+\section{Further Reading \& Citations}
+
+\begin{itemize}[leftmargin=15pt]
+  \item Stonebraker, M., \& Rowe, L. A. (1986). \textit{The Design of POSTGRES}. ACM SIGMOD.
+  \item Mohan, C., et al. (1992). \textit{ARIES: A Transaction Recovery Method Supporting Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging}. ACM TODS.
+  \item Lehman, P. L., \& Yao, S. B. (1981). \textit{Efficient Locking for Concurrent Operations on B-Trees}. ACM TODS.
+  \item Fowler, M. (2002). \textit{Patterns of Enterprise Application Architecture}. Addison-Wesley.
+  \item PostgreSQL Global Development Group. (2024). \textit{PostgreSQL 16 Documentation: Internals \& Storage}. \url{https://www.postgresql.org/docs/current/internals.html}
+\end{itemize}

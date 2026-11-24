@@ -1,0 +1,355 @@
+\chapter{Sagas, CQRS, and Event Sourcing}
+\label{ch:sagas-cqrs-eventsourcing}
+
+\begin{chaptergoalsbox}
+\textbf{What you will learn:}
+\begin{itemize}[leftmargin=12pt]
+  \item The Dual-Write Problem: why updating a database and publishing an event to a message broker in separate steps guarantees state corruption.
+  \item The Transactional Outbox Pattern: achieving guaranteed message delivery using local ACID transactions and Change Data Capture (CDC via Debezium).
+  \item The Saga Pattern: managing long-running distributed business transactions via local transactions and compensating actions.
+  \item Saga Topologies: Orchestrated Sagas (centralized state machines) vs. Choreographed Sagas (decentralized event gossip).
+  \item Command Query Responsibility Segregation (CQRS): separating write models (aggregates) from read models (denormalized query projections).
+  \item Event Sourcing: modeling application state as an append-only stream of immutable domain events, snapshotting, and projection rebuilds.
+\end{itemize}
+
+\textbf{What you should already understand:}
+\begin{itemize}[leftmargin=12pt]
+  \item Database write-ahead logging (WAL) and local ACID transaction semantics.
+  \item Messaging brokers (Kafka/RabbitMQ) and at-least-once delivery from Chapter~\ref{ch:messaging-systems} and Chapter~\ref{ch:kafka-rabbitmq}.
+\end{itemize}
+
+\textbf{Why this topic exists:}
+Because Two-Phase Commit (2PC) is slow, blocking, and unsupported across polyglot microservice boundaries, distributed architectures must embrace eventual consistency. Sagas, CQRS, and Event Sourcing provide mathematically sound patterns to coordinate business state across independent microservices.
+
+\textbf{Motivating practical problem:}
+An e-commerce order service executes: \texttt{db.saveOrder()} followed by \texttt{kafka.send("order\_created")}. After saving the order to PostgreSQL, the pod is killed by Kubernetes due to a memory limit. The order is stored in the database, but the event is never published. The payment service and warehouse packing service never receive the notification; the customer is never charged, the order is never shipped, and the system enters an undetectable ghost state.
+\end{chaptergoalsbox}
+
+\section{The Dual-Write Problem}
+
+In a microservices architecture, operations frequently require updating an internal database and publishing an event to an external broker:
+
+\begin{lstlisting}[language=Python, caption={The Flawed Dual-Write Anti-Pattern}]
+def create_order(order_data):
+    # Step 1: Write to local relational database
+    db.orders.insert(order_data)
+
+    # Step 2: Publish event to Kafka
+    kafka_producer.send("order_events", order_data)
+\end{lstlisting}
+
+\begin{productionwarningbox}[The Inescapable Dual-Write Failure States]
+No matter which order you arrange Step 1 and Step 2, failure is guaranteed:
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{DB First, then Kafka}: If the application server crashes, network partitions hit Kafka, or the JVM pauses between Step 1 and Step 2, the DB transaction commits but the event is never dispatched. The rest of the distributed system is unaware the order exists.
+  \item \textbf{Kafka First, then DB}: If the Kafka send succeeds, but the database insertion fails due to a unique key collision or disk full error, consumers begin fulfilling an order that does not exist in the database.
+\end{itemize}
+Because the database and the Kafka broker are separate distributed systems that do not share an atomic commit protocol, executing dual writes directly in application code violates Atomicity.
+\end{productionwarningbox}
+
+\section{The Transactional Outbox Pattern and CDC}
+
+The \textbf{Transactional Outbox Pattern} solves the dual-write problem by leveraging the database's local ACID transaction guarantee.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.85,
+  box/.style={rectangle, draw=headingblue, fill=codebg, thick, rounded corners=2pt, minimum width=2.4cm, minimum height=1.0cm, align=center, font=\sffamily\footnotesize},
+  db/.style={cylinder, draw=exampleBlue, fill=exampleBg, thick, shape border rotate=90, minimum width=2.8cm, minimum height=1.8cm, align=center, font=\sffamily\footnotesize}
+]
+  \node[box] (app) at (0, 0) {\textbf{Order Service}\\Application Code};
+  \node[db] (db) at (5, 0) {\textbf{PostgreSQL}\\\texttt{orders}\\+ \texttt{outbox} table};
+  \node[box, fill=intuitionBg] (cdc) at (9.5, 0) {\textbf{Debezium / CDC}\\Tail PostgreSQL WAL};
+  \node[box, fill=tryBg] (kafka) at (13.5, 0) {\textbf{Kafka Cluster}\\Topic: \texttt{orders}};
+
+  \draw[-{Stealth[scale=1.0]}, thick, color=exampleBlue] (app) -- node[above, font=\sffamily\tiny] {1. Atomic Local Tx} node[below, font=\sffamily\tiny] {(Order + Outbox)} (db);
+  \draw[-{Stealth[scale=1.0]}, thick, color=intuitionTeal] (db) -- node[above, font=\sffamily\tiny] {2. Read WAL} (cdc);
+  \draw[-{Stealth[scale=1.0]}, thick, color=tryViolet] (cdc) -- node[above, font=\sffamily\tiny] {3. Publish Event} (kafka);
+\end{tikzpicture}
+\caption{The Transactional Outbox Pattern with Change Data Capture (Debezium)}
+\label{fig:outbox-pattern}
+\end{figure}
+
+\subsection{Implementation Mechanics}
+
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{The Outbox Table}: A dedicated table is added to the application database:
+  \begin{lstlisting}[language=SQL]
+  CREATE TABLE outbox_events (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      aggregate_type VARCHAR(64) NOT NULL,
+      aggregate_id VARCHAR(64) NOT NULL,
+      event_type VARCHAR(64) NOT NULL,
+      payload JSONB NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+  \end{lstlisting}
+  \item \textbf{Atomic Local Write}: When an order is created, the service inserts both the business entity into \texttt{orders} and the event record into \texttt{outbox\_events} within the \textbf{same single database transaction}:
+  \begin{lstlisting}[language=SQL]
+  BEGIN;
+  INSERT INTO orders (id, customer_id, total) VALUES ('ord_1', 'cust_9', 99.00);
+  INSERT INTO outbox_events (aggregate_type, aggregate_id, event_type, payload)
+  VALUES ('Order', 'ord_1', 'OrderCreated', '{"total": 99.00}');
+  COMMIT;
+  \end{lstlisting}
+  \item \textbf{Asynchronous Relay}: A relay process reads records from \texttt{outbox\_events} and publishes them to Kafka.
+  \begin{itemize}[leftmargin=12pt]
+    \item \textbf{Polling Publisher}: A background worker runs \texttt{SELECT ... FOR UPDATE SKIP LOCKED} every $500\text{ ms}$, publishes to Kafka, and deletes the processed rows. (High polling overhead).
+    \item \textbf{Change Data Capture (CDC via Debezium)}: Debezium connects directly to the PostgreSQL logical replication stream (reading the binary Write-Ahead Log). As soon as the transaction commits to disk, Debezium streams the outbox insert straight into Kafka with sub-millisecond latency and zero polling CPU load.
+  \end{itemize}
+\end{enumerate}
+
+\section{The Saga Pattern}
+
+In 1987, Hector Garcia-Molina and Kenneth Salem formulated the \textbf{Saga Pattern}. A Saga is an architectural mechanism to execute long-running transactions across multiple independent databases without distributed locks.
+
+A Saga breaks a distributed transaction into a sequence of $N$ local transactions: $T_1, T_2, \dots, T_n$. Each local transaction $T_i$ updates state within a single service and commits. If any transaction $T_k$ fails (e.g., credit check fails or out of stock), the saga executes a series of \textbf{Compensating Transactions} $C_{k-1}, \dots, C_1$ in reverse order to undo the changes made by preceding steps.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.85,
+  tx/.style={rectangle, draw=headingblue, fill=codebg, thick, rounded corners=2pt, minimum width=2.4cm, minimum height=1.0cm, align=center, font=\sffamily\footnotesize},
+  comp/.style={rectangle, draw=warningRed, fill=warningBg, thick, rounded corners=2pt, minimum width=2.4cm, minimum height=1.0cm, align=center, font=\sffamily\footnotesize}
+]
+  \node[tx, fill=intuitionBg] (t1) at (0, 1.5) {$T_1$: Create Order\\(Pending)};
+  \node[tx, fill=intuitionBg] (t2) at (4.5, 1.5) {$T_2$: Reserve Stock\\(Warehouse)};
+  \node[tx, fill=mistakeBg] (t3) at (9, 1.5) {$T_3$: Charge Card\\(FAILED!)};
+
+  \node[comp] (c2) at (4.5, -1.0) {$C_2$: Release Stock\\(Warehouse)};
+  \node[comp] (c1) at (0, -1.0) {$C_1$: Cancel Order\\(Status: Canceled)};
+
+  \draw[-{Stealth[scale=1.0]}, thick, color=intuitionTeal] (t1) -- node[above, font=\sffamily\tiny] {Success} (t2);
+  \draw[-{Stealth[scale=1.0]}, thick, color=warningRed] (t2) -- node[above, font=\sffamily\tiny] {Failure} (t3);
+
+  \draw[-{Stealth[scale=1.0]}, thick, color=warningRed] (t3) |- node[below, font=\sffamily\tiny] {Trigger Compensation} (c2);
+  \draw[-{Stealth[scale=1.0]}, thick, color=warningRed] (c2) -- node[below, font=\sffamily\tiny] {Compensate $T_1$} (c1);
+\end{tikzpicture}
+\caption{Saga Execution Flow with Reverse Compensating Transactions}
+\label{fig:saga-flow}
+\end{figure}
+
+\begin{intuitionbox}[Semantic Compensation vs. Physical Rollback]
+A database rollback physically restores bits on disk to their pre-transaction values, as if the transaction never occurred. A Saga \textbf{cannot} physically roll back because previous local transactions have already committed and their changes were made visible to other users.
+A compensating transaction is a \textbf{semantic counter-action}:
+\begin{itemize}[leftmargin=12pt]
+  \item If $T_1$ credited \$100 to an account, $C_1$ debits \$100.
+  \item If $T_2$ reserved 3 seats on a flight, $C_2$ releases the 3 seats.
+  \item If $T_3$ sent an email confirmation, $C_3$ sends an apology email explaining the order cancellation.
+\end{itemize}
+\end{intuitionbox}
+
+\subsection{Orchestration vs. Choreography}
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lp{5.5cm}p{5.5cm}}
+\toprule
+\textbf{Dimension} & \textbf{Choreography (Decentralized)} & \textbf{Orchestration (Centralized)} \\
+\midrule
+\textbf{Coordination} & Services listen to events and autonomously decide when to execute local steps and publish next events. & A dedicated state machine (Orchestrator) sends explicit commands to services and tracks progress. \\
+\textbf{Coupling} & Low spatial coupling. Services do not know about each other. & Moderate coupling. Services must implement API/command contracts defined by the orchestrator. \\
+\textbf{Visibility} & Poor. Distributed state transitions are spread across multiple logs; difficult to determine where a saga stalled. & Excellent. The central orchestrator logs the complete execution graph, state history, and timeouts in one place. \\
+\textbf{Complexity} & High risk of circular event storms and cyclic dependencies as business flows scale beyond 4 steps. & Scales cleanly to dozens of steps. Built using tools like Temporal.io, AWS Step Functions, or Camunda. \\
+\bottomrule
+\end{tabular}
+\caption{Architectural Comparison: Choreographed vs. Orchestrated Sagas}
+\label{tab:saga-comparison}
+\end{table}
+
+\section{Command Query Responsibility Segregation (CQRS)}
+
+Traditional relational applications use a single data model for both reads and writes. As systems scale, this creates conflicting pressures: write operations require normalized 3NF schemas to prevent update anomalies and ensure lock efficiency, whereas complex UI queries require highly denormalized joins, full-text indexing, and aggregation.
+
+\textbf{CQRS} (formulated by Greg Young and Bertrand Meyer) separates the application into two distinct paths:
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Command Side (Write Model)}: Handles business validation, invariants, and transactional mutations. Optimized strictly for consistency and write throughput. Emits domain events.
+  \item \textbf{Query Side (Read Model)}: Consumes domain events and projects them into read-optimized data stores (e.g., Elasticsearch for search, Redis for caching, PostgreSQL denormalized views for dashboards). Completely read-only.
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.85,
+  box/.style={rectangle, draw=headingblue, fill=codebg, thick, rounded corners=2pt, minimum width=2.4cm, minimum height=1.0cm, align=center, font=\sffamily\footnotesize},
+  db/.style={cylinder, draw=exampleBlue, fill=exampleBg, thick, shape border rotate=90, minimum width=2.0cm, minimum height=1.4cm, align=center, font=\sffamily\footnotesize}
+]
+  \node[box] (client) at (0, 0) {Client / API};
+  \node[box, fill=exampleBg] (cmd) at (4, 1.5) {\textbf{Command Handler}\\Validates Invariants};
+  \node[db] (write_db) at (8, 1.5) {\textbf{Write DB}\\PostgreSQL};
+  \node[box, fill=intuitionBg] (bus) at (11.5, 0) {\textbf{Event Bus}\\Kafka};
+  \node[box, fill=tryBg] (proj) at (8, -1.5) {\textbf{Projector}\\Async Worker};
+  \node[db] (read_db) at (4, -1.5) {\textbf{Read DB}\\Elasticsearch};
+
+  \draw[-{Stealth[scale=1.0]}, thick, color=exampleBlue] (client) |- node[above, font=\sffamily\tiny] {1. Execute Command} (cmd);
+  \draw[-{Stealth[scale=1.0]}, thick] (cmd) -- node[above, font=\sffamily\tiny] {2. Persist} (write_db);
+  \draw[-{Stealth[scale=1.0]}, thick] (write_db) -| node[above, font=\sffamily\tiny] {3. Emit Event} (bus);
+  \draw[-{Stealth[scale=1.0]}, thick, color=tryViolet] (bus) |- node[below, font=\sffamily\tiny] {4. Consume} (proj);
+  \draw[-{Stealth[scale=1.0]}, thick, color=tryViolet] (proj) -- node[below, font=\sffamily\tiny] {5. Update View} (read_db);
+  \draw[-{Stealth[scale=1.0]}, thick, color=intuitionTeal] (client) |- node[below, font=\sffamily\tiny] {6. Fast Query} (read_db);
+\end{tikzpicture}
+\caption{CQRS Architectural Flow: Decoupled Write and Read Projections}
+\label{fig:cqrs-architecture}
+\end{figure}
+
+\section{Event Sourcing}
+
+In traditional state-oriented systems (CRUD), the database stores only the \textbf{current state} of an entity. When an address changes, an \texttt{UPDATE} statement overwrites the old address, destroying historical context.
+
+In \textbf{Event Sourcing}, application state is modeled as an append-only stream of immutable domain events. The database is called an \textbf{Event Store}.
+
+\subsection{State Reconstruction and Projections}
+
+Current state is never stored directly; it is calculated at runtime by \textbf{replaying} events from the beginning of time:
+\begin{equation}
+\text{State}_N = \text{FoldLeft}(\text{InitialState}, [E_1, E_2, \dots, E_N])
+\end{equation}
+
+\begin{lstlisting}[language=Python, caption={Event Sourcing Domain Aggregate in Python}]
+from typing import List
+
+class BankAccountAggregate:
+    def __init__(self, account_id: str):
+        self.account_id = account_id
+        self.balance = 0.0
+        self.is_closed = False
+        self.version = 0
+
+    def apply_event(self, event: dict):
+        """Mutates internal aggregate state deterministically."""
+        event_type = event["type"]
+        if event_type == "AccountOpened":
+            self.balance = event["initial_balance"]
+        elif event_type == "FundsDeposited":
+            self.balance += event["amount"]
+        elif event_type == "FundsWithdrawn":
+            self.balance -= event["amount"]
+        elif event_type == "AccountClosed":
+            self.is_closed = True
+        self.version = event["version"]
+
+    def replay_events(self, history: List[dict]):
+        for event in history:
+            self.apply_event(event)
+
+    # Command Handling with Invariant Validation
+    def withdraw(self, amount: float) -> dict:
+        if self.is_closed:
+            raise ValueError("Account is closed.")
+        if amount > self.balance:
+            raise ValueError("Insufficient funds.")
+
+        # Emits a new immutable event
+        return {
+            "type": "FundsWithdrawn",
+            "account_id": self.account_id,
+            "amount": amount,
+            "version": self.version + 1
+        }
+\end{lstlisting}
+
+\begin{underthehoodbox}[Snapshotting Performance Optimization]
+If an aggregate has 50,000 historical events, replaying the entire stream on every read operation would take hundreds of milliseconds.
+To optimize recovery, systems take periodic \textbf{Snapshots} (e.g., every 100 events). A snapshot serializes the exact state at version $K$. When loading, the engine loads Snapshot $K$ and only replays events from $K+1$ to $N$.
+\end{underthehoodbox}
+
+\section{Summary \& Key Takeaways}
+\begin{itemize}[leftmargin=18pt]
+  \item Dual-writes directly in application code violate distributed atomicity because partial failures leave databases and message brokers permanently desynchronized.
+  \item The Transactional Outbox pattern guarantees at-least-once message publication by writing domain state and outbox events within the same local ACID transaction, dispatched asynchronously via Change Data Capture (Debezium).
+  \item Sagas replace blocking 2PC transactions across microservices using a sequence of local transactions paired with reverse compensating actions.
+  \item Orchestrated sagas use centralized state machines (Temporal, Step Functions) to provide comprehensive observability and eliminate cyclic event deadlocks.
+  \item CQRS separates command write models from read-optimized query projections, decoupling transactional constraints from complex user queries.
+  \item Event Sourcing stores the sequence of immutable domain events as the authoritative system of record, deriving current state via deterministic replay and periodic snapshotting.
+\end{itemize}
+
+\section{Exercises}
+
+\subsection{Mechanics}
+Write an event sourcing stream for a customer shopping cart:
+\begin{enumerate}[leftmargin=18pt]
+  \item Emitting events: \texttt{CartCreated}, \texttt{ItemAdded(SKU123, qty=2)}, \texttt{ItemAdded(SKU456, qty=1)}, \texttt{ItemRemoved(SKU123, qty=1)}.
+  \item Demonstrate the mathematical fold function that derives the final shopping cart contents.
+\end{enumerate}
+
+\subsection{Debugging}
+A microservice architecture uses a choreographed saga for ride-sharing bookings. Service A publishes \texttt{RideRequested}; Service B listens and reserves a driver, publishing \texttt{DriverReserved}; Service C listens and attempts to charge the rider's credit card. If Service C fails, it publishes \texttt{PaymentFailed}.
+During testing, engineers observe that when a payment fails, Service B releases the driver, but Service A receives \texttt{DriverReleased} and incorrectly triggers another \texttt{RideRequested} event, entering an infinite loop. Explain how to break this cyclic dependency.
+
+\subsection{Architecture}
+Architect an event-sourced cryptocurrency exchange ledger. Detail:
+\begin{enumerate}[leftmargin=18pt]
+  \item The Event Store PostgreSQL schema supporting optimistic concurrency control (handling concurrent deposits/withdrawals).
+  \item The Kafka outbox pipeline streaming events to real-time CQRS projections (account balance cache in Redis, audit history in ClickHouse).
+\end{enumerate}
+
+\section{Detailed Solutions}
+
+\subsection{Solution to Mechanics Exercise}
+\begin{lstlisting}[language=Python]
+events = [
+    {"type": "CartCreated", "cart_id": "c1"},
+    {"type": "ItemAdded", "sku": "SKU123", "qty": 2},
+    {"type": "ItemAdded", "sku": "SKU456", "qty": 1},
+    {"type": "ItemRemoved", "sku": "SKU123", "qty": 1}
+]
+
+def reduce_cart(cart: dict, event: dict) -> dict:
+    etype = event["type"]
+    if etype == "ItemAdded":
+        sku, qty = event["sku"], event["qty"]
+        cart[sku] = cart.get(sku, 0) + qty
+    elif etype == "ItemRemoved":
+        sku, qty = event["sku"], event["qty"]
+        cart[sku] = max(0, cart.get(sku, 0) - qty)
+        if cart[sku] == 0:
+            del cart[sku]
+    return cart
+
+final_state = functools.reduce(reduce_cart, events, {})
+# Output: {'SKU123': 1, 'SKU456': 1}
+\end{lstlisting}
+
+\subsection{Solution to Debugging Exercise}
+\textbf{The Cyclic Event Storm Root Cause:}
+In choreographed sagas, services listen to generic domain events rather than targeted commands. When Service A treats \texttt{DriverReleased} as an indicator to retry a ride request, it conflates a normal compensation state with a new request.
+\textbf{Architectural Mitigations:}
+1. \textbf{Correlation \& Saga IDs}: Every saga must carry a unique \texttt{saga\_id}. Service A must check the saga's current lifecycle state. If \texttt{saga.status == CANCELED}, ignore downstream compensation events.
+2. \textbf{Explicit Event Semantics}: Differentiate between \emph{Domain Events} (\texttt{DriverWasReleased}) and \emph{Compensation Completed Events} (\texttt{RideBookingFailedAndCleanedUp}).
+3. \textbf{Migrate to Orchestration}: Replace decentralized choreography with a central orchestrator (like Temporal). The orchestrator explicitly commands: \texttt{ReleaseDriver(saga\_id)}, waits for acknowledgment, transitions the state to \texttt{FAILED}, and stops without firing cyclic events.
+
+\subsection{Solution to Architecture Exercise}
+\textbf{Event Store Schema with Optimistic Concurrency Control:}
+\begin{lstlisting}[language=SQL]
+CREATE TABLE event_store (
+    stream_id UUID NOT NULL,
+    version BIGINT NOT NULL,
+    event_type VARCHAR(64) NOT NULL,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (stream_id, version) -- Guarantees optimistic concurrency!
+);
+\end{lstlisting}
+When appending an event, the application specifies the expected previous version:
+\begin{lstlisting}[language=SQL]
+-- Append event for account_id with expected version 4
+INSERT INTO event_store (stream_id, version, event_type, payload)
+VALUES ('748e-acc', 5, 'FundsWithdrawn', '{"amount": 500.00}');
+\end{lstlisting}
+If two concurrent transactions attempt to append version 5, PostgreSQL's primary key constraint causes one to immediately fail with a unique violation, preventing double-spend race conditions.
+
+\textbf{Outbox \& CQRS Pipeline:}
+\begin{enumerate}[leftmargin=18pt]
+  \item Debezium tails \texttt{event\_store} WAL commits and writes events to Kafka topic \texttt{exchange.events} partitioned by \texttt{stream\_id}.
+  \item \textbf{Redis Projection Worker}: Reads stream sequentially, updating \texttt{HSET account:\{id\} balance \$new\_balance}.
+  \item \textbf{ClickHouse Projector}: Batches events into ClickHouse columnar storage for real-time compliance reporting.
+\end{enumerate}
+
+\section{Further Reading \& Citations}
+\begin{itemize}[leftmargin=18pt]
+  \item Garcia-Molina, H., \& Salem, K. (1987). \emph{Sagas}. ACM SIGMOD Record, 16(3), 249--259.
+  \item Young, G. (2010). \emph{CQRS Documents}. Available at \url{https://cqrs.files.wordpress.com/2010/11/cqrs_documents.pdf}.
+  \item Richardson, C. (2018). \emph{Microservices Patterns: With examples in Java}. Manning Publications.
+  \item Fowler, M. (2005). \emph{Event Sourcing}. Available at \url{https://martinfowler.com/eaaDev/EventSourcing.html}.
+\end{itemize}

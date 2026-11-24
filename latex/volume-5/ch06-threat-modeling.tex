@@ -1,0 +1,309 @@
+\chapter{Threat Modeling}
+\label{ch:threat-modeling}
+
+\begin{chaptergoalsbox}
+\textbf{What You Will Learn:}
+\begin{itemize}[leftmargin=12pt]
+  \item Master Adam Shostack's 4-Question Threat Modeling Framework to evaluate security architectures before writing code.
+  \item Construct formal security Data Flow Diagrams (DFDs) utilizing the four standard elements: External Entities, Processes, Data Stores, and Data Flows.
+  \item Draw and analyze **Trust Boundaries** to identify where privilege levels change and where strict input validation is mandatory.
+  \item Systematically apply the **STRIDE-per-Element matrix** (Spoofing, Tampering, Repudiation, Information Disclosure, Denial of Service, Elevation of Privilege).
+  \item Map identified threats to concrete cryptographic and architectural mitigations (mTLS, JWT signatures, HMAC, immutable audit logs, rate limiters, and RBAC).
+  \item Quantify exploitability and business risk using DREAD and CVSS scoring methodologies.
+\end{itemize}
+
+\textbf{What You Should Already Understand:}
+\begin{itemize}[leftmargin=12pt]
+  \item Basic networking protocols (TCP/IP, TLS handshakes, HTTP request headers).
+  \item Core cryptographic primitives (symmetric AES-GCM, asymmetric RSA/ECDSA, SHA-256 hashing).
+  \item Identity, authentication, and authorization models (OAuth 2.0, OpenID Connect, RBAC, ABAC).
+\end{itemize}
+
+\textbf{Why This Topic Exists:}
+Security cannot be patched in at deployment through firewalls and periodic penetration tests. Over 70\% of severe enterprise security breaches originate from fundamental architectural design flaws—such as unauthenticated internal RPCs, missing authorization checks across trust boundaries, and insecure direct object references (IDOR). Threat modeling systematically uncovers design vulnerabilities on paper during the architecture phase.
+
+\textbf{Motivating Practical Problem:}
+A modern fintech neobank launches an automated wire-transfer service. While the external REST API requires strict OAuth 2.0 bearer tokens, internal microservices communicate over unencrypted, unauthenticated HTTP inside an AWS EKS Kubernetes cluster. An attacker discovers a Server-Side Request Forgery (SSRF) flaw in a public PDF-generation webhook, allowing them to issue arbitrary internal HTTP POST requests directly to the internal \texttt{wire-transfer-service}. The attacker transfers \$4.2 million to offshore accounts without triggering a single authentication alert.
+\end{chaptergoalsbox}
+
+\section{The Four-Question Framework and Shift-Left Security}
+
+Traditional application security relied on ``penetration testing'' performed days before a production release. In modern continuous delivery pipelines, discovering a structural architectural vulnerability days before launch causes massive project delays or forces teams to ship known vulnerabilities.
+
+**Threat Modeling** is the proactive discipline of analyzing system architectures to identify vulnerabilities, assess their risk, and engineer mitigations into the design. Security expert Adam Shostack formalized this into the **Four-Question Framework**:
+
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{What are we building?} (Modeled via security Data Flow Diagrams).
+  \item \textbf{What can go wrong?} (Discovered systematically via the STRIDE methodology).
+  \item \textbf{What are we going to do about it?} (Architected via Defensive Mitigations).
+  \item \textbf{Did we do a good job?} (Validated via verification tests and residual risk scoring).
+\end{enumerate}
+
+\begin{intuitionbox}[Inspecting Blueprints Before Pouring Concrete]
+If an architect designs a bank vault with three-foot-thick titanium doors but installs an unreinforced ventilation shaft directly into the ceiling, any burglar with a ladder can bypass the door. Threat modeling is the process of examining the architectural blueprint to find every ventilation shaft, unlocked window, and shared wall before the concrete is poured.
+\end{intuitionbox}
+
+\section{Data Flow Diagrams (DFDs) and Trust Boundaries}
+
+To model security, engineers must map the flow of data across systems. A security **Data Flow Diagram (DFD)** differs from a standard C4 container diagram: it focuses strictly on data transitions, protocol boundaries, and differences in administrative privilege.
+
+\subsection{The Four Core Elements of a Security DFD}
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lllp{6.0cm}}
+\toprule
+\textbf{Element} & \textbf{Standard Symbol} & \textbf{Notation} & \textbf{Architectural Definition} \\
+\midrule
+\textbf{External Entity} & Rectangle & Interactor & A human user, client device, or external third-party system outside our administrative control. \\
+\textbf{Process} & Circle / Rounded Box & Compute & Any compute entity executing code (web servers, microservices, Lambda functions, OS daemons). \\
+\textbf{Data Store} & Open Parallel Lines & Storage & Any persistent or temporary repository of state (PostgreSQL, Redis, S3 bucket, local file). \\
+\textbf{Data Flow} & Directed Arrow & Wire & Network packets, RPCs, or IPC pipes transporting data between two entities. \\
+\bottomrule
+\end{tabular}
+\caption{The Formal Elements of a Security Data Flow Diagram}
+\label{tab:dfd-elements}
+\end{table}
+
+\subsection{The Trust Boundary}
+
+The most critical construct in a security DFD is the **Trust Boundary**, represented as a red dashed line. A trust boundary separates entities operating with \textit{different levels of privilege, security clearance, or network isolation}.
+
+Whenever data crosses a trust boundary, **all incoming data must be treated as hostile and untrusted**. The receiving entity is strictly responsible for authenticating the caller, authorizing the requested action, and sanitizing payloads.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1.2cm and 1.8cm,
+  entity/.style={rectangle, draw=headingblue, fill=headingblue!10, rounded corners=2pt, minimum width=2.4cm, minimum height=1.1cm, font=\sffamily\scriptsize\bfseries, align=center},
+  proc/.style={rectangle, draw=exampleBlue, fill=exampleBg, rounded corners=6pt, minimum width=2.6cm, minimum height=1.2cm, font=\sffamily\scriptsize\bfseries, align=center},
+  store/.style={rectangle, draw=headingblue!80, fill=headingblue!5, minimum width=2.4cm, minimum height=1.0cm, font=\sffamily\scriptsize\bfseries, align=center},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=textdark},
+  tboundary/.style={draw=warningRed, thick, dashed, rounded corners=8pt}
+]
+
+% Trust Boundaries
+\draw[tboundary, fill=warningRed!3] (-0.5, -4.5) rectangle (12.5, 1.8);
+\node[font=\sffamily\tiny\bfseries\color{warningRed}, anchor=north west] at (-0.3, 1.6) {Trust Boundary: Enterprise Cloud VPC (Private Subnet)};
+
+\draw[tboundary, fill=warningRed!5] (4.0, -4.0) rectangle (12.2, 1.0);
+\node[font=\sffamily\tiny\bfseries\color{warningRed}, anchor=north west] at (4.2, 0.8) {Trust Boundary: Secure Ledger Enclave (mTLS + IAM)};
+
+% Entities
+\node[entity] (client) at (-2.5, 0) {Web Browser /\\End User\\ \scriptsize[External Entity]};
+\node[proc] (edge) at (1.5, 0) {API Gateway\\ \scriptsize[Process: Envoy]};
+\node[proc] (core) at (6.0, 0) {Transfer Engine\\ \scriptsize[Process: Go]};
+\node[store] (db) at (10.2, 0) {Ledger DB\\ \scriptsize[Data Store: Postgres]};
+
+\node[entity] (fraud) at (6.0, -3.0) {Fraud Scoring API\\ \scriptsize[External Entity]};
+
+% Flows
+\draw[arrow] (client) -- node[above, font=\tiny\sffamily]{1. POST /transfer} node[below, font=\tiny\sffamily\color{warningRed}]{Crosses Perimeter} (edge);
+\draw[arrow] (edge) -- node[above, font=\tiny\sffamily]{2. gRPC Forward} node[below, font=\tiny\sffamily\color{warningRed}]{Crosses Enclave} (core);
+\draw[arrow] (core) -- node[above, font=\tiny\sffamily]{3. SQL UPDATE} (db);
+\draw[arrow] (core) -- node[right, font=\tiny\sffamily]{4. Fraud Check} (fraud);
+
+\end{tikzpicture}
+\caption{Security Data Flow Diagram with Explicit Trust Boundaries}
+\label{fig:dfd-trust-boundary}
+\end{figure}
+
+\begin{underthehoodbox}[Trust Boundary Crossings and Serialization Sinks]
+When an object crosses a trust boundary, it is serialized into raw bytes (e.g., JSON, Protobuf, or XML). The receiving process must deserialize those bytes into memory. Vulnerabilities like Java Deserialization RCE, Python Pickle injection, and XML External Entity (XXE) injection happen precisely at the boundary where unvalidated bytes are converted into executable language runtime objects.
+\end{underthehoodbox}
+
+\section{The STRIDE Threat Classification Taxonomy}
+
+Developed by Loren Kohnfelder and Praerit Garg at Microsoft, **STRIDE** provides an exhaustive taxonomy for software vulnerabilities. Each letter maps to a specific security attribute that is violated:
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lllp{5.5cm}}
+\toprule
+\textbf{Threat} & \textbf{Violated Property} & \textbf{Core Question} & \textbf{Typical Real-World Exploit} \\
+\midrule
+\textbf{S: Spoofing} & Authenticity & Can an adversary pretend to be another user or service? & Stolen JWT, forged session cookie, IP spoofing, missing mTLS. \\
+\textbf{T: Tampering} & Integrity & Can an adversary modify data in transit or at rest? & Man-in-the-Middle (MitM), SQL injection parameter tampering. \\
+\textbf{R: Repudiation} & Non-repudiation & Can an actor deny performing an action without proof? & Lack of tamper-proof audit logs, shared admin accounts. \\
+\textbf{I: Info Disclosure} & Confidentiality & Can unauthorized actors read private data? & Unencrypted database backup, verbose error stack traces. \\
+\textbf{D: Denial of Service} & Availability & Can an attacker exhaust resources and crash the system? & SYN floods, ReDoS regex bombs, algorithmic HashDoS, memory leaks. \\
+\textbf{E: Elevation of Privilege} & Authorization & Can a user perform actions beyond their assigned role? & Horizontal/Vertical privilege escalation, IDOR, path traversal. \\
+\bottomrule
+\end{tabular}
+\caption{The STRIDE Threat Taxonomy and Violated Security Properties}
+\label{tab:stride-taxonomy}
+\end{table}
+
+\subsection{The STRIDE-per-Element Matrix}
+
+The true mathematical power of STRIDE lies in the **STRIDE-per-Element Matrix**. Not every threat applies to every DFD element. By applying the matrix, architects systematically identify all theoretically possible threat classes for every node in the DFD:
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{DFD Element} & \textbf{S}poofing & \textbf{T}ampering & \textbf{R}epudiation & \textbf{I}nfo Disclosure & \textbf{D}enial of Service & \textbf{E}levation of Privilege \\
+\midrule
+\textbf{External Entity} & \checkmark & & \checkmark & & & \\
+\textbf{Data Flow} & & \checkmark & & \checkmark & \checkmark & \\
+\textbf{Data Store} & & \checkmark & \checkmark & \checkmark & \checkmark & \\
+\textbf{Process} & \checkmark & \checkmark & \checkmark & \checkmark & \checkmark & \checkmark \\
+\bottomrule
+\end{tabular}
+\caption{The Canonical STRIDE-per-Element Applicability Matrix}
+\label{tab:stride-matrix}
+\end{table}
+
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{External Entities} can only be \textit{Spoofed} (someone claims to be customer Alice) or commit \textit{Repudiation} (Alice denies submitting an order). They cannot directly suffer internal tampering because they are external.
+  \item \textbf{Data Flows} cannot be ``spoofed'' directly (the endpoints are spoofed), but data on the wire can be \textit{Tampered} with, suffer \textit{Information Disclosure} (packet sniffing), or experience \textit{Denial of Service} (network link saturation).
+  \item \textbf{Data Stores} can suffer \textit{Tampering} (unauthorized SQL updates), \textit{Repudiation} (logs overwritten), \textit{Information Disclosure} (data exfiltration), and \textit{Denial of Service} (disk fill).
+  \item \textbf{Processes} are vulnerable to \textbf{all six STRIDE threats}.
+\end{itemize}
+
+\begin{commonmistakebox}[Assuming Internal VPC Traffic is Implicitly Trusted]
+The ``Castle and Moat'' security model assumes that once traffic passes the edge firewall, the internal network is safe. In modern containerized Kubernetes environments, an attacker compromising a low-privilege pod can sniff internal network traffic, forge plaintext HTTP requests to adjacent microservices, and exfiltrate cloud metadata credentials (IMDS). Modern architecture mandates **Zero Trust**: every internal request must be authenticated (mTLS), authorized, and encrypted.
+\end{commonmistakebox}
+
+\section{Threat Mitigation Mapping}
+
+Once threats are cataloged via STRIDE, architects must map each threat to concrete defensive controls:
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{llp{7.5cm}}
+\toprule
+\textbf{Threat Class} & \textbf{Architectural Countermeasure} & \textbf{Production Implementation Technologies} \\
+\midrule
+\textbf{Spoofing} & Strong Authentication & OpenID Connect, OAuth 2.0 PKCE, X.509 Mutual TLS (mTLS), SPIFFE/SPIRE identity tokens. \\
+\textbf{Tampering} & Cryptographic Integrity & TLS 1.3 encryption, HMAC-SHA256 request signatures, immutable append-only filesystems. \\
+\textbf{Repudiation} & Audit Logging & Write-Once-Read-Many (WORM) storage, cryptographically chained audit trails (AWS CloudTrail). \\
+\textbf{Info Disclosure} & Confidentiality & AES-256-GCM encryption at rest (AWS KMS), envelope encryption, TLS in transit, field-level PII masking. \\
+\textbf{Denial of Service} & Resilient Availability & Token-bucket rate limiting (Redis/Envoy), connection bulkheads, auto-scaling, SYN cookies. \\
+\textbf{Elevation of Priv.} & Authorization Controls & Attribute-Based Access Control (ABAC), Open Policy Agent (OPA), least-privilege IAM roles. \\
+\bottomrule
+\end{tabular}
+\caption{Architectural Mitigation Mapping across the STRIDE Taxonomy}
+\label{tab:mitigation-mapping}
+\end{table}
+
+\begin{realworldbox}[Deconstructing the Capital One Breach via STRIDE]
+In 2019, a former AWS employee breached Capital One, compromising 106 million customer credit applications. 
+\begin{itemize}
+  \item \textbf{Vector}: The attacker leveraged a Server-Side Request Forgery (SSRF) flaw in an open-source ModSecurity Web Application Firewall (WAF) running on EC2.
+  \item \textbf{Trust Boundary Crossing}: The WAF had direct network access to the AWS Instance Metadata Service (IMDSv1 at \texttt{169.254.169.254}).
+  \item \textbf{STRIDE Classification}: \textbf{Elevation of Privilege} (SSRF allowed the attacker to query the metadata service) $\rightarrow$ \textbf{Spoofing} (stole IAM role credentials of the WAF instance) $\rightarrow$ \textbf{Information Disclosure} (used excessive IAM permissions to sync hundreds of S3 buckets containing credit records).
+  \item \textbf{Modern Mitigations}: IMDSv2 (requires session token headers, defeating simple SSRF) and Least-Privilege IAM (never granting broad \texttt{s3:*} permissions to an edge WAF instance).
+\end{itemize}
+\end{realworldbox}
+
+\section{Risk Scoring Frameworks: DREAD and CVSS}
+
+Not all threats require immediate mitigation; organizations must prioritize engineering investments based on quantitative risk scoring.
+
+\subsection{The DREAD Model}
+
+The DREAD model scores each threat on a scale from 1 to 10 across five parameters:
+\begin{equation}
+\text{Risk Score} = \frac{\text{Damage} + \text{Reproducibility} + \text{Exploitability} + \text{Affected Users} + \text{Discoverability}}{5}
+\end{equation}
+
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Damage (D)}: How severe is the impact if the exploit succeeds? (1 = trivial, 10 = total company insolvency).
+  \item \textbf{Reproducibility (R)}: How easily can the attack be repeated? (10 = automated script works 100\% of the time).
+  \item \textbf{Exploitability (E)}: What skill level is required? (10 = script kiddie with web browser, 1 = nation-state actor with quantum computer).
+  \item \textbf{Affected Users (A)}: What fraction of users are impacted? (1 = single user, 10 = all customers globally).
+  \item \textbf{Discoverability (D)}: How easily can the flaw be found? (Often defaulted to 10 assuming Kerckhoffs's principle).
+\end{itemize}
+Scores above 7.0 demand immediate architectural mitigation before production release.
+
+\begin{productionwarningbox}[Checklist Threat Models That Rot]
+Performing a threat model once during initial system inception and filing the PDF away in an archive creates a false sense of security. As new APIs, microservice integrations, and third-party webhook dependencies are deployed every sprint, the threat landscape shifts. High-performing engineering organizations maintain **Threat Models as Code** (using Python libraries like \texttt{pytm} or OWASP Threat Dragon) directly inside the Git repository, re-validating the model on every architectural pull request.
+\end{productionwarningbox}
+
+\begin{tryityourselfbox}[Exercise: STRIDE on an S3 Bucket Upload Pipeline]
+Consider a file upload feature where users upload medical PDF scans:
+$$\text{Browser} \xrightarrow{\text{Presigned S3 URL}} \text{AWS S3 Bucket} \xrightarrow{\text{S3 Event Notification}} \text{Lambda OCR Worker}$$
+Apply the STRIDE-per-Element matrix to:
+\begin{enumerate}
+  \item The Data Flow between Browser and S3 Bucket.
+  \item The Data Store (S3 Bucket).
+  \item The Process (Lambda OCR Worker).
+\end{enumerate}
+Identify at least one critical threat and architectural countermeasure for each.
+\end{tryityourselfbox}
+
+\section{Summary \& Key Takeaways}
+
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Shift-Left Security}: Threat modeling identifies systemic architectural defects on paper before code is deployed, avoiding costly production breaches.
+  \item \textbf{DFD Rigor}: Deconstruct systems into External Entities, Processes, Data Stores, and Data Flows.
+  \item \textbf{Trust Boundaries}: Every boundary crossing demands mutual authentication, cryptographic integrity, and payload sanitization.
+  \item \textbf{STRIDE-per-Element}: Use the matrix to systematically enumerate Spoofing, Tampering, Repudiation, Info Disclosure, Denial of Service, and Elevation of Privilege.
+  \item \textbf{Prioritization via DREAD/CVSS}: Score identified threats mathematically to drive engineering sprint prioritization.
+\end{itemize}
+
+\section{Exercises}
+
+\subsection*{Mechanics}
+\begin{enumerate}[leftmargin=18pt]
+  \item According to the STRIDE-per-Element matrix, why can an External Entity never be the target of a Tampering or Information Disclosure threat within our system model?
+  \item State the five parameters of the DREAD risk calculation and compute the composite score for a vulnerability with: Damage = 9, Reproducibility = 8, Exploitability = 8, Affected Users = 7, Discoverability = 8.
+\end{enumerate}
+
+\subsection*{Debugging}
+\begin{enumerate}[leftmargin=18pt]
+  \item An engineer presents a threat model diagram where an internal microservice communicates with an in-cluster Redis database over plaintext TCP. The engineer argues: \textit{``Because both run inside our private AWS VPC, there is no Trust Boundary between them, so STRIDE Tampering does not apply.''} Explain why this assumption is dangerous.
+\end{enumerate}
+
+\subsection*{Architecture Design}
+\begin{enumerate}[leftmargin=18pt]
+  \item Perform a STRIDE analysis on an asynchronous Payment Webhook Receiver. A third-party payment provider (e.g., Stripe) dispatches an HTTP POST webhook containing an \texttt{event\_id} and \texttt{payment\_amount} to your public API Gateway. Formulate one specific threat for each letter of STRIDE and specify the corresponding production defense.
+\end{enumerate}
+
+\section{Detailed Solutions}
+
+\subsection*{Mechanics Solution}
+\begin{enumerate}[leftmargin=18pt]
+  \item In DFD threat modeling, an \textbf{External Entity} is outside our direct administrative and technical control (e.g., a customer's laptop, an external bank's server). We cannot alter or protect their internal hardware, operating system, or memory. Therefore, our system cannot prevent someone from tampering with their own client device, nor can we secure information disclosure happening within their own local screen. We only model how that external entity interacts with \textit{our} perimeter (Spoofing our endpoints, or Repudiating actions taken).
+  
+  \item Composite DREAD calculation:
+  $$\text{Score} = \frac{9 + 8 + 8 + 7 + 8}{5} = \frac{40}{5} = 8.0$$
+  A score of 8.0 indicates a Critical Severity risk requiring immediate remediation prior to production rollout.
+\end{enumerate}
+
+\subsection*{Debugging Solution}
+\begin{enumerate}[leftmargin=18pt]
+  \item The assumption violates the core tenets of **Zero Trust Architecture**. 
+  \begin{enumerate}
+    \item Modern cloud VPCs are shared networks hosting dozens of heterogeneous services. If any peripheral container in the VPC is compromised (e.g., via a dependency vulnerability or SSRF), an attacker with network access can sniff unencrypted Redis traffic to steal sensitive customer session tokens (Information Disclosure).
+    \item Without authentication or TLS, an attacker can issue malicious \texttt{FLUSHALL} commands or alter cached authorization keys (Tampering and DoS).
+    \item A Trust Boundary exists between the compute layer and the persistent storage layer regardless of physical proximity.
+  \end{enumerate}
+\end{enumerate}
+
+\subsection*{Architecture Design Solution}
+\begin{table}[htbp]
+\centering\scriptsize
+\begin{tabular}{llp{3.5cm}p{4.2cm}}
+\toprule
+\textbf{Letter} & \textbf{Threat Category} & \textbf{Specific Attack Scenario} & \textbf{Architectural Mitigation} \\
+\midrule
+\textbf{S} & Spoofing & Attacker sends fake HTTP POST pretending to be Stripe. & Verify HMAC-SHA256 signature in \texttt{Stripe-Signature} header using shared webhook secret. \\
+\textbf{T} & Tampering & Attacker modifies payload amount from \$100 to \$0.01 in transit. & Mandate TLS 1.3 in transit; HMAC signature validation fails if a single byte is altered. \\
+\textbf{R} & Repudiation & Merchant claims order was marked paid without receiving webhook. & Store immutable append-only raw webhook logs with timestamp, signature, and body in S3 Glacier. \\
+\textbf{I} & Info Disclosure & Credit card numbers or PII leaked in webhook payloads. & Stripe never transmits PAN in webhooks; redact sensitive JSON fields before storing in application logs. \\
+\textbf{D} & Denial of Service & Attacker floods webhook endpoint with 100,000 fake requests/sec. & Enforce rate limiting at Cloudflare/Envoy; reject invalid signatures early before hitting database. \\
+\textbf{E} & Elevation of Priv. & Injected JSON payload contains \texttt{\{"is\_admin": true\}} mass assignment. & Strict Pydantic/Protobuf schema deserialization rejecting unknown fields; least-privilege DB role. \\
+\bottomrule
+\end{tabular}
+\caption{Complete STRIDE Threat Mitigation Analysis for Payment Webhook}
+\end{table}
+
+\section{Further Reading \& Citations}
+\begin{itemize}[leftmargin=18pt]
+  \item Shostack, A. (2014). \textit{Threat Modeling: Designing for Security}. John Wiley \& Sons.
+  \item Howard, M., \& Lipner, S. (2006). \textit{The Security Development Lifecycle}. Microsoft Press.
+  \item OWASP Foundation. (2023). \textit{Threat Modeling Cheat Sheet and OWASP Threat Dragon Project}.
+  \item NIST. (2020). \textit{Zero Trust Architecture} (NIST Special Publication 800-207).
+\end{itemize}

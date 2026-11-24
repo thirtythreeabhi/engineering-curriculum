@@ -1,0 +1,418 @@
+\chapter{Docker and Kubernetes Internals}
+\label{ch:docker-kubernetes}
+
+\begin{chaptergoalsbox}
+\textbf{What You Will Learn:}
+\begin{itemize}[leftmargin=12pt]
+  \item Linux kernel virtualization primitives: the seven core namespaces (\texttt{pid}, \texttt{net}, \texttt{mnt}, \texttt{ipc}, \texttt{uts}, \texttt{user}, \texttt{cgroup}) and kernel syscalls (\texttt{clone}, \texttt{unshare}, \texttt{setns}).
+  \item Resource management and quota governance via \texttt{cgroups v2} unified hierarchy, \texttt{cpu.max}, \texttt{memory.max}, and Linux OOM killer mechanics.
+  \item Union filesystems with \texttt{overlay2}: layer stacking, lowerdir, upperdir, merged mount, Copy-on-Write (CoW), and deletion whiteouts.
+  \item The Open Container Initiative (OCI) runtime model: \texttt{containerd}, \texttt{containerd-shim}, and \texttt{runc}.
+  \item Kubernetes control plane internals: \texttt{kube-apiserver} admission chains, \texttt{etcd} Raft consensus and MVCC, \texttt{kube-scheduler} filtering/scoring, and controller manager reconciliation.
+  \item Worker node internals: \texttt{kubelet} \texttt{syncLoop}, the Pod Lifecycle Event Generator (PLEG), CRI, and CNI execution.
+  \item Autoscaling engineering: Horizontal Pod Autoscaler (HPA) algorithm and Kubernetes Event-driven Autoscaling (KEDA) zero-to-one mechanics.
+\end{itemize}
+
+\textbf{What You Should Already Understand:}
+\begin{itemize}[leftmargin=12pt]
+  \item Operating system foundations: processes, threads, virtual memory, and file descriptors.
+  \item Basic container usage: \texttt{docker build}, \texttt{docker run}, and writing basic Dockerfiles.
+  \item Basic Kubernetes manifests: Pods, Deployments, and Services.
+\end{itemize}
+
+\textbf{Why This Topic Exists:}
+A ``container'' is not a physical or software object in the Linux kernel; it is a user-space abstraction constructed from isolated kernel primitives. Engineers who treat containers as ``lightweight virtual machines'' inevitably face catastrophic production failures: silent CPU throttling from cgroup quota misconfigurations, OOM kills caused by JVM memory ignorance, runaway disk utilization from unoptimized OverlayFS layers, and cluster-wide node locks caused by kubelet PLEG degradation.
+
+\textbf{Motivating Practical Problem:}
+A high-throughput payment processing engine deployed on Kubernetes begins dropping transactions during flash sales. The HPA fails to scale pods quickly enough because metrics lag by 90 seconds. Concurrently, half of the active worker nodes report \texttt{NotReady} with log messages stating \texttt{PLEG is not healthy}, and critical transaction pods are suddenly terminated with exit code 137 (OOMKilled) even though overall node memory utilization is only 45\%. How do you diagnose and resolve these cascading failures by diving into the kernel cgroup limits, OverlayFS behavior, and kubelet runtime mechanics?
+\end{chaptergoalsbox}
+
+\section{Linux Kernel Primitives: The Construction of a Container}
+
+To master container engineering, one must recognize a fundamental truth: \textbf{there is no such thing as a container in the Linux kernel}. The kernel manages processes, threads, memory pages, network interfaces, and file system descriptors. What the industry labels a ``container'' is merely a standard Linux process whose visibility into system resources is constrained by \textbf{Namespaces} and whose resource consumption is restricted by \textbf{Control Groups (cgroups)}.
+
+\subsection{The Seven Core Linux Namespaces}
+Namespaces wrap global system resources in abstractions that make it appear to the contained process that it possesses its own isolated instance of the resource.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{llp{7.5cm}}
+\toprule
+\textbf{Namespace} & \textbf{Syscall Flag} & \textbf{Resource Isolated} \\
+\midrule
+\textbf{PID} & \texttt{CLONE\_NEWPID} & Process IDs. Inside the namespace, the container entrypoint process sees itself as PID 1, while on the host it possesses a standard PID (e.g., 29481). \\
+\textbf{NET} & \texttt{CLONE\_NEWNET} & Network devices, IPv4/IPv6 stacks, IP routing tables, firewall rules (iptables/nftables), and socket port bindings. \\
+\textbf{MNT} & \texttt{CLONE\_NEWNS} & Filesystem mount points. Isolates the root directory (\texttt{/}) via pivot\_root. \\
+\textbf{IPC} & \texttt{CLONE\_NEWIPC} & Inter-Process Communication: System V IPC objects and POSIX message queues. \\
+\textbf{UTS} & \texttt{CLONE\_NEWUTS} & Hostname and NIS domain name. \\
+\textbf{USER} & \texttt{CLONE\_NEWUSER} & User and group IDs. Allows a process to run with UID 0 (root) inside the container while mapping to an unprivileged UID (e.g., 10001) on the host. \\
+\textbf{CGROUP} & \texttt{CLONE\_NEWCGROUP} & Virtualized view of \texttt{/proc/self/cgroup} to conceal host-level cgroup topologies. \\
+\bottomrule
+\end{tabular}
+\caption{The Seven Linux Kernel Namespaces}
+\label{tab:linux-namespaces}
+\end{table}
+
+\subsection{Kernel Syscalls: \texttt{clone}, \texttt{unshare}, and \texttt{setns}}
+Namespaces are created and manipulated via three foundational POSIX system calls:
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{\texttt{clone(child\_func, stack, flags, arg)}:} Extends standard \texttt{fork()}. By passing bitwise-ORed flags (e.g., \texttt{CLONE\_NEWPID | CLONE\_NEWNET}), the newly spawned child process enters newly minted namespaces.
+  \item \textbf{\texttt{unshare(flags)}:} Allows an existing running process to disassociate itself from its current namespaces and spawn new ones without creating a child process.
+  \item \textbf{\texttt{setns(fd, nstype)}:} Attaches the calling process to an already existing namespace identified by an open file descriptor pointing to \texttt{/proc/<pid>/ns/<type>}. This is the exact mechanism powering commands like \texttt{docker exec} and \texttt{kubectl exec}.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.9, every node/.style={scale=0.9},
+  node distance=1.1cm and 1.2cm,
+  host/.style={rectangle, draw=headingblue, fill=headingblue!3, dashed, inner sep=14pt, rounded corners=4pt},
+  proc/.style={rectangle, draw=exampleBlue, fill=exampleBg, rounded corners=2pt, text width=3.4cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  ns/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, text width=3.4cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  cg/.style={rectangle, draw=warningRed, fill=warningBg, rounded corners=2pt, text width=3.4cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=headingblue}
+]
+
+\node[proc] (p_host) {Host Process Table\\PID 29481 (Node.js)\\PID 29482 (Worker)};
+\node[ns, right=1.6cm of p_host] (ns_pid) {PID Namespace\\PID 1 (Mapped from 29481)\\PID 2 (Mapped from 29482)};
+\node[cg, below=1.0cm of ns_pid] (cg_mem) {cgroups v2 Controllers\\\texttt{cpu.max: 200000 100000}\\\texttt{memory.max: 1073741824}};
+
+\draw[arrow] (p_host) -- node[above, font=\tiny\sffamily]{CLONE\_NEWPID} (ns_pid);
+\draw[arrow] (ns_pid) -- node[left, font=\tiny\sffamily]{Restricted by} (cg_mem);
+
+\end{tikzpicture}
+\caption{Linux Kernel Process Isolation via Namespaces and cgroups v2}
+\label{fig:namespaces-cgroups}
+\end{figure}
+
+\begin{tryityourselfbox}[Constructing a Raw Container with \texttt{unshare}]
+You can create an isolated container environment without Docker installed using native Linux command-line utilities:
+\begin{lstlisting}[language=bash]
+# Create a new process with isolated UTS, PID, and Mount namespaces
+sudo unshare --uts --pid --mount --fork /bin/bash
+
+# Change hostname inside the container
+hostname container-isolated
+hostname # Returns: container-isolated
+
+# In another host terminal:
+hostname # Returns original host name! Hostname is fully isolated.
+\end{lstlisting}
+\end{tryityourselfbox}
+
+\section{Resource Isolation and Quotas: \texttt{cgroups v2}}
+
+While namespaces control \textbf{what a process can see}, Control Groups (cgroups) control \textbf{how many resources a process can consume}. 
+
+In modern enterprise Linux distributions (Ubuntu 22.04+, RHEL 9+, Debian 12+), the legacy \texttt{cgroups v1} (which maintained disconnected directory trees per controller) has been superseded by \textbf{\texttt{cgroups v2}}, which enforces a \textbf{unified single-hierarchy tree} rooted at \texttt{/sys/fs/cgroup}.
+
+\subsection{Core Controllers in \texttt{cgroups v2}}
+Every container created by containerd or Kubernetes is assigned a dedicated directory under \texttt{/sys/fs/cgroup/kubepods.slice/}. Resource quotas are configured by writing plain text to specific pseudofiles:
+
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{CPU Quota (\texttt{cpu.max}):} Governs the Completely Fair Scheduler (CFS) bandwidth quota. It contains two integers: \texttt{\$QUOTA \$PERIOD}. For example:
+  \begin{equation*}
+  \texttt{echo "200000 100000" > /sys/fs/cgroup/.../cpu.max}
+  \end{equation*}
+  This limits the cgroup processes to 200,000 microseconds ($200\text{ms}$) of CPU time every 100,000 microseconds ($100\text{ms}$) period, which translates to exactly \textbf{2.0 CPU cores}. If the processes exceed this limit, the kernel CFS scheduler throttles their execution without killing them.
+  \item \textbf{Memory Hard Ceiling (\texttt{memory.max}):} The absolute upper memory threshold in bytes (e.g., \texttt{1073741824} for 1 GiB). If the aggregate memory consumption (RSS + page cache) breaches \texttt{memory.max} and the kernel cannot reclaim memory through page eviction, the Linux \textbf{Out-Of-Memory (OOM) Killer} is immediately invoked.
+  \item \textbf{Memory Soft Warning (\texttt{memory.high}):} Acts as a protective throttle. When exceeded, processes inside the cgroup are slowed down and forced into background memory reclaim, avoiding sudden OOM spikes.
+\end{itemize}
+
+\subsection{OOM Killer and \texttt{oom\_score\_adj}}
+When the kernel encounters an out-of-memory condition within a cgroup, it must terminate a process to preserve stability. The kernel calculates an \texttt{oom\_score} for each process. Kubernetes manipulates this selection via \texttt{/proc/<pid>/oom\_score\_adj} (ranging from -1000 to +1000) based on Quality of Service (QoS) classes:
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{Guaranteed QoS} (Limits == Requests): \texttt{oom\_score\_adj = -997} (almost never killed).
+  \item \textbf{Burstable QoS} (Limits > Requests): \texttt{oom\_score\_adj = $\min(\max(2, 1000 - (1000 \times \text{ReqMem}) / \text{NodeMem}), 999)$}.
+  \item \textbf{BestEffort QoS} (No limits/requests): \texttt{oom\_score\_adj = 1000} (first to be slaughtered).
+\end{itemize}
+
+\section{Union Filesystems: The \texttt{overlay2} Storage Driver}
+
+Containers require rapid instantiation and minimal storage overhead. Downloading a 1 GB operating system image for every new container instance would exhaust storage and network bandwidth. Containers solve this using the \textbf{\texttt{overlay2}} union filesystem.
+
+\subsection{Layer Stacking Architecture}
+OverlayFS merges multiple underlying directories into a single unified directory structure. It consists of four distinct components:
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{\texttt{lowerdir}:} A stack of read-only image layers. These layers are completely immutable and shared concurrently across hundreds of running containers on the same host.
+  \item \textbf{\texttt{upperdir}:} The read-write container layer. Every container receives a private, ephemeral \texttt{upperdir}. All newly written files reside here.
+  \item \textbf{\texttt{workdir}:} An internal scratchpad directory used by the kernel to stage atomic file operations before exposing them.
+  \item \textbf{\texttt{merged}:} The unified mount point presented to the container process as its root filesystem (\texttt{/}).
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=0.8cm,
+  layer/.style={rectangle, draw=headingblue, fill=headingblue!5, rounded corners=2pt, text width=9.5cm, minimum height=0.75cm, align=center, font=\sffamily\footnotesize},
+  merged/.style={rectangle, draw=exampleBlue, fill=exampleBg, rounded corners=2pt, text width=9.5cm, minimum height=0.85cm, align=center, font=\sffamily\footnotesize\bfseries},
+  rw/.style={rectangle, draw=warningRed, fill=warningBg, rounded corners=2pt, text width=9.5cm, minimum height=0.75cm, align=center, font=\sffamily\footnotesize\bfseries},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=headingblue}
+]
+
+\node[merged] (m) {\texttt{merged} View: Unified Directory (\texttt{/bin}, \texttt{/app}, \texttt{/tmp})};
+\node[rw, below=0.6cm of m] (u) {\texttt{upperdir} (Read-Write Layer): Modified \& Newly Created Files};
+\node[layer, below=0.6cm of u] (l2) {\texttt{lowerdir} Layer 2 (Read-Only): Application Artifacts (\texttt{/app/server.js})};
+\node[layer, below=0.4cm of l2] (l1) {\texttt{lowerdir} Layer 1 (Read-Only): Node.js Runtime Dependencies (\texttt{/usr/local/bin/node})};
+\node[layer, below=0.4cm of l1] (l0) {\texttt{lowerdir} Layer 0 (Read-Only): Base OS Image (Alpine Linux)};
+
+\draw[arrow] (u) -- (m);
+\draw[arrow] (l2) -- (u);
+\draw[arrow] (l1) -- (l2);
+\draw[arrow] (l0) -- (l1);
+
+\end{tikzpicture}
+\caption{OverlayFS Layer Stacking Architecture in \texttt{overlay2}}
+\label{fig:overlay2}
+\end{figure}
+
+\subsection{Copy-on-Write (CoW) and Whiteouts}
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{Modification (Copy-up):} When a process modifies an existing file residing in a read-only \texttt{lowerdir}, the kernel pauses the write operation, copies the entire file up into the container's \texttt{upperdir}, and performs the write on the newly copied file. The original lower layer file remains pristine.
+  \item \textbf{Deletion (Whiteouts):} If a container deletes a file inherited from a \texttt{lowerdir}, the kernel cannot alter the immutable lower layer. Instead, it creates a special \textbf{whiteout file} in the \texttt{upperdir} (a character device file with major/minor numbers \texttt{0,0}). When OverlayFS reads the merged view, encountering a whiteout hides the corresponding lower file from the directory listing.
+\end{itemize}
+
+\section{Container Standards and Runtimes: OCI, \texttt{containerd}, and \texttt{runc}}
+
+The container runtime ecosystem is governed by standards established by the \textbf{Open Container Initiative (OCI)}:
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{OCI Image Specification:} Defines the serialization format for container image archives, layer tarballs, and JSON manifests.
+  \item \textbf{OCI Runtime Specification:} Defines the lifecycle, configuration (\texttt{config.json}), and execution environment of a container.
+\end{enumerate}
+
+\subsection{The Runtime Stack Hierarchy}
+When Kubernetes requests the creation of a pod, the execution descends through a clean architectural hierarchy:
+\begin{equation*}
+\text{kubelet} \xrightarrow{\text{gRPC (CRI)}} \text{containerd} \xrightarrow{} \text{containerd-shim} \xrightarrow{} \text{runc} \xrightarrow{} \text{Linux Kernel}
+\end{equation*}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=0.9cm,
+  comp/.style={rectangle, draw=headingblue, fill=headingblue!5, rounded corners=2pt, text width=10.0cm, minimum height=0.8cm, align=left, inner sep=6pt, font=\sffamily\footnotesize},
+  highlight/.style={rectangle, draw=exampleBlue, fill=exampleBg, rounded corners=2pt, text width=10.0cm, minimum height=0.8cm, align=left, inner sep=6pt, font=\sffamily\footnotesize},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=headingblue}
+]
+
+\node[comp] (kubelet) {\textbf{kubelet}: Node agent enforcing desired Pod state from apiserver.};
+\node[highlight, below=0.6cm of kubelet] (cri) {\textbf{CRI (Container Runtime Interface)}: gRPC API (\texttt{RunPodSandbox}, \texttt{CreateContainer}).};
+\node[comp, below=0.6cm of cri] (cd) {\textbf{containerd}: High-level daemon managing image pull, storage unpack, and lifecycle.};
+\node[highlight, below=0.6cm of cd] (shim) {\textbf{containerd-shim}: Lightweight process per container; holds open IO pipes, decouples daemon.};
+\node[comp, below=0.6cm of shim] (runc) {\textbf{runc}: Low-level CLI runtime; executes \texttt{clone()}, \texttt{pivot\_root}, applies cgroups, then exits.};
+\node[comp, below=0.6cm of runc] (kernel) {\textbf{Container Process}: Running application process isolated in Linux kernel.};
+
+\draw[arrow] (kubelet) -- (cri);
+\draw[arrow] (cri) -- (cd);
+\draw[arrow] (cd) -- (shim);
+\draw[arrow] (shim) -- (runc);
+\draw[arrow] (runc) -- (kernel);
+
+\end{tikzpicture}
+\caption{The Container Execution Chain from kubelet to the Linux Kernel}
+\label{fig:container-runtime-chain}
+\end{figure}
+
+\subsection{Why \texttt{containerd-shim} Exists}
+Many engineers wonder why an intermediate process (\texttt{containerd-shim}) runs alongside every container. The shim solves critical architectural requirements:
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{Daemonless Containers:} \texttt{runc} is designed to configure namespaces, launch the application entrypoint, and immediately exit. The container process is reparented to the \texttt{containerd-shim}.
+  \item \textbf{Zero-Downtime Restarts:} If the \texttt{containerd} daemon crashes or is upgraded during a node maintenance cycle, the containers do not die. The shim keeps file descriptors (\texttt{stdin}, \texttt{stdout}, \texttt{stderr}) open and buffers output until containerd reconnects.
+  \item \textbf{Accurate Exit Codes:} The shim captures the exact process exit status code and reports it back asynchronously to the control plane.
+\end{itemize}
+
+\section{Kubernetes Control Plane Internals}
+
+The Kubernetes control plane is a distributed state reconciliation machine. It operates continuously to align the cluster's \textbf{actual state} with its declared \textbf{desired state}.
+
+\subsection{\texttt{kube-apiserver} and Admission Webhooks}
+The \texttt{kube-apiserver} is the sole gateway to the cluster. All components communicate exclusively with the apiserver; no component touches \texttt{etcd} directly. When an API call arrives (e.g., \texttt{kubectl apply -f deployment.yaml}), it traverses a strict sequential pipeline:
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Authentication:} Authenticates the caller via X.509 client certificates, Bearer tokens, or OpenID Connect (OIDC).
+  \item \textbf{Authorization:} Evaluates permissions via Role-Based Access Control (RBAC) evaluating $\langle \text{Subject}, \text{Verb}, \text{Resource}, \text{Namespace} \rangle$.
+  \item \textbf{Mutating Admission Controllers:} Calls registered webhooks that can alter the object before creation (e.g., injecting Istio Envoy sidecars or setting default security contexts).
+  \item \textbf{Schema Validation:} Verifies that the JSON/YAML payload adheres to the API schema specifications.
+  \item \textbf{Validating Admission Controllers:} Calls webhooks that evaluate organizational compliance policies (e.g., Kyverno or OPA Gatekeeper rejecting containers without resource limits or running as root). If any validating webhook rejects the object, the transaction aborts.
+  \item \textbf{Persistence to \texttt{etcd}:} The validated object is committed to \texttt{etcd}.
+\end{enumerate}
+
+\subsection{\texttt{etcd}: Distributed Consensus and MVCC}
+\texttt{etcd} is a strongly consistent distributed key-value store governed by the \textbf{Raft consensus algorithm}. It provides two fundamental architectural guarantees:
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{Raft Quorum:} Writes require acknowledgement from a strict majority:
+  \begin{equation}
+  Q = \left\lfloor \frac{N}{2} \right\rfloor + 1
+  \end{equation}
+  A 3-node cluster tolerates 1 node failure ($Q = 2$); a 5-node cluster tolerates 2 failures ($Q = 3$).
+  \item \textbf{Multi-Version Concurrency Control (MVCC):} \texttt{etcd} never mutates data in place. Every modification increments a global 64-bit revision counter. Past revisions remain readable, allowing \texttt{kube-apiserver} to watch for streaming changes via HTTP/2 gRPC streams starting from a specific revision without locking the database.
+\end{itemize}
+
+\subsection{\texttt{kube-scheduler}: Two-Phase Placement Algorithm}
+When a Pod is committed to \texttt{etcd} without a \texttt{nodeName}, the \texttt{kube-scheduler} assigns it to an optimal worker node through two distinct phases:
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Phase 1: Filtering (Predicates):} Evaluates hard architectural constraints to prune unqualified nodes. Checks include:
+  \begin{itemize}[leftmargin=10pt]
+    \item \texttt{NodeResourcesFit}: Does the node have unreserved CPU and memory exceeding the Pod's requests?
+    \item \texttt{NodePorts}: Are the requested host ports already bound?
+    \item \texttt{NodeAffinity} and \texttt{PodTopologySpread}: Do node labels satisfy placement criteria?
+    \item \texttt{TaintsAndTolerations}: Does the node possess taints that the Pod cannot tolerate?
+  \end{itemize}
+  \item \textbf{Phase 2: Scoring (Priorities):} Evaluates the filtered candidate nodes on a 0--100 scale using weighted plugins:
+  \begin{itemize}[leftmargin=10pt]
+    \item \texttt{NodeResourcesBalancedAllocation}: Scores nodes highest that maintain an equal ratio of CPU to memory utilization after placing the pod.
+    \item \texttt{ImageLocality}: Awards bonus points to nodes that already have the container image layers cached locally, minimizing pull latency.
+  \end{itemize}
+  The node with the highest cumulative score is selected, and a \texttt{Binding} object is written to \texttt{kube-apiserver}.
+\end{enumerate}
+
+\section{Worker Node Internals: The Kubelet and PLEG}
+
+The \textbf{\texttt{kubelet}} is the primary agent running on each worker node. It does not inspect Deployments or ReplicaSets; it cares strictly about \textbf{Pods} assigned to its specific node.
+
+\subsection{The \texttt{syncLoop} and PLEG}
+The heart of the kubelet is an infinite event loop: the \textbf{\texttt{syncLoop}}. The loop multiplexes updates from three channels:
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{Config Channel:} Watches the \texttt{kube-apiserver} for pod assignment events.
+  \item \textbf{File Channel:} Scans local manifests (used for static control plane pods in \texttt{/etc/kubernetes/manifests}).
+  \item \textbf{PLEG Channel:} Receives events from the \textbf{Pod Lifecycle Event Generator}.
+\end{itemize}
+
+\begin{underthehoodbox}[How PLEG Works and Why It Fails]
+Before PLEG existed, kubelet polled the container runtime every second for every container, generating an $O(N)$ CPU storm on large nodes. PLEG replaced this with a relisting loop: every second, PLEG calls \texttt{containerd} over CRI to list all containers, compares the returned state against its internal cache, and translates the diffs into discrete events (\texttt{ContainerStarted}, \texttt{ContainerDied}). 
+
+If the underlying container runtime or OverlayFS filesystem becomes unresponsive (e.g., due to heavy disk I/O wait, hanging NFS mounts, or kernel thread exhaustion), the PLEG relist call blocks. If PLEG fails to complete its loop within 3 minutes, the kubelet marks itself \textbf{\texttt{PLEG is not healthy}}, triggering the control plane to mark the node \texttt{NotReady} and evict all workloads.
+\end{underthehoodbox}
+
+\section{Autoscaling Architectures: HPA and KEDA}
+
+Scaling microservices dynamically in response to real-world traffic spikes is fundamental to cloud reliability.
+
+\subsection{Horizontal Pod Autoscaler (HPA) Algorithm}
+The native Kubernetes HPA executes a periodic control loop (every 15 seconds) calculating the target replica count:
+\begin{equation}
+\text{desiredReplicas} = \left\lceil \text{currentReplicas} \times \left( \frac{\text{currentMetricValue}}{\text{desiredMetricValue}} \right) \right\rceil
+\end{equation}
+
+For example, if an application currently runs 10 replicas with an average CPU utilization of 80\%, and the target threshold is 50\%:
+\begin{equation*}
+\text{desiredReplicas} = \left\lceil 10 \times \left( \frac{80}{50} \right) \right\rceil = \lceil 16.0 \rceil = 16 \text{ replicas}.
+\end{equation*}
+
+\begin{productionwarningbox}[HPA Flapping and Stabilization Windows]
+Without damping, rapid oscillations in traffic create \textbf{flapping} (scaling up and down rapidly), causing severe thrashing and JVM/startup latency overhead. Production HPA manifests should always specify a stabilization window:
+\begin{lstlisting}[language=bash]
+behavior:
+  scaleDown:
+    stabilizationWindowSeconds: 300 # Evaluates highest demand over last 5 min
+    policies:
+    - type: Percent
+      value: 10
+      periodSeconds: 60 # Limit scale-down to max 10% per minute
+\end{lstlisting}
+\end{productionwarningbox}
+
+\subsection{Kubernetes Event-driven Autoscaling (KEDA)}
+While standard HPA relies on resource metrics (CPU/Memory) scraped via \texttt{metrics-server}, modern microservices scale based on \textbf{external event queues} (e.g., Kafka consumer lag, Azure Service Bus queue depth). Furthermore, native HPA cannot scale a deployment down to \textbf{zero replicas}.
+
+\textbf{KEDA} solves this by introducing two components:
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{KEDA Operator:} Reconciles custom resources (\texttt{ScaledObject}) and activates or deactivates deployments between 0 and 1 replica.
+  \item \textbf{KEDA Metrics Server:} Implements the Kubernetes External Metrics API, serving real-time event counts directly to HPA for scaling between 1 and $N$ replicas.
+\end{enumerate}
+
+\begin{lstlisting}[language=bash, caption={Production KEDA ScaledObject Manifest for Azure Service Bus}]
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: order-processor-scaler
+  namespace: banking-prod
+spec:
+  scaleTargetRef:
+    name: order-processor-deployment
+  minReplicaCount: 0  # True scale-to-zero capability
+  maxReplicaCount: 50
+  cooldownPeriod: 300
+  triggers:
+  - type: azure-servicebus
+    metadata:
+      queueName: pending-transactions
+      messageCount: "100" # Scale 1 pod for every 100 messages in queue
+    authenticationRef:
+      name: keda-trigger-auth-spiffe
+\end{lstlisting}
+
+\begin{realworldbox}[The Nightmare of Unset Memory Limits in Production]
+A tier-1 fintech processing securities trading migrated its core microservice from virtual machines to a bare-metal Kubernetes cluster. The platform team omitted \texttt{resources.limits.memory} in the Pod spec, relying on Java's default runtime heuristics. Java 17 detected the \emph{node's total physical memory} (256 GB) rather than a container allocation. As the heap grew during market opening, the single Java process consumed 190 GB of RAM. The Linux kernel's global host OOM Killer activated. Because the pod had no limit, it possessed a default BestEffort \texttt{oom\_score\_adj} of 1000. The kernel terminated the Java process mid-transaction, leaving thousands of multi-million dollar trades in a half-committed state. Specifying explicit memory requests and limits matching the JVM \texttt{-Xmx} ceiling prevented all future occurrences.
+\end{realworldbox}
+
+\section{Chapter Summary \& Key Takeaways}
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{Kernel Virtualization:} Containers are standard Linux processes restricted by Namespaces (isolation) and cgroups (quotas). The kernel provides \texttt{clone}, \texttt{unshare}, and \texttt{setns}.
+  \item \textbf{cgroups v2:} Unified hierarchy under \texttt{/sys/fs/cgroup}. \texttt{cpu.max} restricts CPU bandwidth in CFS periods; \texttt{memory.max} enforces hard memory limits, triggering the OOM killer when breached.
+  \item \textbf{\texttt{overlay2}:} Merges immutable read-only \texttt{lowerdir} layers with a private read-write \texttt{upperdir}. File alterations trigger Copy-on-Write (copy-up); deletions generate character device whiteouts.
+  \item \textbf{Runtime Architecture:} The OCI layer descends from \texttt{kubelet} $\to$ \texttt{containerd} (CRI) $\to$ \texttt{containerd-shim} $\to$ \texttt{runc}. The shim isolates containers from daemon crashes and preserves I/O.
+  \item \textbf{Control Plane:} \texttt{kube-apiserver} executes authentication, RBAC, mutating webhooks, schema validation, and validating webhooks before committing state to \texttt{etcd}.
+  \item \textbf{Scheduling \& Nodes:} \texttt{kube-scheduler} filters nodes via predicates and scores them via priorities. The \texttt{kubelet} reconciles node state via its \texttt{syncLoop} and the PLEG event generator.
+  \item \textbf{Autoscaling:} HPA scales horizontally based on metric ratios with stabilization windows. KEDA enables event-driven scale-to-zero based on queue backlogs.
+\end{itemize}
+
+\section{Exercises}
+
+\subsection{Mechanics}
+\begin{enumerate}[leftmargin=18pt]
+  \item A container's \texttt{cpu.max} file is configured with the values \texttt{350000 100000}. Calculate the exact equivalent in Kubernetes CPU millicores. If three processes inside this cgroup concurrently run compute-heavy infinite loops, what percentage of CPU bandwidth does each receive?
+  \item An application is running 8 replicas with an average memory consumption of 720 MiB. The HPA is configured with a target metric of 500 MiB per pod. Calculate the new desired replica count calculated by the HPA algorithm.
+\end{enumerate}
+
+\subsection{Debugging}
+\begin{enumerate}[leftmargin=18pt]
+  \setcounter{enumi}{2}
+  \item A critical Kubernetes worker node suddenly enters the \texttt{NotReady} state. Inspecting \texttt{/var/log/syslog} reveals the repeating error: \texttt{PLEG is not healthy: pleg was last seen active 3m12s ago; threshold is 3m0s}. Provide a systematic root-cause analysis workflow to isolate whether this issue is caused by container runtime lockup, disk I/O starvation, or kernel thread contention.
+\end{enumerate}
+
+\subsection{Architecture}
+\begin{enumerate}[leftmargin=18pt]
+  \setcounter{enumi}{3}
+  \item Design a complete Pod specification and autoscaling policy for a message-driven transaction consumer processing data from an external Kafka topic. The pod must guarantee that it is never killed by the host OOM killer during peak spikes, must spread across at least three distinct Availability Zones, must not flap during sudden traffic halts, and must scale from 0 to 40 replicas based on Kafka consumer group lag.
+\end{enumerate}
+
+\section{Detailed Solutions}
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Solution (Mechanics):}\\
+  The quota allows 350,000 $\mu$s per 100,000 $\mu$s period:
+  \begin{equation*}
+  \text{Cores} = \frac{350000}{100000} = 3.5 \text{ CPU cores} = 3500 \text{ millicores (m)}.
+  \end{equation*}
+  The Completely Fair Scheduler (CFS) allocates bandwidth equally among active compute threads within the cgroup. Each of the three threads receives:
+  \begin{equation*}
+  \frac{3.5 \text{ cores}}{3} \approx 1.167 \text{ cores (33.3\% of the cgroup bandwidth)}.
+  \end{equation*}
+
+  \item \textbf{Solution (Mechanics):}\\
+  Using the HPA formula:
+  \begin{equation*}
+  \text{desiredReplicas} = \left\lceil \text{currentReplicas} \times \left( \frac{\text{currentMetric}}{\text{desiredMetric}} \right) \right\rceil = \left\lceil 8 \times \left( \frac{720}{500} \right) \right\rceil = \lceil 8 \times 1.44 \rceil = \lceil 11.52 \rceil = 12 \text{ replicas}.
+  \end{equation*}
+
+  \item \textbf{Solution (Debugging):}\\
+  \textbf{Step 1: Check Disk I/O Wait.} Execute \texttt{iostat -xz 1 10} or \texttt{vmstat 1}. If \texttt{\%iowait} is high or disk utilization is near 100\%, the containerd daemon's OverlayFS snapshot operations are blocked waiting on disk storage.\\
+  \textbf{Step 2: Inspect containerd Thread Locks.} Run \texttt{crictl --runtime-endpoint unix:///run/containerd/containerd.sock ps}. If \texttt{crictl} hangs or times out, containerd has suffered an internal mutex deadlock or is blocked on a dead kernel syscall.\\
+  \textbf{Step 3: Analyze D-State Processes.} Run \texttt{ps aux | awk '\$8 \textasciitilde{} /D/'}. Processes in uninterruptible sleep (state \texttt{D}) indicate kernel threads blocked on hardware I/O or network file locks (e.g., hanging NFS/CSI drivers).\\
+  \textbf{Step 4: Check cgroup Memory Pressure.} Inspect \texttt{/sys/fs/cgroup/memory.pressure} to see if severe memory compaction and page thrashing is causing extreme scheduling latency.
+
+  \item \textbf{Solution (Architecture):}\\
+  Deploy the Pod with:
+  \begin{itemize}[leftmargin=12pt]
+    \item \textbf{Guaranteed QoS Class:} Set \texttt{resources.requests.memory} == \texttt{resources.limits.memory} (e.g., \texttt{2Gi}) and \texttt{requests.cpu} == \texttt{limits.cpu} (e.g., \texttt{2000m}). This sets \texttt{oom\_score\_adj} to -997, ensuring the host kernel never kills the pod ahead of BestEffort/Burstable pods.
+    \item \textbf{Topology Spread Constraints:} Add \texttt{topologySpreadConstraints} with \texttt{topologyKey: "topology.kubernetes.io/zone"}, \texttt{maxSkew: 1}, and \texttt{whenUnsatisfiable: DoNotSchedule} across 3 zones.
+    \item \textbf{KEDA ScaledObject:} Configure a Kafka trigger targeting the specific consumer group lag with a threshold of 500 messages per replica. Set \texttt{minReplicaCount: 0} and \texttt{maxReplicaCount: 40}. Add a scale-down stabilization window of 300 seconds to prevent flapping.
+  \end{itemize}
+\end{enumerate}
+
+\section{Further Reading \& Citations}
+\begin{itemize}[leftmargin=15pt]
+  \item Kerrisk, M. \emph{The Linux Programming Interface}. No Starch Press, 2010.
+  \item Open Container Initiative. \emph{OCI Runtime and Image Specifications}, \texttt{opencontainers.org}.
+  \item Ongaro, D., and Ousterhout, J. \emph{In Search of an Understandable Consensus Algorithm (Raft)}. USENIX ATC, 2014.
+  \item Kubernetes Authors. \emph{Kubernetes Production Patterns and Architecture}, Cloud Native Computing Foundation (CNCF), 2025.
+\end{itemize}

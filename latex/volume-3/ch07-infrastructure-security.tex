@@ -1,0 +1,380 @@
+\chapter{Infrastructure Security}
+\label{ch:infrastructure-security}
+
+\begin{chaptergoalsbox}
+\textbf{What You Will Learn:}
+\begin{itemize}[leftmargin=12pt]
+  \item NIST SP 800-207 Zero Trust Architecture (ZTA) principles: continuous verification, assume breach, and Policy Decision/Enforcement Points (PDP/PEP).
+  \item Enterprise identity governance: Azure Role-Based Access Control (RBAC), fine-grained \texttt{actions}/\texttt{notActions}, and Just-In-Time (JIT) Privileged Identity Management (PIM).
+  \item Cryptographic workload identity using SPIFFE/SPIRE: SPIFFE IDs, X.509/JWT SVIDs, node attestation, and workload attestation.
+  \item Workload Identity Federation: eliminating static service principal secrets via RFC 7523/8693 OIDC token exchange in GitHub Actions and Kubernetes.
+  \item Cloud Key Management Systems (KMS): Hardware Security Modules (HSM), envelope encryption (KEK/DEK), and automated secret rotation.
+  \item Mounting secrets securely into Kubernetes pods via the Azure Key Vault Secrets Store CSI Driver with \texttt{tmpfs} memory isolation.
+\end{itemize}
+
+\textbf{What You Should Already Understand:}
+\begin{itemize}[leftmargin=12pt]
+  \item Public-key infrastructure (PKI): TLS handshakes, asymmetric key cryptography, Certificate Authorities (CAs), and X.509 certificate chains.
+  \item OAuth 2.0 authorization flows and OpenID Connect (OIDC) JWT token structures (header, payload, signature).
+  \item Kubernetes Pod architectures and volume mounts (covered in Chapter~\ref{ch:docker-kubernetes}).
+\end{itemize}
+
+\textbf{Why This Topic Exists:}
+The traditional ``castle-and-moat'' security model---where everything inside the corporate firewall or private subnet is trusted implicitly---is dead. Sophisticated threat actors routinely bypass perimeter firewalls through compromised VPN credentials, phishing, or third-party supply chain exploits. Modern infrastructure security demands that every workload, user, and network packet be continuously authenticated, strictly authorized, and cryptographically verified.
+
+\textbf{Motivating Practical Problem:}
+A global fintech infrastructure is breached when an attacker discovers a static Azure Service Principal client secret hardcoded in a decommissioned developer repository. The compromised credential possesses permanent, standing \texttt{Contributor} permissions across the entire production subscription. The attacker moves laterally, accesses the unencrypted core database connection string, and extracts customer financial records. How do you re-architect the entire infrastructure to enforce Zero Trust, replace static secrets with federated OIDC workload identities, mandate mTLS via SPIFFE/SPIRE, and manage secrets using Hardware Security Module (HSM) envelope encryption?
+\end{chaptergoalsbox}
+
+\section{Zero Trust Architecture (ZTA) Fundamentals}
+
+For decades, enterprise security relied on physical and virtual network perimeters: once a user or server was inside the corporate intranet or VPN boundary, it could communicate freely with other internal servers. This model failed disastrously when attackers gained internal footholds and moved laterally unimpeded.
+
+\subsection{The NIST SP 800-207 Tenets}
+Published by the National Institute of Standards and Technology, **NIST SP 800-207** codifies the foundational principles of **Zero Trust Architecture (ZTA)**:
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Verify Explicitly:} Always authenticate and authorize based on all available data points---including identity, physical location, device health, service context, and anomalous behavior heuristics. Never grant implicit trust based on network topology or IP address.
+  \item \textbf{Use Least Privilege Access:} Constrain user and machine access using Just-In-Time (JIT) and Just-Enough-Access (JEA) principles, risk-based adaptive policies, and data protection mechanisms.
+  \item \textbf{Assume Breach:} Minimize the blast radius by segmenting networks, encrypting all data in transit and at rest, utilizing automated threat detection, and treating internal networks as if they were the hostile public internet.
+\end{enumerate}
+
+\subsection{The Policy Engine: PDP and PEP}
+Zero Trust operationalizes access through two decoupled architectural components:
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{Policy Decision Point (PDP):} The centralized brain that evaluates policy rules, organizational compliance criteria, and real-time telemetry (threat intelligence, device posture) to decide whether to grant, challenge, or deny an access request.
+  \item \textbf{Policy Enforcement Point (PEP):} The distributed gatekeeper (e.g., an Envoy reverse proxy, an API gateway, or a kernel firewall module) that intercepts the communication session and enforces the PDP's decision.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.9, every node/.style={scale=0.9},
+  node distance=1.1cm and 1.2cm,
+  subject/.style={rectangle, draw=headingblue, fill=headingblue!5, rounded corners=2pt, text width=3.2cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  pep/.style={rectangle, draw=warningRed, fill=warningBg, rounded corners=2pt, text width=3.2cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  pdp/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, text width=4.6cm, minimum height=1.2cm, align=center, font=\sffamily\scriptsize\bfseries},
+  resource/.style={rectangle, draw=exampleBlue, fill=exampleBg, rounded corners=2pt, text width=3.2cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=headingblue}
+]
+
+\node[subject] (subj) {Subject / Workload\\(Requesting Access)};
+\node[pep, right=1.4cm of subj] (pep) {Policy Enforcement\\Point (PEP)\\(Envoy Proxy / Gateway)};
+\node[resource, right=1.4cm of pep] (res) {Protected Resource\\(Database / Ledger)};
+\node[pdp, above=1.2cm of pep] (pdp) {Policy Decision Point (PDP)\\Continuous Trust Evaluation\\(Identity, Posture, Threat Intel)};
+
+\draw[arrow] (subj) -- node[above, font=\tiny\sffamily]{1. Request} (pep);
+\draw[arrow, <->] (pep) -- node[right, font=\tiny\sffamily]{2. Evaluate Policy} (pdp);
+\draw[arrow] (pep) -- node[above, font=\tiny\sffamily]{3. Forward (mTLS)} (res);
+
+\end{tikzpicture}
+\caption{NIST SP 800-207 Zero Trust Policy Decision and Enforcement Architecture}
+\label{fig:zero-trust-pdp-pep}
+\end{figure}
+
+\section{Least Privilege Access Control: Advanced RBAC and PIM}
+
+In cloud architectures, identities---not network addresses---form the primary security perimeter.
+
+\subsection{Azure Role-Based Access Control (RBAC) Anatomy}
+Azure RBAC controls management-plane access. A role assignment consists of three parts:
+\begin{equation}
+\text{Role Assignment} = \langle \text{Security Principal}, \text{Role Definition}, \text{Scope} \rangle
+\end{equation}
+
+A **Role Definition** is a JSON policy declaring allowed and denied operations:
+\begin{lstlisting}[language=bash, caption={Custom Least-Privilege Azure RBAC Role Definition}]
+{
+  "Name": "Banking Key Vault Secret Auditor",
+  "IsCustom": true,
+  "Description": "Permits reading vault metadata and secrets without granting vault administration.",
+  "Actions": [
+    "Microsoft.KeyVault/vaults/read",
+    "Microsoft.Insights/metrics/read"
+  ],
+  "NotActions": [
+    "Microsoft.KeyVault/vaults/write",
+    "Microsoft.KeyVault/vaults/delete"
+  ],
+  "DataActions": [
+    "Microsoft.KeyVault/vaults/secrets/getSecret/action"
+  ],
+  "NotDataActions": [
+    "Microsoft.KeyVault/vaults/secrets/setSecret/action"
+  ],
+  "AssignableScopes": [
+    "/subscriptions/a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d"
+  ]
+}
+\end{lstlisting}
+
+\subsection{Privileged Identity Management (PIM) and JIT Access}
+Standing administrative privileges (e.g., permanent 24/7 \texttt{Owner} permissions on a subscription) represent catastrophic breach risk. If an administrator's credentials leak, the attacker inherits full control immediately.
+
+**Azure AD / Entra Privileged Identity Management (PIM)** eliminates standing privileges through **Just-In-Time (JIT)** access:
+\begin{itemize}[leftmargin=12pt]
+  \item Administrators hold **Eligible** roles, not **Active** roles. In daily operations, their account has zero administrative permissions.
+  \item When an operational change is required, the engineer requests role activation via PIM, providing a ticket number and business justification.
+  \item PIM enforces mandatory Multi-Factor Authentication (MFA) and routes the request to designated approvers.
+  \item Upon approval, the role activates for a strict time window (e.g., 4 hours), after which permissions revoke automatically.
+\end{itemize}
+
+\section{Mutual TLS (mTLS) with SPIFFE and SPIRE}
+
+In microservice environments spanning multiple clouds, on-premises datacenters, and Kubernetes clusters, IP addresses are ephemeral and easily spoofed. Applications require a universal, cryptographically verifiable standard for **workload identity**.
+
+\subsection{The SPIFFE Standard}
+The **Secure Production Identity Framework for Everyone (SPIFFE)** defines an open standard for workload identification:
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{SPIFFE ID:} A standardized URI scheme uniquely identifying a workload:
+  \begin{equation*}
+  \texttt{spiffe://prod.banking.contoso.com/ns/payment/sa/ledger-service}
+  \end{equation*}
+  \item \textbf{SPIFFE Verifiable Identity Document (SVID):} A cryptographic document encoding the SPIFFE ID. SVIDs exist primarily as **X.509 certificates** (for mutual TLS) or **JWT tokens** (for HTTP authorization headers).
+\end{itemize}
+
+\subsection{SPIRE Architecture: Node and Workload Attestation}
+**SPIRE (SPIFFE Runtime Environment)** is the production reference implementation of SPIFFE. It consists of two components:
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{SPIRE Server:} Acts as the root Certificate Authority (CA) for the trust domain, storing registration entries and managing trust bundles.
+  \item \textbf{SPIRE Agent:} Runs as a daemon on every physical host or Kubernetes worker node, exposing a local Unix Domain Socket implementing the **SPIFFE Workload API**.
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.85, every node/.style={scale=0.85},
+  node distance=1.0cm and 1.2cm,
+  server/.style={rectangle, draw=headingblue, fill=headingblue!5, rounded corners=2pt, text width=3.8cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  agent/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, text width=3.8cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  workload/.style={rectangle, draw=exampleBlue, fill=exampleBg, rounded corners=2pt, text width=3.8cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  kernel/.style={rectangle, draw=gray!70, fill=gray!10, rounded corners=2pt, text width=3.8cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=headingblue}
+]
+
+\node[server] (server) {SPIRE Server\\(Trust Domain CA)};
+\node[agent, below=1.2cm of server] (agent) {SPIRE Agent (Node Daemon)\\\texttt{/run/spire/sockets/workload.sock}};
+\node[kernel, right=1.6cm of agent] (kernel) {Linux Kernel / Kubelet\\(cgroups, UID/GID, Pod Labels)};
+\node[workload, below=1.2cm of agent] (pod) {Application Container\\(Ledger Microservice)};
+
+\draw[arrow, <->] (server) -- node[right, font=\tiny\sffamily]{1. Node Attestation (TPM/Azure MSI)} (agent);
+\draw[arrow] (pod) -- node[left, font=\tiny\sffamily]{2. Call Workload API} (agent);
+\draw[arrow, <->] (agent) -- node[above, font=\tiny\sffamily]{3. Inspect Process} (kernel);
+\draw[arrow] (agent) -- node[right, font=\tiny\sffamily]{4. Issue X.509 SVID (Short-lived)} (pod);
+
+\end{tikzpicture}
+\caption{SPIFFE/SPIRE Workload Attestation and SVID Issuance Lifecycle}
+\label{fig:spire-attestation}
+\end{figure}
+
+The attestation workflow operates with zero shared secrets:
+\begin{itemize}[leftmargin=12pt]
+  \item \textbf{Node Attestation:} When the SPIRE Agent boots, it proves its hardware identity to the SPIRE Server using cryptographically signed platform assertions (e.g., Azure Managed Identity tokens, AWS IAM instance documents, or TPM chips).
+  \item \textbf{Workload Attestation:} When an application container connects to the local Workload API Unix socket, the SPIRE Agent interrogates the Linux kernel using \texttt{getsockopt(SO\_PEERCRED)} to retrieve the caller's PID. It then inspects the host kernel's \texttt{/proc/<pid>/cgroup} and the Kubernetes kubelet API to verify the container's namespace, ServiceAccount, and image digest.
+  \item \textbf{SVID Delivery \& Auto-Rotation:} Once validated, the SPIRE Agent dynamically mints an X.509 SVID certificate valid for only \textbf{60 minutes}. The agent automatically rotates the certificate in-memory before expiration, providing continuous, seamless zero-downtime mTLS across all microservices.
+\end{itemize}
+
+\section{Workload Identity Federation: Eliminating Static Secrets}
+
+Historically, external systems (such as GitHub Actions CI/CD runners or Kubernetes pods) authenticated to cloud platforms like Azure by creating a **Service Principal** with a static password (client secret):
+\begin{equation*}
+\text{Client Secret: } \texttt{abc123\_SuperSecretPasswordThatNeverExpires!}
+\end{equation*}
+
+This practice creates acute security vulnerabilities: secrets are routinely committed to Git repositories, logged in CI terminal logs, or compromised when developer machines are breached.
+
+\subsection{RFC 7523 / RFC 8693 Token Exchange}
+**Workload Identity Federation** eliminates static cloud credentials entirely by implementing standard **OpenID Connect (OIDC)** token exchange:
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.85, every node/.style={scale=0.85},
+  node distance=1.1cm and 1.2cm,
+  gh/.style={rectangle, draw=headingblue, fill=headingblue!5, rounded corners=2pt, text width=3.8cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  runner/.style={rectangle, draw=exampleBlue, fill=exampleBg, rounded corners=2pt, text width=3.8cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  entra/.style={rectangle, draw=intuitionTeal, fill=intuitionBg, rounded corners=2pt, text width=3.8cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  arm/.style={rectangle, draw=warningRed, fill=warningBg, rounded corners=2pt, text width=3.8cm, minimum height=1.0cm, align=center, font=\sffamily\scriptsize\bfseries},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=headingblue}
+]
+
+\node[runner] (run) {GitHub Actions Runner\\\texttt{release.yaml}};
+\node[gh, above=1.2cm of run] (gh) {GitHub OIDC Provider\\\texttt{token.actions.githubusercontent.com}};
+\node[entra, right=2.0cm of run] (entra) {Microsoft Entra ID\\Federated Identity Credential};
+\node[arm, right=2.0cm of entra] (arm) {Azure Resource Manager\\(ARM API Access)};
+
+\draw[arrow] (run) -- node[left, font=\tiny\sffamily]{1. Request JWT} (gh);
+\draw[arrow] (gh) -- node[right, font=\tiny\sffamily]{2. Signed OIDC Token} (run);
+\draw[arrow] (run) -- node[above, font=\tiny\sffamily]{3. Exchange Token (RFC 8693)} (entra);
+\draw[arrow] (entra) -- node[above, font=\tiny\sffamily]{4. Scoped OAuth Token} (run);
+\draw[arrow] (run) to [bend right=35] node[below, font=\tiny\sffamily]{5. Authenticated Azure API Calls} (arm);
+
+\end{tikzpicture}
+\caption{OIDC Workload Identity Federation Authentication Sequence}
+\label{fig:workload-identity-flow}
+\end{figure}
+
+The authentication sequence operates as follows:
+\begin{enumerate}[leftmargin=15pt]
+  \item The GitHub Actions runner requests a cryptographically signed OIDC JSON Web Token from GitHub's internal token service.
+  \item The token contains standard claims asserting the repository context:
+  \begin{lstlisting}[language=bash]
+  {
+    "iss": "https://token.actions.githubusercontent.com",
+    "sub": "repo:contoso/banking:ref:refs/heads/main",
+    "aud": "api://AzureADTokenExchange"
+  }
+  \end{lstlisting}
+  \item The runner transmits this JWT to Microsoft Entra ID.
+  \item Entra ID downloads GitHub's public JSON Web Key Set (JWKS), validates the cryptographic signature, and checks the configured **Federated Identity Credential**. If the subject (\texttt{sub}) matches, Entra ID issues a short-lived (1-hour) Azure access token.
+  \item Zero passwords or static secrets are ever stored in GitHub Actions secrets!
+\end{enumerate}
+
+\begin{lstlisting}[language=bash, caption={Terraform HCL for Azure Federated Identity Credential}]
+resource "azurerm_user_assigned_identity" "ci_identity" {
+  name                = "uai-github-ci"
+  resource_group_name = "rg-banking-prod"
+  location            = "eastus"
+}
+
+resource "azurerm_federated_identity_credential" "github_prod" {
+  name                = "fed-github-main-branch"
+  resource_group_name = "rg-banking-prod"
+  audience            = ["api://AzureADTokenExchange"]
+  issuer              = "https://token.actions.githubusercontent.com"
+  parent_id           = azurerm_user_assigned_identity.ci_identity.id
+  subject             = "repo:contoso/banking:ref:refs/heads/main"
+}
+\end{lstlisting}
+
+\section{Azure Key Vault and Cloud KMS Secret Management}
+
+Managing cryptographic keys and runtime application secrets requires dedicated Hardware Security Modules (HSMs).
+
+\subsection{Envelope Encryption Architecture (KEK and DEK)}
+Encrypting gigabytes of data directly inside an HSM is computationally inefficient. Enterprise systems employ **Envelope Encryption**:
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Data Encryption Key (DEK):} An ephemeral symmetric AES-256 key generated locally by the application to rapidly encrypt data payloads.
+  \item \textbf{Key Encryption Key (KEK):} An asymmetric or symmetric master key that resides permanently within a FIPS 140-2 Level 2/3 Hardware Security Module in **Azure Key Vault**. The KEK never leaves the physical boundaries of the HSM.
+  \item The application sends the raw DEK to Key Vault's \texttt{wrapKey} API. Key Vault encrypts the DEK using the KEK and returns the **Encrypted DEK**.
+  \item The application stores the Encrypted DEK alongside the encrypted data, discarding the plaintext DEK from memory.
+\end{enumerate}
+
+\subsection{Kubernetes Azure Key Vault Secrets Store CSI Driver}
+Storing secrets as native Kubernetes \texttt{Secret} objects is hazardous: by default, Kubernetes secrets are merely base64-encoded strings stored in \texttt{etcd}.
+
+The **Secrets Store CSI Driver** allows Kubernetes to mount secrets, keys, and certificates directly from Azure Key Vault into pod containers as an in-memory **\texttt{tmpfs} volume**:
+
+\begin{lstlisting}[language=bash, caption={SecretProviderClass Manifest for In-Memory Secret Mounting}]
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: azure-kv-secret-provider
+  namespace: banking-prod
+spec:
+  provider: azure
+  parameters:
+    usePodIdentity: "false"
+    clientID: "d3b07384-d113-4f9e-b92c-7b81b8b8b8b8" # Managed Identity Client ID
+    keyvaultName: "kv-banking-prod"
+    cloudName: "AzurePublicCloud"
+    objects: |
+      array:
+        - |
+          objectName: DatabaseConnectionString
+          objectType: secret
+          objectVersion: ""
+    tenantId: "847291a1-3920-4102-a849-591823901234"
+\end{lstlisting}
+
+When the Pod boots, the CSI driver communicates with Azure Key Vault using the pod's federated identity, downloads the secret, and mounts it to \texttt{/mnt/secrets-store/DatabaseConnectionString} on an in-memory RAM disk. No secret is ever written to the node's physical hard drive or stored in \texttt{etcd}. Furthermore, enabling \texttt{secretRotation: true} ensures that when a secret is updated in Key Vault, the mounted file in the running container updates automatically within minutes.
+
+\begin{commonmistakebox}[The Peril of Long-Lived Static Credentials]
+Engineering teams frequently generate Azure Service Principal client secrets with 2-year or 5-year expiration periods to avoid rotational maintenance. If an employee leaves the company or a repository is accidentally cloned to a personal laptop, those standing credentials remain active vectors indefinitely. Workload Identity Federation combined with Azure Managed Identities completely eliminates static credential rotation overhead.
+\end{commonmistakebox}
+
+\begin{realworldbox}[A Catastrophic Lateral Movement via Over-Privileged Managed Identity]
+A retail enterprise configured a user-assigned Managed Identity for an internal web application. Because developers encountered permission errors during testing, a systems engineer assigned the identity the built-in \texttt{Contributor} role at the Subscription root. Six months later, a Server-Side Request Forgery (SSRF) vulnerability was discovered in the web application's image preview parser. The attacker directed the server to issue an HTTP request to the internal Azure Instance Metadata Service (\texttt{http://168.63.129.16/metadata/identity/oauth2/token}). The metadata service returned an OAuth access token for the Managed Identity. Because the identity possessed Subscription Contributor rights, the attacker leveraged the token to delete production storage accounts and compromise peer virtual machines. Enforcing strict least-privilege RBAC definitions with bounded scopes prevents SSRF from escalating to total infrastructure takeover.
+\end{realworldbox}
+
+\begin{tryityourselfbox}[Inspecting Azure Workload Identity Tokens in Kubernetes]
+You can inspect the projected service account token that Kubernetes provides to your pods:
+\begin{lstlisting}[language=bash]
+# Exec into a pod running with Azure Workload Identity configured
+kubectl exec -it my-banking-pod -- /bin/sh
+
+# Inspect the projected OIDC token location
+cat /var/run/secrets/azure/tokens/azure-identity-token
+
+# Decode the JWT token header and claims using jq
+cat /var/run/secrets/azure/tokens/azure-identity-token | jq -R 'split(".") | .[1] | @base64d | fromjson'
+\end{lstlisting}
+Verify that the \texttt{iss} claim points to your AKS OIDC issuer URL and the \texttt{sub} claim displays your exact ServiceAccount name.
+\end{tryityourselfbox}
+
+\section{Chapter Summary \& Key Takeaways}
+\begin{itemize}[leftmargin=15pt]
+  \item \textbf{Zero Trust Tenets:} Verify explicitly, enforce least privilege, and assume breach. Decouple Policy Decision Points (PDP) from Policy Enforcement Points (PEP).
+  \item \textbf{RBAC \& PIM:} Scope role definitions precisely with \texttt{actions} and \texttt{dataActions}. Eliminate standing administrative rights using JIT Privileged Identity Management.
+  \item \textbf{SPIFFE/SPIRE:} Universal cryptographic workload identity. SPIRE agents perform node and workload attestation (cgroups, PIDs) to issue short-lived X.509 SVIDs for automated mTLS.
+  \item \textbf{Workload Identity Federation:} Eliminates static secrets via RFC 7523/8693 OIDC token exchange between external systems (GitHub Actions, Kubernetes) and Azure Entra ID.
+  \item \textbf{Envelope Encryption:} Cloud KMS protects data using an HSM-backed Key Encryption Key (KEK) that wraps local Data Encryption Keys (DEKs).
+  \item \textbf{Secrets Store CSI:} Mounts Key Vault secrets directly into Kubernetes pods on in-memory \texttt{tmpfs} volumes, eliminating plaintext storage in \texttt{etcd}.
+\end{itemize}
+
+\section{Exercises}
+
+\subsection{Mechanics}
+\begin{enumerate}[leftmargin=18pt]
+  \item In a SPIRE deployment, an application pod is issued an X.509-SVID certificate with a validity period of 60 minutes. The SPIRE Agent initiates renewal when 50\% of the certificate lifetime has elapsed. How frequently does the agent rotate certificates? If the SPIRE Server becomes completely unreachable, for how many minutes does the workload continue operating before mTLS handshakes fail?
+  \item A custom Azure RBAC role definition specifies:
+  \begin{lstlisting}[language=bash]
+  Actions: ["Microsoft.Compute/virtualMachines/*"]
+  NotActions: ["Microsoft.Compute/virtualMachines/delete"]
+  \end{lstlisting}
+  Can a user assigned this role restart a virtual machine (\texttt{Microsoft.Compute/virtualMachines/restart/action})? Can they delete a virtual machine? Explain the evaluation rule between \texttt{Actions} and \texttt{NotActions}.
+\end{enumerate}
+
+\subsection{Debugging}
+\begin{enumerate}[leftmargin=18pt]
+  \setcounter{enumi}{2}
+  \item A GitHub Actions workflow configured with Azure Workload Identity Federation suddenly fails at the \texttt{azure/login@v2} step with: \texttt{AADSTS70021: No matching federated identity record found for presented assertion. Subject: repo:contoso/payments:pull\_request}. The engineer insists the federated credential was configured properly. Explain the exact claim mismatch causing this error and provide the correct subject configuration.
+\end{enumerate}
+
+\subsection{Architecture}
+\begin{enumerate}[leftmargin=18pt]
+  \setcounter{enumi}{3}
+  \item Architect a complete Zero Trust security topography for an enterprise banking ledger deployed across Azure Kubernetes Service (AKS). The architecture must guarantee: (1) all inter-service pod communication is authenticated via mTLS using SPIFFE IDs, (2) zero static cloud credentials exist anywhere in the cluster, (3) database credentials in Azure Key Vault are mounted into pods without touching disk or \texttt{etcd}, and (4) administrative cluster access requires JIT approval with a 2-hour automatic revocation.
+\end{enumerate}
+
+\section{Detailed Solutions}
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Solution (Mechanics):}\\
+  Certificate lifetime = 60 minutes. The agent initiates renewal at 50\% lifetime, which is every $60 \times 0.50 = 30 \text{ minutes}$.\\
+  If the SPIRE Server becomes unreachable, the application continues to use its already-issued SVID until the certificate's \texttt{NotAfter} timestamp is reached. Therefore, the workload operates for exactly **60 minutes** from the moment of last certificate issuance before peer mTLS handshakes reject the expired certificate.
+
+  \item \textbf{Solution (Mechanics):}\\
+  Yes, the user can restart the virtual machine; No, they cannot delete it.\\
+  \textbf{Evaluation Rule:} In Azure RBAC, permissions are evaluated by computing:
+  \begin{equation*}
+  \text{Effective Permissions} = \text{Actions} - \text{NotActions}
+  \end{equation*}
+  The wildcard \texttt{Microsoft.Compute/virtualMachines/*} includes the \texttt{restart/action} operation. Since \texttt{restart/action} is not listed in \texttt{NotActions}, it evaluates to \texttt{Allow}. Conversely, the \texttt{delete} action matches the explicit string in \texttt{NotActions}, subtracting it from effective permissions.
+
+  \item \textbf{Solution (Debugging):}\\
+  \textbf{Root Cause:} The GitHub Actions workflow executed on a \texttt{pull\_request} event, which produces an OIDC token with the subject claim: \texttt{repo:contoso/payments:pull\_request}. However, the Azure Federated Identity Credential was configured with the subject: \texttt{repo:contoso/payments:ref:refs/heads/main}. Because the subject strings do not match character-for-character, Entra ID rejects the token exchange.\\
+  \textbf{Remediation:} Either restrict production deployments to execute strictly on pushes to the main branch (\texttt{on: push: branches: [main]}), or configure a dedicated Federated Identity Credential in Azure targeting the pull request subject filter if PR validation against Azure is required.
+
+  \item \textbf{Solution (Architecture):}\\
+  \textbf{1. mTLS \& Identity:} Deploy SPIRE on AKS. The SPIRE Agent runs as a DaemonSet, performing workload attestation using Kubernetes Pod ServiceAccounts. Microservice Envoy sidecars query the local SPIRE Unix socket via the Workload API, securing all inter-pod traffic using mutual TLS with SPIFFE IDs.\\
+  \textbf{2. Workload Identity:} Enable AKS Workload Identity Federation on the cluster. Pods declare a Kubernetes ServiceAccount annotated with \texttt{azure.workload.identity/client-id}. Pods exchange projected service account tokens for Azure Entra access tokens with zero static secrets.\\
+  \textbf{3. Secret Management:} Deploy the Azure Key Vault Secrets Store CSI Driver with the Azure provider. Create a \texttt{SecretProviderClass} mapping database credentials from Azure Key Vault into pods as an in-memory \texttt{tmpfs} mount with automatic rotation enabled.\\
+  \textbf{4. JIT Cluster Administration:} Integrate AKS with Microsoft Entra ID authentication and Azure RBAC for Kubernetes Authorization. Cluster administrator roles (\texttt{Azure Kubernetes Service RBAC Cluster Admin}) are assigned via Privileged Identity Management (PIM) with mandatory MFA and approver sign-off, enforcing a 2-hour maximum active duration.
+\end{enumerate}
+
+\section{Further Reading \& Citations}
+\begin{itemize}[leftmargin=15pt]
+  \item Rose, S., et al. \emph{Zero Trust Architecture (NIST SP 800-207)}. National Institute of Standards and Technology, 2020.
+  \item SPIFFE Project Authors. \emph{SPIFFE and SPIRE: Workload Identity in Cloud-Native Environments}, Linux Foundation / CNCF.
+  \item RFC 7523. \emph{JSON Web Token (JWT) Profile for OAuth 2.0 Client Authentication and Authorization Grants}, IETF.
+  \item Microsoft Learn. \emph{Microsoft Entra Workload Identity Federation Architecture}, 2025.
+\end{itemize}

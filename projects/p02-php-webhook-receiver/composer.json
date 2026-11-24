@@ -1,0 +1,21 @@
+{
+    "name": "curriculum/p02-php-webhook-receiver",
+    "description": "Production Webhook Receiver in PHP 8.3 with HMAC-SHA256, replay defense, idempotency, and retry worker",
+    "type": "project",
+    "require": {
+        "php": ">=8.3"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^10.0 || ^11.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "WebhookReceiver\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "WebhookReceiver\\Tests\\": "tests/"
+        }
+    }
+}

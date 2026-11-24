@@ -1,0 +1,388 @@
+\chapter{Requirements Engineering}
+\label{ch:requirements-engineering}
+
+\begin{chaptergoalsbox}
+\textbf{What You Will Learn:}
+\begin{itemize}[leftmargin=12pt]
+  \item Dissect the taxonomy of requirements using the enterprise FURPS+ framework (Functionality, Usability, Reliability, Performance, Supportability, plus Design, Implementation, Interface, and Physical constraints).
+  \item Master the mathematics of availability: Mean Time Between Failures (MTBF), Mean Time to Repair (MTTR), the exact downtime cost of ``nines'', and composite availability across series and parallel systems.
+  \item Analyze latency distributions with mathematical precision: understanding why arithmetic means are invalid, interpreting p50, p95, p99, and p99.9 tail latencies, detecting Coordinated Omission, and calculating microservice tail amplification.
+  \item Size high-concurrency systems using Little's Law ($L = \lambda W$) to calculate thread pool bounds, queue capacities, and database connection limits.
+  \item Define and engineer Disaster Recovery (DR) architectures based on Recovery Point Objective (RPO) and Recovery Time Objective (RTO).
+\end{itemize}
+
+\textbf{What You Should Already Understand:}
+\begin{itemize}[leftmargin=12pt]
+  \item Elementary probability, probability distributions, and basic calculus.
+  \item Synchronous HTTP request-response mechanics and connection pooling.
+  \item Relational database transactions and storage snapshot backups.
+\end{itemize}
+
+\textbf{Why This Topic Exists:}
+Software systems do not fail because engineers write bad for-loops; they fail because systems are designed against vague, unquantified, or contradictory requirements. When business stakeholders demand ``100\% uptime, zero latency, and real-time cross-region consistency,'' architects must translate business desires into rigorous, mathematically grounded trade-offs.
+
+\textbf{Motivating Practical Problem:}
+A health-tech startup signs a Master Services Agreement with a hospital network promising 99.99\% availability with a 5-minute RTO and \$50,000 hourly outage penalties. Six months into production, a lightning strike at their primary AWS cloud region severs power to their database Availability Zone. The platform team discovers their automated failover requires manual DNS updates taking 45 minutes, and their RDS snapshots run only once every 24 hours. The 4-hour outage costs \$200,000 in penalties and triggers immediate contract termination.
+\end{chaptergoalsbox}
+
+\section{The Taxonomy of Requirements: FURPS+}
+
+Requirements engineering is the discipline of establishing what a system must do (functional requirements) and how well it must perform under real-world constraints (non-functional requirements or quality attributes).
+
+The most comprehensive classification model for enterprise software is the **FURPS+ framework**, originally formulated by Robert Grady at Hewlett-Packard:
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=0.8cm and 1.2cm,
+  main/.style={rectangle, draw=headingblue, fill=headingblue!10, rounded corners=3pt, minimum width=3.2cm, minimum height=1.0cm, font=\sffamily\bfseries\color{headingblue}, align=center},
+  sub/.style={rectangle, draw=gray!60, fill=gray!5, rounded corners=2pt, text width=9.5cm, minimum height=0.9cm, font=\sffamily\scriptsize, inner sep=5pt}
+]
+
+\node[main] (f) {Functionality (F)};
+\node[sub, right=0.8cm of f] (fd) {Feature set, capabilities, business logic, security permissions, data accuracy.};
+
+\node[main, below=0.4cm of f] (u) {Usability (U)};
+\node[sub, right=0.8cm of u] (ud) {Human factors, accessibility (WCAG), internationalization, UX error recovery, documentation.};
+
+\node[main, below=0.4cm of u] (r) {Reliability (R)};
+\node[sub, right=0.8cm of r] (rd) {Availability (nines), MTBF, MTTR, failure frequency, fault tolerance, predictability.};
+
+\node[main, below=0.4cm of r] (p) {Performance (P)};
+\node[sub, right=0.8cm of p] (pd) {Throughput (RPS), latency percentiles (p99/p99.9), resource saturation (CPU/RAM/IOPS).};
+
+\node[main, below=0.4cm of p] (s) {Supportability (S)};
+\node[sub, right=0.8cm of s] (sd) {Testability, maintainability, modularity, configurability, observability (metrics/logs).};
+
+\node[main, below=0.4cm of s] (plus) {The ``+'' Constraints};
+\node[sub, right=0.8cm of plus] (plusd) {Design (SOLID), Implementation (languages, runtimes), Interface (gRPC/REST), Physical (hardware/cloud AZ).};
+
+\end{tikzpicture}
+\caption{The FURPS+ Requirements Taxonomy}
+\label{fig:furps-plus}
+\end{figure}
+
+\section{Availability Mathematics and the Cost of ``Nines''}
+
+System availability is the probability that a system is operational and accessible to service requests at any given point in time:
+\begin{equation}
+A = \frac{\text{Uptime}}{\text{Total Time}} = \frac{\text{MTBF}}{\text{MTBF} + \text{MTTR}}
+\end{equation}
+where:
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{MTBF (Mean Time Between Failures)}: The average duration of uninterrupted operational uptime between successive service incidents.
+  \item \textbf{MTTR (Mean Time to Repair)}: The average time required to diagnose, mitigate, and restore service operation once a failure occurs.
+\end{itemize}
+
+\subsection{The Financial and Operational Cost of Nines}
+
+Every additional ``nine'' of availability reduces permissible downtime by an order of magnitude, but exponentially increases capital expenditure, architectural complexity, and engineering overhead.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Availability Level} & \textbf{Downtime / Year} & \textbf{Downtime / Month} & \textbf{Downtime / Week} & \textbf{Downtime / Day} \\
+\midrule
+99\% (``Two Nines'') & 3.65 days & 7.30 hours & 1.68 hours & 14.40 minutes \\
+99.9\% (``Three Nines'') & 8.76 hours & 43.80 minutes & 10.08 minutes & 1.44 minutes \\
+99.95\% & 4.38 hours & 21.90 minutes & 5.04 minutes & 43.20 seconds \\
+99.99\% (``Four Nines'') & 52.56 minutes & 4.38 minutes & 1.01 minutes & 8.64 seconds \\
+99.999\% (``Five Nines'') & 5.26 minutes & 26.30 seconds & 6.05 seconds & 0.86 seconds \\
+\bottomrule
+\end{tabular}
+\caption{Permissible Downtime Windows Across Availability Tiers}
+\label{tab:availability-nines}
+\end{table}
+
+\begin{intuitionbox}[Twin-Engine Aircraft Redundancy]
+A modern commercial aircraft does not operate with a single massive engine; it operates with two or four independent engines. If an engine fails mid-flight, the probability of the backup engine failing simultaneously during the same emergency window is infinitesimal. In software, we construct parallel redundant systems so that individual node failures do not compromise overall service availability.
+\end{intuitionbox}
+
+\subsection{Composite Availability: Series vs Parallel Redundancy}
+
+A real-world software architecture is a composite graph of dependent components.
+
+\subsubsection{Series Dependencies (The Weakest Link Principle)}
+If a system requires $n$ independent components to function simultaneously in series (e.g., Load Balancer $\rightarrow$ API Gateway $\rightarrow$ Database), the composite availability $A_s$ is the mathematical product of individual availabilities:
+\begin{equation}
+A_s = \prod_{i=1}^n A_i = A_1 \times A_2 \times \dots \times A_n
+\end{equation}
+Notice that for series systems:
+\begin{equation}
+A_s < \min(A_1, A_2, \dots, A_n)
+\end{equation}
+A chain of three components each having 99.9\% availability yields:
+\begin{equation}
+A_s = 0.999 \times 0.999 \times 0.999 = 0.999^3 \approx 0.997 \quad (99.70\%)
+\end{equation}
+Adding more components in series \textit{always decreases} overall system availability.
+
+\subsubsection{Parallel Redundancy (Active-Active / Active-Passive)}
+When $n$ identical independent components operate in parallel redundancy, the overall subsystem fails \textit{only if all $n$ components fail simultaneously}:
+\begin{equation}
+A_p = 1 - \prod_{i=1}^n (1 - A_i)
+\end{equation}
+If two database replicas each have an individual availability of 99.0\% ($0.99$), their composite parallel availability is:
+\begin{equation}
+A_p = 1 - (1 - 0.99)^2 = 1 - (0.01)^2 = 1 - 0.0001 = 0.9999 \quad (99.99\%)
+\end{equation}
+Parallel redundancy successfully converts two unreliable ``two nines'' nodes into a highly resilient ``four nines'' cluster.
+
+\begin{productionwarningbox}[Contracting Five Nines on Three Nines Cloud Infrastructure]
+Cloud hyper-scalers (AWS, Azure, GCP) provide specific Service Level Agreements for individual compute instances. A single AWS EC2 instance offers a 99.5\% SLA. An AWS Application Load Balancer offers 99.99\%. An Amazon RDS Multi-AZ instance offers 99.95\%. If an enterprise system consists of an ALB, an EC2 cluster, and an RDS database in series, the theoretical maximum availability provided by the underlying infrastructure is:
+$$A_{\text{max}} = 0.9999 \times 0.9995 = 0.9994 \quad (99.94\%)$$
+Promising a customer 99.999\% (5 minutes of downtime per year) on top of this cloud infrastructure is mathematically impossible and will result in catastrophic SLA breach penalties.
+\end{productionwarningbox}
+
+\section{Latency Distributions and the Tyranny of Tail Latency}
+
+In performance engineering, measuring latency via the \textbf{arithmetic mean} (average) is an egregious engineering flaw. Latency distributions are not Gaussian (bell-shaped); they are heavily skewed, multi-modal, and exhibit long power-law tails.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.9, every node/.style={transform shape},
+  axis/.style={thick, -{Stealth[scale=1.0]}},
+  curve/.style={draw=headingblue, ultra thick},
+  percentile/.style={dashed, thick, color=warningRed}
+]
+
+% Axes
+\draw[axis] (0, 0) -- (12, 0) node[right, font=\sffamily\small]{Latency $t$ (ms)};
+\draw[axis] (0, 0) -- (0, 5) node[above, font=\sffamily\small]{Probability Density $f(t)$};
+
+% Skewed distribution curve
+\draw[curve] plot [smooth, tension=0.7] coordinates {
+  (0.2, 0) (0.8, 1.2) (1.5, 4.5) (2.2, 3.8) (3.2, 1.8) (5.0, 0.8) (7.5, 0.4) (10.5, 0.1) (11.5, 0.02)
+};
+
+% Percentile lines
+\draw[percentile] (1.6, 0) -- (1.6, 4.4) node[above, font=\sffamily\tiny\bfseries]{p50 = 18ms};
+\draw[percentile, color=exampleBlue] (3.6, 0) -- (3.6, 1.5) node[above, font=\sffamily\tiny\bfseries]{p90 = 42ms};
+\draw[percentile, color=mistakeAmber] (6.5, 0) -- (6.5, 0.6) node[above, font=\sffamily\tiny\bfseries]{p99 = 150ms};
+\draw[percentile, color=warningRed] (10.0, 0) -- (10.0, 0.2) node[above, font=\sffamily\tiny\bfseries]{p99.9 = 850ms};
+
+\end{tikzpicture}
+\caption{Non-Gaussian Skewed Latency Distribution and Tail Percentiles}
+\label{fig:latency-distribution}
+\end{figure}
+
+\subsection{Percentile Definitions: p50, p95, p99, and p99.9}
+
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{p50 (50th Percentile / Median)}: The exact midpoint. 50\% of all requests are faster than this value, and 50\% are slower.
+  \item \textbf{p95 (95th Percentile)}: 95\% of requests complete faster than this duration; only 1 in 20 requests experience worse performance.
+  \item \textbf{p99 (99th Percentile)}: Represents the experience of the slowest 1 out of every 100 requests. In e-commerce, the users making the largest purchases often touch the most database rows, making high-value spenders disproportionately clustered in the p99 tail.
+  \item \textbf{p99.9 (Three Nines Latency)}: The slowest 1 in 1,000 requests, typically revealing severe garbage collection pauses, disk flush stalls, or network packet retransmissions.
+\end{itemize}
+
+\begin{commonmistakebox}[The Fallacy of Averaging Averages (Mean-of-Means)]
+Engineers frequently record the average latency on 10 application servers and compute the mean of those 10 values to get a ``global average.'' Mathematically, you cannot average percentiles or averages unless each node handled the exact same number of requests. Doing so completely obscures tail latency and produces mathematically meaningless numbers. Always compute percentiles across the global histogram distribution of raw observations.
+\end{commonmistakebox}
+
+\subsection{Distributed Tail Latency Amplification}
+
+In modern microservice architectures, a single incoming user request frequently fans out into $n$ parallel downstream RPC calls. The parent request cannot complete until the \textit{slowest} downstream call returns.
+
+If each downstream service has an independent probability $p$ of experiencing a high-latency tail event (e.g., $p = 0.01$ for p99 latency), the probability $P(\text{slow})$ that the parent request experiences a tail delay is:
+\begin{equation}
+P(\text{slow}) = 1 - (1 - p)^n
+\end{equation}
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{rrrr}
+\toprule
+\textbf{Downstream Calls ($n$)} & \textbf{If $p = 0.01$ (p99 Tail)} & \textbf{If $p = 0.05$ (p95 Tail)} & \textbf{If $p = 0.001$ (p99.9 Tail)} \\
+\midrule
+1 & 1.0\% & 5.0\% & 0.1\% \\
+5 & 4.9\% & 22.6\% & 0.5\% \\
+20 & 18.2\% & 64.2\% & 2.0\% \\
+50 & 39.5\% & 92.3\% & 4.9\% \\
+100 & \textbf{63.4\%} & \textbf{99.4\%} & 9.5\% \\
+\bottomrule
+\end{tabular}
+\caption{Probability of User Experiencing Tail Latency as Downstream Fan-out $n$ Increases}
+\label{tab:tail-amplification}
+\end{table}
+
+When a webpage fans out to 100 backend services, even if every individual microservice meets a 99\% latency SLA ($p = 0.01$), **63.4\% of all end users will experience the painful 1\% tail latency!**
+
+\begin{underthehoodbox}[Coordinated Omission in Benchmarking]
+Coordinated Omission, coined by latency expert Gil Tene, occurs when performance testing tools (such as naive ApacheBench or JMeter scripts) pause or stall when the server becomes unresponsive. If the server enters a 5-second Stop-the-World GC pause, the benchmark client blocks, sending no requests during that window. When the server resumes, the tool records only one slow request, omitting the thousands of requests that \textit{should have been issued and stalled} during those 5 seconds. To avoid this, modern tools like \texttt{wrk2} and HdrHistogram schedule requests on an independent timer, capturing true latency under backpressure.
+\end{underthehoodbox}
+
+\section{Throughput and Little's Law}
+
+The capacity of any queuing system in a steady state is governed by **Little's Law**, a foundational theorem of queuing theory:
+\begin{equation}
+L = \lambda W
+\end{equation}
+where:
+\begin{itemize}[leftmargin=18pt]
+  \item $L$: Average number of concurrent requests in the system (concurrency / in-flight requests).
+  \item $\lambda$: Arrival rate of requests (throughput in requests per second, RPS).
+  \item $W$: Average processing time spent by a request in the system (latency in seconds).
+\end{itemize}
+
+\subsection{Sizing Thread Pools and Connection Limits}
+
+Suppose an API Gateway receives an arrival rate of $\lambda = 2,500$ requests per second, and downstream database processing requires an average latency of $W = 80\text{ ms} = 0.08\text{ s}$. 
+
+By Little's Law, the average number of concurrent active threads required across the fleet is:
+\begin{equation}
+L = 2,500 \times 0.08 = 200 \text{ concurrent connections}
+\end{equation}
+
+If an unexpected database lock increases processing latency from $80\text{ms}$ to $800\text{ms}$ ($W' = 0.8\text{s}$) while traffic remains $\lambda = 2,500$, the required concurrency surges:
+\begin{equation}
+L' = 2,500 \times 0.8 = 2,000 \text{ concurrent connections}
+\end{equation}
+If the application thread pool is hard-capped at 500 threads, incoming requests immediately overflow into operating system socket backlogs, resulting in connection timeouts and 504 Gateway Timeouts.
+
+\section{Disaster Recovery: RPO and RTO}
+
+Disaster Recovery (DR) requirements are defined by two strict metrics:
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.9, every node/.style={transform shape},
+  axis/.style={thick, -{Stealth[scale=1.0]}},
+  line/.style={thick, color=headingblue}
+]
+
+% Timeline
+\draw[axis] (0, 0) -- (12, 0) node[right, font=\sffamily\small]{Time $\rightarrow$};
+
+% Incident point
+\draw[thick, color=warningRed] (6, -1.2) -- (6, 2.0);
+\node[font=\sffamily\small\bfseries\color{warningRed}, anchor=south] at (6, 2.0) {Disaster / Outage Event};
+
+% RPO bracket (Past)
+\draw[line] (2, 0) -- (2, 1.0);
+\draw[line] (6, 0) -- (6, 1.0);
+\draw[thick, <->, color=exampleBlue] (2, 0.7) -- node[above, font=\sffamily\footnotesize\bfseries]{RPO (Data Loss Window)} (6, 0.7);
+\node[font=\sffamily\scriptsize, anchor=north] at (2, -0.2) {Last Good Backup};
+
+% RTO bracket (Future)
+\draw[line] (6, 0) -- (6, 1.0);
+\draw[line] (10.5, 0) -- (10.5, 1.0);
+\draw[thick, <->, color=tryViolet] (6, 0.7) -- node[above, font=\sffamily\footnotesize\bfseries]{RTO (Downtime Duration)} (10.5, 0.7);
+\node[font=\sffamily\scriptsize, anchor=north] at (10.5, -0.2) {Service Restored};
+
+\end{tikzpicture}
+\caption{Disaster Recovery Timeline: Defining RPO and RTO}
+\label{fig:rpo-rto}
+\end{figure}
+
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{RPO (Recovery Point Objective)}: The maximum acceptable amount of data loss measured in time backwards from the failure point. An RPO of 15 minutes means the business can tolerate losing at most the last 15 minutes of transactional data.
+  \item \textbf{RTO (Recovery Time Objective)}: The maximum acceptable duration of system downtime before service is restored. An RTO of 2 hours means the engineering team has 120 minutes to fail over infrastructure and resume serving traffic.
+\end{itemize}
+
+\subsection{Architectural Tiers of Disaster Recovery}
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lllrr}
+\toprule
+\textbf{DR Strategy} & \textbf{Description} & \textbf{Data Replication} & \textbf{Typical RPO} & \textbf{Typical RTO} \\
+\midrule
+\textbf{Backup \& Restore} & Nightly cold backups stored in S3/Glacier & Batch export & 24 hours & 12--24 hours \\
+\textbf{Pilot Light} & Core DB continuously replicates; app servers off & Continuous async DB & 1--5 minutes & 30--60 minutes \\
+\textbf{Warm Standby} & Downscaled shadow fleet runs in secondary AZ & Continuous async DB & Seconds & 5--10 minutes \\
+\textbf{Multi-Region Hot} & Full active-active deployment in 2+ regions & Synchronous / Raft & $\approx 0$ & Real-time ($<30$s) \\
+\bottomrule
+\end{tabular}
+\caption{Disaster Recovery Architectural Tiers and Cost Trade-offs}
+\label{tab:dr-tiers}
+\end{table}
+
+\begin{realworldbox}[Amazon Prime Day Tail Latency Cascade]
+During an early Amazon Prime Day, a microservice responsible for personalizing product deals suffered an increase in p99 response time from 15ms to 850ms due to cache thrashing. Because the main product page aggregated 35 independent service calls in a synchronous fan-out, the 850ms latency propagated to the entire frontend. Customers experienced spinning checkout wheels, leading to an estimated loss of \$1.2 million per minute until engineers enabled a shed-load feature flag to bypass recommendations entirely.
+\end{realworldbox}
+
+\begin{tryityourselfbox}[Exercise: Sizing Queue Capacity with Little's Law]
+A payment processing microservice handles $\lambda = 1,200\text{ webhook deliveries/second}$. Each webhook requires an average network round-trip of $W = 250\text{ ms}$ to external third-party merchant servers.
+\begin{enumerate}
+  \item Compute the steady-state number of in-flight concurrent worker tasks ($L$) required using Little's Law.
+  \item If an external cellular carrier outage causes merchant response latency to surge to $W' = 4.5\text{ seconds}$, calculate the new required concurrency $L'$.
+  \item What happens if the worker thread pool is capped at 500 connections?
+\end{enumerate}
+\end{tryityourselfbox}
+
+\section{Summary \& Key Takeaways}
+
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{FURPS+ Classification}: Deconstruct requirements systematically into Functionality, Usability, Reliability, Performance, Supportability, and Technical Constraints.
+  \item \textbf{Availability Compounding}: Components in series multiply failure probabilities ($A_s = \prod A_i$). True high availability requires parallel active-active or active-passive redundancy ($A_p = 1 - \prod (1 - A_i)$).
+  \item \textbf{Tail Latency Reality}: Never rely on arithmetic means. Track p50, p95, p99, and p99.9. In fan-out architectures, $P(\text{slow}) = 1 - (1 - p)^n$; the slowest component dictates the user experience.
+  \item \textbf{Little's Law}: Balance throughput, latency, and concurrency via $L = \lambda W$. When downstream latency surges, concurrency requirements expand linearly, risking thread pool starvation.
+  \item \textbf{RPO and RTO Discipline}: Quantify data loss tolerance (RPO) and downtime tolerance (RTO) before selecting backup, warm standby, or multi-region hot architectures.
+\end{itemize}
+
+\section{Exercises}
+
+\subsection*{Mechanics}
+\begin{enumerate}[leftmargin=18pt]
+  \item Calculate the total annual downtime in minutes for an enterprise system delivering 99.95\% availability over a 365-day year.
+  \item An architecture consists of four sequential microservices in series. Each service independently provides 99.9\% availability. Calculate the composite availability of the end-to-end system.
+\end{enumerate}
+
+\subsection*{Debugging}
+\begin{enumerate}[leftmargin=18pt]
+  \item A load testing report states: \textit{``Server A had an average latency of 20ms over 1,000 requests. Server B had an average latency of 100ms over 100,000 requests. The overall average latency of the system is $(20 + 100)/2 = 60\text{ms}$.''} Identify the mathematical fallacy and compute the true weighted arithmetic mean.
+\end{enumerate}
+
+\subsection*{Architecture Design}
+\begin{enumerate}[leftmargin=18pt]
+  \item Design an active-passive disaster recovery architecture for a PostgreSQL-backed healthcare platform with strict constraints: $\text{RPO} \le 1\text{ minute}$ and $\text{RTO} \le 15\text{ minutes}$. Specify the replication mechanism, DNS failover routing, and automated health check topology.
+\end{enumerate}
+
+\section{Detailed Solutions}
+
+\subsection*{Mechanics Solution}
+\begin{enumerate}[leftmargin=18pt]
+  \item Total minutes in a 365-day year:
+  $$\text{Total Minutes} = 365 \times 24 \times 60 = 525,600 \text{ minutes}$$
+  Permissible downtime fraction:
+  $$1 - 0.9995 = 0.0005$$
+  Total permissible annual downtime:
+  $$\text{Downtime} = 525,600 \times 0.0005 = 262.8 \text{ minutes } (\approx 4\text{ hours, } 22\text{ minutes, } 48\text{ seconds})$$
+  
+  \item Series composite availability $A_s$:
+  $$A_s = (0.999)^4 = 0.996005996 \approx 99.60\%$$
+  The system degrades from three nines ($99.9\%$) down to $99.60\%$, increasing annual downtime from 8.76 hours to 35.04 hours.
+\end{enumerate}
+
+\subsection*{Debugging Solution}
+\begin{enumerate}[leftmargin=18pt]
+  \item The report commits the fallacy of averaging averages without weighting by sample volume. Server B processed 100 times more traffic than Server A; treating them equally distorts the true performance.
+  
+  \textbf{True Weighted Mean}:
+  $$\bar{x} = \frac{(20 \times 1,000) + (100 \times 100,000)}{1,000 + 100,000} = \frac{20,000 + 10,000,000}{101,000} = \frac{10,020,000}{101,000} \approx 99.21 \text{ ms}$$
+  The true mean ($99.21\text{ms}$) is dramatically worse than the claimed $60\text{ms}$.
+\end{enumerate}
+
+\subsection*{Architecture Design Solution}
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Data Replication (Meeting $\text{RPO} \le 1\text{ min}$)}: Configure PostgreSQL streaming replication with asynchronous physical WAL (Write-Ahead Logging) transfer to a hot standby in a secondary cloud region. Replicate WAL archives every 10 seconds via continuous WAL-G archiving to cross-region S3 replication. Measured WAL lag under peak traffic is $<5$ seconds, easily satisfying the 1-minute RPO.
+  \item \textbf{Failover Automation (Meeting $\text{RTO} \le 15\text{ mins}$)}:
+  \begin{enumerate}
+    \item Deploy an automated Patroni/Consul heartbeat cluster across both regions.
+    \item If the primary region fails health checks for 60 consecutive seconds, Patroni triggers a standby promotion script.
+    \item Route53 Application Recovery Controller (ARC) with 10-second DNS TTL flips the traffic routing policy to the secondary region.
+    \item Application containers in the secondary region are maintained in a ``Warm Standby'' state (scaled to 20\% capacity), and auto-scale to 100\% within 3 minutes of traffic arrival.
+    \item Total time to failover: $1\text{m (detection)} + 1.5\text{m (promotion)} + 3\text{m (scaling)} = 5.5\text{ minutes} < 15\text{ minutes RTO}$.
+  \end{enumerate}
+\end{itemize}
+
+\section{Further Reading \& Citations}
+\begin{itemize}[leftmargin=18pt]
+  \item Tene, G. (2015). \textit{How NOT to Measure Latency}. Strange Loop Conference.
+  \item Little, J. D. C. (1961). A Proof for the Queuing Formula: $L = \lambda W$. \textit{Operations Research}, 9(3), 383--387.
+  \item Dean, J., \& Barroso, L. A. (2013). The Tail at Scale. \textit{Communications of the ACM}, 56(2), 74--80.
+  \item Beyer, B., Jones, C., Petoff, J., \& Murphy, N. R. (2016). \textit{Site Reliability Engineering: How Google Runs Production Systems}. O'Reilly Media.
+\end{itemize}

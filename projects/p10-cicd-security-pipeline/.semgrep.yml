@@ -1,0 +1,41 @@
+rules:
+  - id: python-sqli-string-concat
+    patterns:
+      - pattern-either:
+          - pattern: $SESSION.execute(f"..." + ...)
+          - pattern: $CURSOR.execute("SELECT ... %s" % ...)
+          - pattern: $DB.query("SELECT * FROM " + $VAR)
+    message: "Potential SQL Injection: unparameterized query constructed with string concatenation or interpolation."
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: "CWE-89: Improper Neutralization of Special Elements used in an SQL Command"
+      owasp: "A03:2021 - Injection"
+
+  - id: hardcoded-jwt-secret
+    patterns:
+      - pattern-either:
+          - pattern: jwt.encode(..., "...", ...)
+          - pattern: jwt.decode(..., "secret", ...)
+          - pattern: JWT_SECRET = "..."
+    message: "Hardcoded JWT secret detected. Secrets must be injected via environment variables or Key Vault."
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+
+  - id: insecure-pickle-deserialization
+    pattern: pickle.loads(...)
+    message: "Insecure Deserialization: pickle.loads allows arbitrary remote code execution (RCE) on untrusted inputs."
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: "CWE-502: Deserialization of Untrusted Data"
+
+  - id: insecure-yaml-unsafe-load
+    pattern: yaml.load($INPUT)
+    message: "Insecure YAML loading: use yaml.safe_load() instead of yaml.load() to prevent object injection."
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: "CWE-502: Deserialization of Untrusted Data"

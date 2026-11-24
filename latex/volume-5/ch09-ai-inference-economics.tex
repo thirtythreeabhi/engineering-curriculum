@@ -1,0 +1,469 @@
+\chapter{AI Inference Economics and Cost Optimization}
+\label{ch:ai-inference-economics}
+
+\begin{chaptergoalsbox}
+\textbf{What You Will Learn:}
+\begin{itemize}[leftmargin=12pt]
+  \item Understand the hardware physics of modern deep learning inference: compute-bound prefill versus memory-bandwidth-bound autoregressive decoding using the Roofline model.
+  \item Derive and calculate the exact mathematical memory footprint of the Key-Value (KV) cache across Multi-Head Attention (MHA), Multi-Query Attention (MQA), and Grouped-Query Attention (GQA) architectures.
+  \item Dissect LLM serving latency metrics: Time to First Token (TTFT), Inter-Token Latency (ITL), and total token throughput (tokens/sec).
+  \item Master the architecture of **vLLM and PagedAttention**, understanding how virtual memory page tables eliminate external and internal memory fragmentation.
+  \item Compare static batching with iteration-level **continuous batching** to eliminate bubble waste during variable-length generation.
+  \item Analyze high-performance inference optimizations: speculative decoding, FP8 and AWQ quantization, and RadixAttention prefix caching.
+  \item Construct an end-to-end cloud financial model calculating the exact cost per million tokens for self-hosted GPU clusters versus commercial API endpoints.
+\end{itemize}
+
+\textbf{What You Should Already Understand:}
+\begin{itemize}[leftmargin=12pt]
+  \item Transformer architecture fundamentals (self-attention mechanism, queries, keys, values, feed-forward layers).
+  \item GPU hardware components: High Bandwidth Memory (HBM3), Tensor Cores, and VRAM memory bounds.
+  \item Basic floating-point precision standards (FP32, FP16, BF16, FP8, INT4).
+\end{itemize}
+
+\textbf{Why This Topic Exists:}
+Serving Large Language Models (LLMs) is orders of magnitude more computationally expensive than serving traditional microservices. A single 8-GPU NVIDIA H100 node costs \$30,000 to \$40,000 annually to rent in the cloud. Deploying models naively with standard PyTorch runtimes results in 70\% memory fragmentation and single-digit GPU compute utilization, causing inference bills to explode into millions of dollars. Architects must master inference economics to build economically sustainable AI systems.
+
+\textbf{Motivating Practical Problem:}
+An enterprise SaaS platform builds an automated AI customer support agent powered by an open-weight LLaMA-3-70B model. Running naive Hugging Face Transformers serving on an 8x80GB A100 cluster (\$24/hour), the system runs Out Of Memory (OOM) after only 12 concurrent customer conversations. Scaling to support their peak concurrent load of 600 conversations would require 50 GPU clusters costing \$864,000 per month. By re-architecting their inference engine using vLLM, GQA, FP8 quantization, and continuous batching, the team supports all 600 users on just two nodes, reducing monthly GPU spend from \$864,000 to \$34,560.
+\end{chaptergoalsbox}
+
+\section{The Hardware Physics of LLM Inference: The Roofline Model}
+
+To understand why LLM inference is expensive, one must understand how modern GPUs execute Transformer models. Modern GPUs (such as the NVIDIA H100 SXM5) possess extraordinary theoretical compute capabilities (up to 1,979 TFLOPS of FP16/FP8 Tensor Core compute) paired with 3.35 TB/second of High Bandwidth Memory (HBM3) throughput.
+
+The operational efficiency of any GPU workload is governed by the **Roofline Model**, which maps performance against **Arithmetic Intensity**:
+\begin{equation}
+\text{Arithmetic Intensity} = \frac{\text{Floating Point Operations (FLOPs)}}{\text{Memory Access (Bytes Read/Written)}}
+\end{equation}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.9, every node/.style={transform shape},
+  axis/.style={thick, -{Stealth[scale=1.0]}},
+  roof/.style={draw=headingblue, ultra thick},
+  point/.style={circle, fill=warningRed, inner sep=2.5pt}
+]
+
+% Axes
+\draw[axis] (0, 0) -- (12, 0) node[right, font=\sffamily\small]{Arithmetic Intensity (FLOPs / Byte)};
+\draw[axis] (0, 0) -- (0, 6) node[above, font=\sffamily\small]{Attainable Performance (TFLOPS)};
+
+% Roofline curve
+\draw[roof] (0.5, 0.5) -- (6.0, 5.0) -- (11.5, 5.0);
+
+% Labels
+\node[font=\sffamily\scriptsize\bfseries\color{headingblue}, rotate=36] at (3.0, 3.1) {Memory Bandwidth Bound (Slope = HBM GB/s)};
+\node[font=\sffamily\scriptsize\bfseries\color{headingblue}] at (8.8, 5.3) {Compute Bound (Peak Tensor TFLOPS)};
+
+% Workload points
+\node[point, label={[font=\sffamily\tiny\bfseries, color=warningRed]below right:Autoregressive Decode (Low FLOPs/Byte)}] at (1.8, 1.5) {};
+\node[point, color=exampleBlue, label={[font=\sffamily\tiny\bfseries, color=exampleBlue]above:Prompt Prefill Phase}] at (8.5, 5.0) {};
+
+\draw[dashed, color=gray!60] (6.0, 0) -- (6.0, 5.0) node[pos=0.1, right, font=\tiny\sffamily]{Knee Point: $\approx 150 - 200$};
+
+\end{tikzpicture}
+\caption{The GPU Roofline Model: Prefill vs Autoregressive Decode Phases}
+\label{fig:roofline-model}
+\end{figure}
+
+\subsection{The Two Execution Phases: Prefill vs Decode}
+
+An LLM generation request consists of two fundamentally distinct computational regimes:
+
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{The Prefill Phase (Prompt Processing)}:
+  The model ingests the entire user prompt (e.g., 2,048 input tokens) simultaneously. Because all input tokens are known in advance, matrix multiplications (GEMM) are executed in parallel across Tensor Cores. The arithmetic intensity is high ($\approx 100 - 300\text{ FLOPs/byte}$); this phase is **Compute-Bound** and achieves high GPU utilization.
+  
+  \item \textbf{The Decode Phase (Autoregressive Generation)}:
+  The model generates output tokens sequentially, one token at a time. To generate a single token, the GPU must transfer all model weights ($\approx 140\text{ GB}$ for a 70B parameter model in FP16) from HBM3 memory into SRAM cache registers just to perform a few matrix-vector multiplications (GEMV). The arithmetic intensity is abysmally low ($\approx 1 - 2\text{ FLOPs/byte}$); this phase is **Memory-Bandwidth Bound**.
+\end{enumerate}
+
+\begin{intuitionbox}[Refilling Water Glasses One Sip at a Time]
+Imagine a banquet waiter serving water to 100 dinner guests. The prefill phase is like pouring 100 glasses simultaneously using a giant multi-spout dispenser (compute bound, fast, efficient). The autoregressive decode phase is like having the waiter run all the way back to the kitchen faucet, carry a heavy pitcher across the dining hall, and pour exactly one single teaspoon of water into Guest 1's glass, before running back to the kitchen to repeat the trip for Guest 2. The waiter spends 99\% of their time walking (memory bandwidth transfer) and 1\% pouring water (compute).
+\end{intuitionbox}
+
+\section{Mathematical Anatomy of the KV Cache}
+
+During autoregressive generation, computing attention for the new token $t$ requires computing dot products between token $t$'s Query vector and the Key and Value vectors of \textit{all preceding tokens} ($1, 2, \dots, t-1$). 
+
+To avoid recomputing Keys and Values for historical tokens at every single step, inference engines store them in a dynamic GPU memory cache: the **Key-Value (KV) Cache**.
+
+\subsection{The KV Cache Memory Footprint Equation}
+
+For a standard Multi-Head Attention (MHA) Transformer model, the memory footprint required to store the KV cache for a single sequence is given by:
+\begin{equation}
+\text{Memory}_{\text{KV}} = 2 \times n_{\text{layers}} \times d_{\text{model}} \times n_{\text{tokens}} \times b \quad \text{[Bytes]}
+\end{equation}
+where:
+\begin{itemize}[leftmargin=18pt]
+  \item $2$: Factor of 2 representing two tensors: the Key tensor and the Value tensor.
+  \item $n_{\text{layers}}$: Total number of Transformer decoder layers in the model.
+  \item $d_{\text{model}}$: Hidden dimension size of the Transformer (or $n_{\text{heads}} \times d_{\text{head}}$).
+  \item $n_{\text{tokens}}$: Total context length (prompt tokens + generated output tokens).
+  \item $b$: Number of bytes per precision element ($b = 2$ for FP16/BF16, $b = 1$ for FP8, $b = 0.5$ for INT4).
+\end{itemize}
+
+\subsection{Architectural Mitigations: MHA vs MQA vs GQA}
+
+In classical **Multi-Head Attention (MHA)**, each attention head maintains its own independent set of Key and Value heads ($n_{\text{kv\_heads}} = n_{\text{heads}}$). 
+
+To drastically reduce KV cache memory consumption, modern architectures utilize:
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Multi-Query Attention (MQA)}: A single Key head and Value head are shared across all Query heads ($n_{\text{kv\_heads}} = 1$). This reduces KV cache footprint by a factor of $n_{\text{heads}}$ (typically $32\times$ or $64\times$), but can slightly degrade reasoning nuance.
+  \item \textbf{Grouped-Query Attention (GQA)}: Query heads are partitioned into $G$ groups, with each group sharing one Key and Value head ($n_{\text{kv\_heads}} = G$). For example, LLaMA-3-70B has 64 query heads and 8 KV heads ($8\times$ reduction factor).
+\end{itemize}
+
+For GQA architectures, the generalized KV cache formula becomes:
+\begin{equation}
+\text{Memory}_{\text{KV, GQA}} = 2 \times n_{\text{layers}} \times \left( \frac{n_{\text{kv\_heads}}}{n_{\text{heads}}} \times d_{\text{model}} \right) \times n_{\text{tokens}} \times b
+\end{equation}
+
+\begin{table}[htbp]
+\centering\footnotesize
+\begin{tabular}{lrrrrrr}
+\toprule
+\textbf{Model} & \textbf{Layers} & \textbf{Hidden} & \textbf{Attention} & \textbf{4k Context} & \textbf{32k Context} & \textbf{128k Context} \\
+\midrule
+LLaMA-2-7B (FP16) & 32 & 4,096 & MHA & 2.1 GB & 16.8 GB & 67.1 GB \\
+LLaMA-3-8B (FP16) & 32 & 4,096 & GQA (1:4) & 0.52 GB & 4.2 GB & 16.8 GB \\
+LLaMA-3-70B (FP16) & 80 & 8,192 & GQA (1:8) & 1.31 GB & 10.5 GB & 41.9 GB \\
+LLaMA-3-70B (FP8) & 80 & 8,192 & GQA (1:8) & \textbf{0.66 GB} & \textbf{5.2 GB} & \textbf{21.0 GB} \\
+\bottomrule
+\end{tabular}
+\caption{KV Cache Memory Footprint per Concurrent Stream across Context Windows}
+\label{tab:kv-cache-footprint}
+\end{table}
+
+\begin{commonmistakebox}[Sizing GPU Fleets Solely by Model Parameter Weight]
+A common operational failure is calculating GPU requirements as: $\text{GPU Memory} \ge \text{Parameter Count} \times \text{Bytes}$. For LLaMA-3-70B in FP16, the weights consume $70\text{B} \times 2 = 140\text{ GB}$. An engineer provisions two 80GB GPUs ($160\text{ GB}$ total VRAM) and assumes they can serve traffic. However, this leaves only $160 - 140 = 20\text{ GB}$ for activations and the KV cache! If requests have a 32k context window, a single user stream consumes 10.5 GB. The cluster runs out of memory with just **two concurrent users**!
+\end{commonmistakebox}
+
+\section{Serving Latency Metrics: TTFT, ITL, and Throughput}
+
+Unlike web services evaluated purely on end-to-end response time, LLM inference performance is governed by three distinct metrics:
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.9, every node/.style={transform shape},
+  axis/.style={thick, -{Stealth[scale=1.0]}},
+  tok/.style={rectangle, draw=headingblue, fill=headingblue!15, rounded corners=2pt, minimum width=0.9cm, minimum height=0.7cm, font=\sffamily\tiny\bfseries}
+]
+
+% Timeline
+\draw[axis] (0, 0) -- (12, 0) node[right, font=\sffamily\small]{Time $\rightarrow$};
+
+% Request Arrival
+\draw[thick, color=textdark] (0.5, -0.4) -- (0.5, 1.2) node[above, font=\sffamily\tiny\bfseries]{Prompt Arrives};
+
+% Tokens
+\node[tok] (t1) at (3.5, 0.4) {$T_1$};
+\node[tok] (t2) at (5.2, 0.4) {$T_2$};
+\node[tok] (t3) at (6.9, 0.4) {$T_3$};
+\node[tok] (t4) at (8.6, 0.4) {$T_4$};
+\node[tok] (tn) at (10.5, 0.4) {$T_N$};
+
+% TTFT Bracket
+\draw[thick, <->, color=exampleBlue] (0.5, 0.9) -- node[above, font=\sffamily\tiny\bfseries]{Time to First Token (TTFT)} (3.5, 0.9);
+
+% ITL Brackets
+\draw[thick, <->, color=tryViolet] (3.5, -0.5) -- node[below, font=\sffamily\tiny\bfseries]{ITL} (5.2, -0.5);
+\draw[thick, <->, color=tryViolet] (5.2, -0.5) -- node[below, font=\sffamily\tiny\bfseries]{ITL} (6.9, -0.5);
+
+\end{tikzpicture}
+\caption{LLM Latency Timeline: Time to First Token (TTFT) and Inter-Token Latency (ITL)}
+\label{fig:llm-latency-timeline}
+\end{figure}
+
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Time to First Token (TTFT)}: The duration between the client dispatching the HTTP prompt and the client receiving the very first generated token. Governed primarily by prefill compute latency and prompt queue wait times. Critical for conversational responsiveness.
+  \item \textbf{Inter-Token Latency (ITL)}: The time interval between successive generated tokens ($T_i$ and $T_{i+1}$). Governed by the memory-bandwidth-bound decode phase. For human reading comfort, ITL must remain below $30 - 50\text{ ms/token}$ ($20 - 33\text{ tokens/second}$).
+  \item \textbf{Total Throughput}: The aggregate number of tokens generated per second across all concurrent streams served by the GPU cluster ($\text{tokens/sec}$). High throughput maximizes revenue density and amortizes expensive GPU rental costs.
+\end{itemize}
+
+The total generation latency for a request generating $N_{\text{out}}$ output tokens is:
+\begin{equation}
+T_{\text{total}} = \text{TTFT} + (N_{\text{out}} - 1) \times \text{ITL}
+\end{equation}
+
+\section{PagedAttention and the vLLM Architecture}
+
+In naive deep learning runtimes (such as standard PyTorch), the KV cache is allocated as a **contiguous memory buffer** sized to the model's maximum possible sequence length (e.g., 8,192 tokens). 
+
+This introduces devastating memory waste:
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Internal Fragmentation}: A request generating only 50 tokens reserves memory for 8,192 tokens. 99\% of the allocated buffer sits completely empty.
+  \item \textbf{External Fragmentation}: As requests of varying lengths complete and exit, GPU memory becomes fragmented like Swiss cheese, preventing new requests from allocating contiguous memory even when plenty of total VRAM exists.
+\end{enumerate}
+In practice, traditional systems waste **60\% to 80\% of total GPU VRAM** on fragmentation alone.
+
+\subsection{Virtual Memory Paging for KV Caches}
+
+In 2023, researchers at UC Berkeley developed **PagedAttention** (the core engine of **vLLM**), drawing inspiration from virtual memory paging in operating systems:
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.85, every node/.style={transform shape},
+  lblock/.style={rectangle, draw=headingblue, fill=headingblue!10, rounded corners=2pt, minimum width=2.2cm, minimum height=0.8cm, font=\sffamily\tiny\bfseries, align=center},
+  tablebox/.style={rectangle, draw=exampleBlue, fill=exampleBg, rounded corners=3pt, text width=3.6cm, font=\sffamily\scriptsize, inner sep=6pt, align=left},
+  pblock/.style={rectangle, draw=tryViolet, fill=tryBg, rounded corners=2pt, minimum width=2.4cm, minimum height=0.7cm, font=\sffamily\tiny\bfseries, align=center},
+  arrow/.style={-{Stealth[scale=0.9]}, thick, color=textdark}
+]
+
+% Logical Blocks
+\node[font=\sffamily\small\bfseries\color{headingblue}] at (0, 2.0) {Logical KV Cache (Contiguous)};
+\node[lblock] (lb0) at (0, 1.2) {Logical Block 0\\Tokens 0--15};
+\node[lblock] (lb1) at (0, 0.2) {Logical Block 1\\Tokens 16--31};
+\node[lblock] (lb2) at (0, -0.8) {Logical Block 2\\Tokens 32--47};
+
+% Block Table
+\node[tablebox] (bt) at (4.5, 0.2) {
+  \textbf{vLLM Block Table}\\
+  \rule{3.4cm}{0.4pt}\\
+  Logical 0 $\rightarrow$ Physical Page 7\\
+  Logical 1 $\rightarrow$ Physical Page 2\\
+  Logical 2 $\rightarrow$ Physical Page 11
+};
+
+% Physical Pages
+\node[font=\sffamily\small\bfseries\color{tryViolet}] at (9.2, 2.0) {Physical GPU HBM3 Memory (Non-contiguous)};
+\node[pblock] (pp2) at (9.2, 1.2) {Physical Page 2 (Tokens 16--31)};
+\node[pblock, fill=gray!20, draw=gray!60] (pp3) at (9.2, 0.4) {Physical Page 3 (Other Request)};
+\node[pblock] (pp7) at (9.2, -0.4) {Physical Page 7 (Tokens 0--15)};
+\node[pblock] (pp11) at (9.2, -1.2) {Physical Page 11 (Tokens 32--47)};
+
+\draw[arrow] (lb0) -- (bt.west |- lb0);
+\draw[arrow] (lb1) -- (bt.west |- lb1);
+\draw[arrow] (lb2) -- (bt.west |- lb2);
+
+\draw[arrow] (bt.east |- pp2) -- (pp2);
+\draw[arrow] (bt.east |- pp7) -- (pp7);
+\draw[arrow] (bt.east |- pp11) -- (pp11);
+
+\end{tikzpicture}
+\caption{PagedAttention: Mapping Contiguous Logical Sequences to Non-Contiguous Physical GPU Pages}
+\label{fig:paged-attention}
+\end{figure}
+
+PagedAttention partitions the KV cache of each sequence into fixed-size **physical blocks** (typically 16 or 32 tokens per block). 
+\begin{itemize}[leftmargin=18pt]
+  \item Blocks are allocated dynamically on-demand only when new tokens are generated.
+  \item Physical blocks do not need to be contiguous in GPU memory; a central **Block Table** maps logical token sequences to physical memory addresses.
+  \item **Memory fragmentation drops from $>70\%$ to under 4\%**, unlocking $2\times$ to $4\times$ higher concurrent batch sizes on identical GPU hardware.
+\end{itemize}
+
+\begin{underthehoodbox}[Zero-Copy Memory Sharing via PagedAttention]
+PagedAttention natively enables **Copy-on-Write (CoW)** at the block level. When executing parallel sampling (e.g., generating 4 candidate answers for one prompt) or beam search, all 4 generation streams point to the exact same physical memory blocks for the prompt tokens. Memory for a new block is allocated only when a specific stream diverges during generation, drastically reducing memory overhead during complex agentic workflows.
+\end{underthehoodbox}
+
+\section{Continuous Batching (Dynamic Iteration-Level Batching)}
+
+In traditional web frameworks, batching is static: the server waits for $B$ requests to arrive, packages them into a matrix, executes inference until the longest request completes, and returns all results.
+
+In LLM serving, static batching is catastrophically inefficient because sequence lengths are wildly non-uniform. If Request 1 generates 15 tokens and Request 2 generates 1,000 tokens, Request 1's GPU memory and compute slot remain completely locked in an idle ``padding bubble'' for the remaining 985 token iterations!
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.85, every node/.style={transform shape},
+  box/.style={rectangle, draw=headingblue, fill=headingblue!15, minimum height=0.6cm, font=\sffamily\tiny},
+  bubble/.style={rectangle, draw=warningRed, fill=warningBg, dashed, minimum height=0.6cm, font=\sffamily\tiny\bfseries\color{warningRed}}
+]
+
+% Static Batching
+\node[font=\sffamily\small\bfseries\color{headingblue}, anchor=west] at (0, 3.2) {Static Batching: Massive Padding Bubble Waste};
+\node[box, minimum width=2.0cm] at (1.0, 2.5) {Req 1 (30 tokens)};
+\node[bubble, minimum width=6.0cm] at (5.0, 2.5) {IDLE PADDING BUBBLE (Wasted GPU VRAM)};
+
+\node[box, minimum width=8.0cm] at (4.0, 1.7) {Req 2 (Long Sequence: 500 tokens)};
+
+% Continuous Batching
+\node[font=\sffamily\small\bfseries\color{exampleBlue}, anchor=west] at (0, 0.4) {Continuous Batching: Dynamic Iteration-Level Swapping};
+\node[box, fill=exampleBg, minimum width=2.0cm] at (1.0, -0.3) {Req 1 (Done)};
+\node[box, fill=intuitionBg, minimum width=2.8cm] at (3.4, -0.3) {Req 3 (New Prompt)};
+\node[box, fill=tryBg, minimum width=3.2cm] at (6.4, -0.3) {Req 4 (Decode)};
+
+\node[box, fill=exampleBg, minimum width=8.0cm] at (4.0, -1.1) {Req 2 (Continuously Decoding...)};
+
+\end{tikzpicture}
+\caption{Static Batching vs Dynamic Continuous Batching (Iteration-Level Scheduling)}
+\label{fig:continuous-batching}
+\end{figure}
+
+**Continuous Batching** (pioneered by Orca and implemented in vLLM and TensorRT-LLM) operates at the **iteration level** rather than the request level. At every single token generation step, the engine checks:
+\begin{itemize}[leftmargin=18pt]
+  \item If any sequence reached its end-of-sequence (\texttt{<EOS>}) token, it is immediately evicted, freeing its physical KV cache pages.
+  \item New pending requests are inserted into the running batch without waiting for the existing batch to conclude.
+\end{itemize}
+Continuous batching increases total GPU throughput by **$10\times$ to $20\times$** compared to naive static batching.
+
+\section{Advanced Optimization Techniques}
+
+\subsection{Speculative Decoding}
+
+In autoregressive generation, memory bandwidth limits generation speed to $\approx 30 - 45\text{ ms/token}$. **Speculative Decoding** overcomes this physical constraint by pairing a large target model ($M_p$, e.g., LLaMA-3-70B) with a tiny, ultra-fast draft model ($M_q$, e.g., LLaMA-3-8B or a 1B speculative head).
+
+\begin{enumerate}[leftmargin=18pt]
+  \item In the time it takes the large model to generate one token, the small draft model rapidly proposes $K$ candidate tokens (e.g., $K = 5$) autoregressively.
+  \item The large model processes all $K$ tokens simultaneously in a single, parallel **compute-bound forward pass** (high arithmetic intensity).
+  \item The target model evaluates each token using a modified rejection sampling rule:
+  \begin{equation}
+  \alpha = \min\left(1, \frac{P_{\text{target}}(x)}{P_{\text{draft}}(x)}\right)
+  \end{equation}
+\end{enumerate}
+If the draft model achieves an $80\%$ acceptance rate, the system generates 3 to 4 tokens per target forward pass, yielding a **$2.5\times - 3.5\times$ end-to-end latency speedup without altering the mathematical output distribution or degrading model quality!**
+
+\begin{productionwarningbox}[Draft Model Perplexity Mismatch]
+Speculative decoding is only cost-effective when the draft model closely mimics the output distribution of the target model. If you pair a generic coding draft model with a medical reasoning target model, the acceptance rate may drop below 30\%. At that point, the overhead of draft generation and frequent rejection rollbacks makes inference \textit{slower and more expensive} than standard autoregressive generation.
+\end{productionwarningbox}
+
+\subsection{Model Quantization: FP16, FP8, and AWQ}
+
+Quantization compresses the numerical precision of weights and activations, shrinking memory footprint and increasing compute throughput:
+
+\begin{table}[htbp]
+\centering\footnotesize
+\begin{tabular}{p{2.6cm}p{2.0cm}rp{1.5cm}p{4.8cm}}
+\toprule
+\textbf{Precision} & \textbf{Bits/Weight} & \textbf{70B VRAM} & \textbf{Speedup} & \textbf{Quality / Perplexity Degradation} \\
+\midrule
+\textbf{FP16 / BF16} & 16 bits (2 B) & 140 GB & $1.0\times$ (Base) & Zero degradation (Reference baseline). \\
+\textbf{FP8 (E4M3/E5M2)} & 8 bits (1 B) & 70 GB & $1.8\times - 2.2\times$ & Negligible ($\Delta \text{perplexity} < 0.1\%$) on Hopper/Ada. \\
+\textbf{AWQ (INT4)} & 4 bits (0.5 B) & 35 GB & $2.5\times - 3.2\times$ & Minimal ($<0.5\%$), protects salient weight channels. \\
+\bottomrule
+\end{tabular}
+\caption{Model Quantization Trade-offs for LLaMA-3-70B}
+\label{tab:quantization-tradeoffs}
+\end{table}
+
+**AWQ (Activation-aware Weight Quantization)** recognizes that not all weights are equally important. By analyzing activation distributions during calibration, AWQ identifies the top 1\% most salient weight channels and protects them from aggressive truncation, allowing 4-bit models to match FP16 perplexity scores.
+
+\subsection{Prefix Caching (RadixAttention)}
+
+In multi-turn chat applications, retrieval-augmented generation (RAG), and agentic workflows, large portions of the prompt are identical across requests (e.g., a 4,000-token system prompt or retrieved document chunks).
+
+**RadixAttention** (implemented in SGLang and vLLM) maintains an in-memory prefix tree (radix tree) of past KV cache blocks. When a new request arrives, the engine performs a longest-prefix match against the radix tree. If the first 3,500 tokens match an existing cached prompt, the engine **completely skips the prefill phase** for those tokens, slashing TTFT by over 90\% and eliminating redundant GPU compute.
+
+\section{Comprehensive Inference Cost Model: Self-Hosted vs Commercial APIs}
+
+To make sound architectural decisions, engineers must calculate the total unit economics of inference.
+
+\subsection{Formulating the Cost per 1M Tokens}
+
+The fully burdened cost of generating one million tokens on self-hosted cloud infrastructure is:
+\begin{equation}
+\text{Cost}_{1M} = \frac{\text{Hourly GPU Cluster Cost (\$)}}{\text{Effective Sustained Generated Tokens per Hour}} \times 10^6
+\end{equation}
+
+\paragraph{Case Study: Serving LLaMA-3-70B on AWS:}
+An enterprise requires serving a 70B parameter model.
+\begin{itemize}[leftmargin=18pt]
+  \item **Hardware**: 1x AWS \texttt{p5.48xlarge} node (8x NVIDIA H100 80GB GPUs).
+  \item **Cost**: \$32.00/hour (On-Demand) or \$19.20/hour (1-Year Compute Savings Plan).
+  \item **Engine Throughput (vLLM + FP8 + Continuous Batching)**: Sustained average of 3,200 output tokens/second across concurrent users.
+\end{itemize}
+
+Effective generated tokens per hour:
+\begin{equation}
+\text{Tokens/Hour} = 3,200 \text{ tokens/s} \times 3,600 \text{ s/hr} = 11,520,000 \text{ tokens/hr}
+\end{equation}
+
+Cost per 1M generated tokens on Savings Plan:
+\begin{equation}
+\text{Cost}_{1M} = \frac{\$19.20}{11,520,000} \times 10^6 \approx \mathbf{\$1.67 \text{ per million tokens}}
+\end{equation}
+
+Compare this to commercial API providers charging between \$5.00 and \$15.00 per million output tokens for comparable frontier models. If an organization generates more than 50 million tokens per day, self-hosting yields annual savings exceeding \$150,000.
+
+\begin{realworldbox}[DeepSeek-V3/R1 Architectural Efficiency]
+The open-weight release of DeepSeek-V3 and DeepSeek-R1 demonstrated the pinnacle of inference engineering economics. By pioneering **Multi-Head Latent Attention (MLA)** (which compresses the KV cache vectors into low-dimensional latent spaces) and fine-grained Mixture-of-Experts (MoE) where only 37B out of 671B parameters activate per token, DeepSeek reduced KV cache memory consumption by **$93\%$** relative to standard MHA. This architectural breakthrough allowed them to serve frontier-grade reasoning models at an unprecedented price point of \$0.55 per million output tokens.
+\end{realworldbox}
+
+\begin{tryityourselfbox}[Exercise: Sizing Concurrent Streams on an H100 Node]
+You are sizing an 8x NVIDIA H100 (80GB each = 640 GB total VRAM) cluster running an FP8-quantized LLaMA-3-70B model with GQA ($1:8$).
+\begin{itemize}
+  \item Model Weights Footprint: $70\text{ GB}$.
+  \item CUDA runtime and activation overhead: $30\text{ GB}$.
+  \item Remaining VRAM available strictly for KV Cache: $640 - 70 - 30 = 540\text{ GB}$.
+\end{itemize}
+Each user conversation requires a maximum context length of $n_{\text{tokens}} = 8,192$ tokens in FP8 precision ($b = 1$).
+\begin{enumerate}
+  \item Calculate the exact KV cache memory footprint per user stream using the GQA formula ($n_{\text{layers}} = 80$, $d_{\text{model}} = 8,192$, $\frac{n_{\text{kv\_heads}}}{n_{\text{heads}}} = \frac{1}{8}$).
+  \item Compute the theoretical maximum number of concurrent user streams the cluster can sustain before running out of memory.
+\end{enumerate}
+\end{tryityourselfbox}
+
+\section{Summary \& Key Takeaways}
+
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Roofline Regime}: Prefill is compute-bound (matrix-matrix); autoregressive decode is memory-bandwidth bound (matrix-vector). Low arithmetic intensity during decoding causes low GPU utilization.
+  \item \textbf{KV Cache Formula}: Scales as $2 \times n_{\text{layers}} \times d_{\text{model}} \times n_{\text{tokens}} \times b$. Multi-Query Attention (MQA) and Grouped-Query Attention (GQA) reduce this footprint by $4\times - 8\times$.
+  \item \textbf{PagedAttention}: Eliminates internal and external fragmentation by allocating non-contiguous physical memory blocks via virtual page tables, boosting concurrency by $2\times - 4\times$.
+  \item \textbf{Continuous Batching}: Swaps sequences at the iteration level, eliminating static padding bubble waste.
+  \item \textbf{High-ROI Optimizations}: Speculative decoding speeds up generation without quality loss; FP8/AWQ quantization halves memory footprints; RadixAttention skips prefill for repetitive prompts.
+  \item \textbf{Unit Economics}: Self-hosting open-weight models becomes dramatically cheaper than commercial APIs once token volume crosses the multi-million daily token threshold.
+\end{itemize}
+
+\section{Exercises}
+
+\subsection*{Mechanics}
+\begin{enumerate}[leftmargin=18pt]
+  \item A 34B parameter Transformer model has 64 layers and a hidden dimension of $d_{\text{model}} = 6,144$. It uses classical Multi-Head Attention (MHA) and stores the KV cache in FP16 precision ($b = 2$). Calculate the exact KV cache memory footprint (in Megabytes) for a single sequence of 4,096 tokens.
+  \item If an NVIDIA A100 GPU has a peak HBM2e memory bandwidth of 2.0 TB/s, calculate the theoretical minimum time required to read a 140 GB model weight tensor from memory during a single decode token generation step (assuming batch size = 1).
+\end{enumerate}
+
+\subsection*{Debugging}
+\begin{enumerate}[leftmargin=18pt]
+  \item A team deploys an LLM inference service with speculative decoding enabled. In production, they notice that the p99 response latency is 25\% slower than running the target model alone, and GPU memory usage has increased. Identify two probable root causes for this degradation.
+\end{enumerate}
+
+\subsection*{Architecture Design}
+\begin{enumerate}[leftmargin=18pt]
+  \item Design an end-to-end, cost-optimized inference architecture for an enterprise RAG assistant that answers questions over internal company documentation. The system receives 500,000 queries per day. Average prompt length is 3,500 tokens (including 3,000 tokens of retrieved context, with 2,500 tokens sharing common policy text) and average output length is 250 tokens. Specify the serving framework, quantization format, prefix caching mechanism, and instance sizing to minimize cost per query.
+\end{enumerate}
+
+\section{Detailed Solutions}
+
+\subsection*{Mechanics Solution}
+\begin{enumerate}[leftmargin=18pt]
+  \item KV Cache formula for MHA:
+  $$\text{Memory}_{\text{KV}} = 2 \times n_{\text{layers}} \times d_{\text{model}} \times n_{\text{tokens}} \times b$$
+  Substitute values:
+  $$\text{Memory}_{\text{KV}} = 2 \times 64 \times 6,144 \times 4,096 \times 2 \text{ bytes}$$
+  $$\text{Memory}_{\text{KV}} = 128 \times 6,144 \times 8,192 = 6,442,450,944 \text{ bytes}$$
+  Convert to Megabytes (dividing by $1024^2$):
+  $$\text{Memory}_{\text{KV}} = \frac{6,442,450,944}{1,048,576} = 6,144 \text{ MB} = 6.0 \text{ GB}$$
+  Each 4k-token sequence requires exactly 6.0 GB of VRAM.
+  
+  \item For batch size = 1, generating a single token requires reading all 140 GB of weights across the memory bus:
+  $$t_{\text{step}} = \frac{\text{Bytes Transferred}}{\text{Memory Bandwidth}} = \frac{140 \times 10^9 \text{ bytes}}{2.0 \times 10^{12} \text{ bytes/sec}} = 0.070 \text{ seconds} = 70 \text{ ms}$$
+  The theoretical maximum generation speed is $\frac{1}{0.070\text{s}} \approx 14.3\text{ tokens/second}$.
+\end{enumerate}
+
+\subsection*{Debugging Solution}
+\begin{enumerate}[leftmargin=18pt]
+  \item Probable root causes for speculative decoding degradation:
+  \begin{enumerate}
+    \item \textbf{Low Token Acceptance Rate ($\alpha < 40\%$)}: The draft model does not match the distribution of the target model for this specific task. The target model rejects most draft tokens, requiring frequent state rollbacks. The system incurs the latency of running the draft model plus target model verification without gaining multiple tokens per step.
+    \item \textbf{VRAM Contention and Draft Model Overhead}: Loading the draft model into GPU VRAM consumed memory that otherwise would have been used for PagedAttention KV cache pages. This forced vLLM to shrink the maximum concurrent batch size, creating request queue backlogs and inflating p99 queue wait times.
+  \end{enumerate}
+\end{enumerate}
+
+\subsection*{Architecture Design Solution}
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Serving Engine}: Deploy **vLLM with SGLang / RadixAttention** enabled. 
+  \item \textbf{Model \& Quantization}: LLaMA-3-70B-Instruct quantized to **FP8** (E4M3 format). This halves the weight footprint to 70 GB and enables native FP8 Tensor Core acceleration on Hopper GPUs without perplexity loss.
+  \item \textbf{Prefix Caching}: Because 2,500 tokens of company policy text are identical across all queries, RadixAttention caches these tokens permanently in VRAM. For all subsequent queries, the prefill phase skips the first 2,500 tokens entirely, reducing prompt processing compute by $>70\%$ and slashing TTFT from 450ms to $<60$ms.
+  \item \textbf{Hardware Fleet Sizing}:
+  A single AWS \texttt{g6e.12xlarge} (4x NVIDIA L40S 48GB = 192GB VRAM) or 1x \texttt{p5.48xlarge} node easily holds the 70GB model weights plus 120GB of KV cache pages. With continuous batching and prefix caching, a single 4-GPU node sustains 65 queries/second, easily handling 500,000 queries per day ($5.8\text{ queries/sec average}$, $25\text{ queries/sec peak}$) with ample headroom at a cloud cost under \$0.0003 per query.
+\end{itemize}
+
+\section{Further Reading \& Citations}
+\begin{itemize}[leftmargin=18pt]
+  \item Kwon, W., et al. (2023). Efficient Memory Management for Large Language Model Serving with PagedAttention. \textit{Proceedings of the 29th ACM Symposium on Operating Systems Principles (SOSP '23)}.
+  \item Leviathan, Y., Kalman, M., \& Matias, Y. (2023). Fast Inference from Transformers via Speculative Decoding. \textit{International Conference on Machine Learning (ICML)}.
+  \item Lin, J., et al. (2024). AWQ: Activation-aware Weight Quantization for On-Device LLM Compression and Acceleration. \textit{MLSys 2024}.
+  \item DeepSeek-AI. (2024). \textit{DeepSeek-V3 Technical Report: Architecture and Multi-Head Latent Attention}.
+\end{itemize}

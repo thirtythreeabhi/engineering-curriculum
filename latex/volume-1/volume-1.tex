@@ -1,0 +1,66 @@
+\documentclass[11pt,oneside]{book}
+\input{../common/preamble.tex}
+
+\title{\Huge\sffamily\bfseries\color{headingblue} Backend Engineering:\\ Systems, Architecture, and Reliability\\[10pt]
+\Large\sffamily\color{gray} Volume I: Core Runtime Internals, Scalable APIs, Data Persistence, and Production Hardening}
+\author{\large\sffamily Engineering Curriculum Series}
+\date{\sffamily \today}
+
+\begin{document}
+
+\frontmatter
+\pagestyle{empty}
+
+\begin{center}
+  \vspace*{2.5cm}
+  {\Huge\sffamily\bfseries\color{headingblue} Backend Engineering}\\[12pt]
+  {\LARGE\sffamily\bfseries\color{headingblue} Systems, Architecture, and Reliability}\\[18pt]
+  {\Large\sffamily\color{gray} Volume I: Core Runtime Internals, Scalable APIs, Data Persistence, and Production Hardening}\\[30pt]
+  \hrule height 1.2pt
+  \vspace*{25pt}
+  {\normalsize\sffamily Production-Grade Engineering Curriculum for Senior \& Staff Systems Engineers}
+\end{center}
+
+\vspace{3.5cm}
+
+\begin{tcolorbox}[
+  enhanced,
+  colback=white,
+  colframe=gray!30!white,
+  boxrule=0.8pt,
+  arc=2pt,
+  left=15pt,right=15pt,top=12pt,bottom=12pt
+]
+\sffamily\small
+\textbf{About Volume I:}
+This textbook provides an uncompromising, deep-dive examination of foundational backend engineering. Moving beyond superficial framework tutorials, this volume exposes runtime execution engines, memory allocators, virtual machines, communication protocols, database storage kernels, concurrent execution models, cryptographic primitives, and production verification paradigms.
+
+\vspace{6pt}
+\textbf{Mastery Objectives:}
+\begin{itemize}[leftmargin=15pt,itemsep=3pt]
+  \item \textbf{Runtime Virtual Machines:} Master PHP 8.1--8.4 Zend Engine internals, zval layout, CoW memory mechanics, and CPython bytecode execution with GIL synchronization.
+  \item \textbf{Transport Protocols \& Microservices:} Architect high-throughput services spanning HTTP/1.1, HTTP/2 binary framing, HTTP/3 QUIC, WebSockets, SSE, and gRPC Protobuf encoding.
+  \item \textbf{Storage Kernels \& Concurrency:} Dissect PostgreSQL storage pages, Write-Ahead Logging (WAL), B-Trees, MVCC snapshot isolation, row locking, and ORM hydrators.
+  \item \textbf{Asynchronous Programming:} Implement event loops, epoll/kqueue selectors, fibers, coroutines, and CSP/Actor models.
+  \item \textbf{Defensive Cryptography \& Security:} Enforce Argon2id, hardened session management, JWT failure mitigation, OAuth2/OIDC PKCE, and OWASP defenses.
+  \item \textbf{Reliability \& Verification:} Build mutation testing pipelines, Testcontainers workflows, circuit breakers, and distributed Redis Lua token-bucket rate limiters.
+\end{itemize}
+\end{tcolorbox}
+
+\newpage
+\pagestyle{fancy}
+\tableofcontents
+
+\mainmatter
+
+\input{ch01-modern-php.tex}
+\input{ch02-python-fastapi.tex}
+\input{ch03-backend-arch-http-api.tex}
+\input{ch04-databases-sql-orm.tex}
+\input{ch05-async-concurrency.tex}
+\input{ch06-auth-security.tex}
+\input{ch07-testing-reliability.tex}
+
+\backmatter
+
+\end{document}

@@ -1,0 +1,390 @@
+\chapter{SLOs, SLIs, and SLAs}
+\label{ch:slos-slis-slas}
+
+\begin{chaptergoalsbox}
+\textbf{What You Will Learn:}
+\begin{itemize}[leftmargin=12pt]
+  \item Dissect the reliability contract hierarchy: Service Level Indicators (SLIs), Service Level Objectives (SLOs), and Service Level Agreements (SLAs).
+  \item Mathematically formulate SLIs for availability, latency, throughput, and correctness using event-based ratios.
+  \item Calculate Error Budgets over rolling 30-day windows and quantify permissible failure margins.
+  \item Implement the Google SRE Multi-Window Multi-Burn-Rate alerting standard to eliminate alert fatigue while catching catastrophic and slow-bleed outages.
+  \item Establish enforceable Error Budget Policies that balance feature development velocity with mandatory reliability engineering freezes.
+  \item Author production PromQL recording rules and alert expressions in Prometheus.
+\end{itemize}
+
+\textbf{What You Should Already Understand:}
+\begin{itemize}[leftmargin=12pt]
+  \item HTTP status code semantics (2xx/3xx successes vs 5xx server errors).
+  \item Time-series metric architectures (Prometheus counters, gauges, and histograms).
+  \item Basic statistical probability and integral calculus.
+\end{itemize}
+
+\textbf{Why This Topic Exists:}
+In traditional engineering cultures, product managers want new features deployed yesterday, while system administrators want zero changes to preserve stability. This conflict leads to political friction and blame-shifting. The SRE discipline replaces subjective arguments with quantitative mathematics: the **Error Budget**. The error budget transforms reliability into an objective, manageable currency that governs deployment velocity.
+
+\textbf{Motivating Practical Problem:}
+A fast-growing B2B analytics platform experiences 25 PagerDuty alerts per night. 95\% of these alerts are transient CPU spikes that auto-resolve in 4 minutes, causing chronic engineer burnout and high turnover. Simultaneously, a subtle memory leak introduced on Tuesday causes an unhandled HTTP 500 error on 1.8\% of customer checkout requests. Because the team's static alert threshold was configured to trigger only when error rates exceed 5\%, the outage persists unnoticed for five days, silently burning 100\% of the quarterly error budget and violating customer contracts.
+\end{chaptergoalsbox}
+
+\section{The Reliability Hierarchy: SLI, SLO, SLA}
+
+To engineer reliable systems, organizations must establish three distinct operational tiers:
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.9, every node/.style={transform shape},
+  tier/.style={rectangle, draw=headingblue, fill=headingblue!8, rounded corners=3pt, text width=11.5cm, minimum height=1.3cm, inner sep=8pt, font=\sffamily\small}
+]
+
+\node[tier] (sli) {
+  \textbf{\color{headingblue}1. Service Level Indicator (SLI) --- \textit{The Measurement}}\\
+  \small A carefully defined quantitative measure of some aspect of the level of service that is provided. Answers: \textit{``What is our actual, empirically measured reliability right now?''} Example: Proportion of successful HTTP requests.
+};
+
+\node[tier, below=0.6cm of sli] (slo) {
+  \textbf{\color{headingblue}2. Service Level Objective (SLO) --- \textit{The Internal Target}}\\
+  \small A target value or range of values for a service level that is measured by an SLI. Owned jointly by Product and Engineering. Answers: \textit{``How reliable does this service need to be to keep customers happy?''} Example: 99.9\% of requests succeed over a rolling 30-day window.
+};
+
+\node[tier, below=0.6cm of slo] (sla) {
+  \textbf{\color{headingblue}3. Service Level Agreement (SLA) --- \textit{The Legal Contract}}\\
+  \small A formal, legally binding contract with customers that includes financial or legal penalties (credits, refunds, termination rights) if the service fails to meet the specified threshold. Set more conservatively than the SLO. Example: 99.0\% uptime or 10\% bill credit.
+};
+
+\draw[-{Stealth[scale=1.1]}, thick, color=headingblue!60] (sli) -- (slo);
+\draw[-{Stealth[scale=1.1]}, thick, color=headingblue!60] (slo) -- (sla);
+
+\end{tikzpicture}
+\caption{The Three Tiers of Reliability Governance}
+\label{fig:sli-slo-sla}
+\end{figure}
+
+\begin{intuitionbox}[The Speed Limit and Fuel Gauge Analogy]
+Think of the SLI as the digital speedometer in your car—it tells you exactly how fast you are moving right now. The SLO is your target driving speed (e.g., 65 mph) chosen to reach your destination efficiently without getting a ticket. The SLA is the legal speed limit where police officers will physically pull you over, fine you, and impound the vehicle. Never set your internal target (SLO) equal to the legal limit (SLA); you always maintain a safety buffer.
+\end{intuitionbox}
+
+\section{Mathematical Formulation of SLIs}
+
+Google Site Reliability Engineering formalizes all modern SLIs as an **event-based ratio**:
+\begin{equation}
+\text{SLI} = \frac{\sum \text{Good Events}}{\sum \text{Valid Events}} \times 100\%
+\end{equation}
+
+By expressing indicators as ratios between 0\% and 100\%, engineering teams can reason consistently about availability, latency, correctness, and throughput across heterogeneous systems.
+
+\subsection{Availability SLI}
+
+An availability SLI measures the proportion of requests that return without an unhandled server error:
+\begin{equation}
+\text{SLI}_{\text{avail}} = \frac{\text{Count of HTTP requests where status } < 500}{\text{Count of all valid HTTP requests where status } \ne 4xx_{\text{client\_error}}}
+\end{equation}
+Notice that client-side errors (such as HTTP 400 Bad Request, 401 Unauthorized, or 404 Not Found) are generally excluded from the denominator (or treated as valid non-server errors), as they reflect client behavior rather than platform failure.
+
+\subsection{Latency SLI}
+
+A latency SLI measures whether requests complete faster than a predetermined threshold $T$:
+\begin{equation}
+\text{SLI}_{\text{latency}} = \frac{\text{Count of valid requests where response duration } \le T}{\text{Total count of valid requests}}
+\end{equation}
+Mathematically, if response duration is characterized by a continuous probability density function $f(t)$, the latency SLI represents the cumulative distribution function (CDF) evaluated at target $T$:
+\begin{equation}
+\text{SLI}_{\text{latency}} = \int_0^T f(t) \, dt
+\end{equation}
+
+\begin{commonmistakebox}[Setting SLO Targets to 100\%]
+Demanding ``100\% availability'' is an architectural, economic, and operational fallacy. 
+\begin{enumerate}
+  \item The user's own cellular connection, home Wi-Fi router, and local ISP rarely deliver more than 99.5\% availability. Any investment to make the backend 99.999\% reliable is invisible to a user whose cable modem drops packets every Tuesday.
+  \item Delivering 100\% availability requires infinite redundant capital and completely halts software deployment velocity.
+\end{enumerate}
+The remaining fraction ($1 - \text{SLO}$) is the **Error Budget**—a deliberate budget meant to be spent on risky deployments, fast iteration, and experiments.
+\end{commonmistakebox}
+
+\section{Error Budgets and Calculations}
+
+The \textbf{Error Budget} is the exact mathematical inverse of the Service Level Objective:
+\begin{equation}
+\text{Error Budget} = 1 - \text{SLO}
+\end{equation}
+If a service has an SLO of 99.9\% ($0.999$) over a rolling 30-day window, its error budget is:
+\begin{equation}
+\text{Error Budget} = 1 - 0.999 = 0.001 \quad (0.1\%)
+\end{equation}
+
+\subsection{Permissible Failure Calculations}
+
+Given a service processing $N_{\text{total}}$ requests over a 30-day period, the permissible number of failed requests $N_{\text{fail}}$ before the error budget is exhausted is:
+\begin{equation}
+N_{\text{fail}} = N_{\text{total}} \times (1 - \text{SLO})
+\end{equation}
+
+\paragraph{Example Calculation:}
+An e-commerce API processes 50,000,000 requests per month under a 99.95\% availability SLO.
+\begin{equation}
+N_{\text{fail}} = 50,000,000 \times (1 - 0.9995) = 50,000,000 \times 0.0005 = 25,000 \text{ failed requests}
+\end{equation}
+If the service experiences 25,001 HTTP 500 responses within any rolling 30-day window, the error budget is entirely consumed.
+
+\section{Multi-Window Multi-Burn-Rate Alerting}
+
+Traditional alerting relied on static thresholds (e.g., \textit{``Page on-call if error rate $> 1\%$ for 5 minutes''}). This naive strategy suffers from two fatal failure modes:
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{High False Positives (Alert Fatigue)}: A brief spike to 1.1\% error rate for 6 minutes consumes only $0.05\%$ of the 30-day budget, yet it wakes an engineer at 3 AM.
+  \item \textbf{Low Detection (Silent Failure)}: A sustained 0.9\% error rate never breaches the 1.0\% threshold, but completely burns a 99.9\% budget in just 3.3 days without firing a single alert.
+\end{enumerate}
+
+\subsection{The Mathematics of Burn Rate}
+
+The **Burn Rate** ($B$) is the speed at which a service consumes its error budget relative to its SLO period.
+\begin{equation}
+B = \frac{\text{Observed Error Rate}}{1 - \text{SLO}}
+\end{equation}
+\begin{itemize}[leftmargin=18pt]
+  \item $B = 1$: The service consumes exactly 100\% of its error budget over the designated window (e.g., exactly 30 days). This is the sustainable steady state.
+  \item $B = 10$: The service consumes the entire 30-day error budget in $30 / 10 = 3\text{ days}$.
+  \item $B = 14.4$: The service consumes 100\% of its 30-day error budget in $30 / 14.4 = 50\text{ hours}$ (or 2\% of the budget in exactly 1 hour).
+\end{itemize}
+
+\subsection{The Google SRE Multi-Window Multi-Burn-Rate Table}
+
+To achieve high alert precision (zero false alarms) and high recall (detecting real budget drain immediately), Google SRE authored the **Multi-Window Multi-Burn-Rate** standard. An alert fires only when \textit{both a long window and a short window} simultaneously exceed the burn rate threshold:
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lrrrrrl}
+\toprule
+\textbf{Severity} & \textbf{Burn Rate ($B$)} & \textbf{\% Budget Burned} & \textbf{Long Window} & \textbf{Short Window} & \textbf{Time to 100\% Burn} & \textbf{Action} \\
+\midrule
+\textbf{Page (Critical)} & 14.4 & 2.0\% & 1 hour & 5 minutes & 2 days (50 hrs) & Wake on-call engineer \\
+\textbf{Page (High)} & 6.0 & 5.0\% & 6 hours & 30 minutes & 5 days (120 hrs) & Page during hours \\
+\textbf{Ticket (Medium)} & 3.0 & 10.0\% & 1 day & 2 hours & 10 days & File JIRA ticket \\
+\textbf{Ticket (Low)} & 1.0 & 10.0\% & 3 days & 6 hours & 30 days & Review next morning \\
+\bottomrule
+\end{tabular}
+\caption{Google SRE Standard Multi-Window Multi-Burn-Rate Alerting Rules}
+\label{tab:burn-rate-table}
+\end{table}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.9, every node/.style={transform shape},
+  box/.style={rectangle, draw=headingblue, fill=headingblue!10, rounded corners=3pt, minimum width=3.2cm, minimum height=1.0cm, font=\sffamily\scriptsize\bfseries, align=center},
+  gate/.style={rectangle, draw=exampleBlue, fill=exampleBg, rounded corners=2pt, font=\sffamily\tiny\bfseries, align=center},
+  alert/.style={rectangle, draw=warningRed, fill=warningBg, rounded corners=3pt, font=\sffamily\small\bfseries\color{warningRed}, align=center}
+]
+
+\node[box] (long) {Long Window (1h)\\Burn Rate $\ge 14.4$};
+\node[box, below=0.6cm of long] (short) {Short Window (5m)\\Burn Rate $\ge 14.4$};
+\node[gate, right=1.5cm of long, yshift=-0.8cm, minimum height=1.5cm, minimum width=1.2cm] (and) {LOGICAL\\AND};
+\node[alert, right=1.5cm of and] (page) {PAGERDUTY\\SEV-1 ALERT!};
+
+\draw[-{Stealth[scale=1.0]}, thick] (long) -- (and.west |- long);
+\draw[-{Stealth[scale=1.0]}, thick] (short) -- (and.west |- short);
+\draw[-{Stealth[scale=1.0]}, thick, color=warningRed] (and) -- (page);
+
+\end{tikzpicture}
+\caption{Multi-Window Alerting Condition (Short Window Prevents Reset Flapping)}
+\label{fig:multi-window-logic}
+\end{figure}
+
+The **Short Window** requirement guarantees that if an error spike resolves after 3 minutes, the alert immediately resets, preventing an engineer from being paged for an incident that has already cured itself.
+
+\begin{underthehoodbox}[PromQL Subquery Engine and Counter Resets]
+When evaluating error rates across rolling windows in Prometheus, Prometheus functions like \texttt{rate()} compute per-second averages by dividing the delta between the first and last samples by the time window duration. If an application pod restarts during the window, the 64-bit integer counter resets to 0. The \texttt{rate()} function natively detects monotonicity resets and adjusts for restarts without corrupting the calculated burn rate.
+\end{underthehoodbox}
+
+\section{Production PromQL Implementation}
+
+To implement a 99.9\% availability SLO ($1 - \text{SLO} = 0.001$) with multi-burn-rate alerting in Prometheus, teams define recording rules:
+
+\begin{lstlisting}[language=bash, caption={Prometheus Recording Rules and Multi-Burn-Rate Alert Expressions}]
+groups:
+  - name: service_slo_rules
+    rules:
+      # Calculate 1-hour error rate ratio
+      - record: job:http_requests:burn_rate_1h
+        expr: >
+          sum(rate(http_requests_total{job="checkout-api", status=~"5.."}[1h]))
+          /
+          sum(rate(http_requests_total{job="checkout-api"}[1h]))
+
+      # Calculate 5-minute error rate ratio
+      - record: job:http_requests:burn_rate_5m
+        expr: >
+          sum(rate(http_requests_total{job="checkout-api", status=~"5.."}[5m]))
+          /
+          sum(rate(http_requests_total{job="checkout-api"}[5m]))
+
+  - name: service_slo_alerts
+    rules:
+      # Critical Page Alert: 14.4x Burn Rate (Burns 2% of budget in 1 hour)
+      - alert: CheckoutApiHighErrorBudgetBurn
+        expr: >
+          (job:http_requests:burn_rate_1h{job="checkout-api"} > (14.4 * 0.001))
+          and
+          (job:http_requests:burn_rate_5m{job="checkout-api"} > (14.4 * 0.001))
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "High Error Budget Burn Rate on Checkout API"
+          description: "Error rate is consuming >2% of monthly budget per hour."
+\end{lstlisting}
+
+\section{Error Budget Policies and Governance}
+
+An error budget without an organizational **Error Budget Policy** is useless trivia. The policy is a formal contract between Product Management and Platform Engineering defining what happens when the budget is consumed:
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lp{10.5cm}}
+\toprule
+\textbf{Budget State} & \textbf{Mandatory Organizational Action} \\
+\midrule
+\textbf{$>50\%$ Remaining} & Normal operations; teams deploy new features, run A/B tests, and refactor code rapidly. \\
+\textbf{$10\% - 50\%$ Remaining} & Pre-deployment canary periods doubled; non-essential schema refactorings postponed. \\
+\textbf{$<10\%$ Remaining} & Product feature launches halted. All engineering resources divert to reliability testing. \\
+\textbf{$0\%$ (Exhausted)} & \textbf{Feature Freeze}: Zero product features deployed. Entire engineering sprint dedicated exclusively to automated testing, chaos engineering, bug fixes, and infrastructure resilience. \\
+\bottomrule
+\end{tabular}
+\caption{The Error Budget Enforcement Policy}
+\label{tab:budget-policy}
+\end{table}
+
+\begin{realworldbox}[Google SRE Enforcement During Cloud Network Migration]
+During a major overhaul of Google Cloud's Software-Defined Networking stack (Andromeda), high-velocity feature deployments caused a sequence of minor packet drops that burned 80\% of the quarterly error budget in three weeks. The SRE team invoked the Error Budget Policy. Despite protests from product managers eager to launch new customer features before the annual Cloud Next conference, all non-critical feature rollouts were blocked for four weeks until automated canary analysis and rollback verifications were deployed.
+\end{realworldbox}
+
+\begin{productionwarningbox}[Alert Fatigue and Pager Desensitization]
+When on-call engineers receive more than 3 false-positive alerts per shift, cognitive desensitization occurs. Engineers silence phone notifications or automatically click ``Acknowledge'' without reading the alert. When a genuine catastrophic database corruption occurs, the critical alert is ignored among the noise. Multi-window burn-rate alerting reduces alert volume by 80--90\% while guaranteeing that every triggered page represents a mathematically significant threat to the business contract.
+\end{productionwarningbox}
+
+\begin{tryityourselfbox}[Exercise: Calculate Burn Rate and Alert Timing]
+An online banking API maintains a 99.95\% monthly availability SLO ($1 - \text{SLO} = 0.0005$). 
+\begin{enumerate}
+  \item Compute the threshold error rate corresponding to a 14.4x burn rate.
+  \item If the service experiences a sustained 1.0\% error rate ($0.01$), compute the actual burn rate $B$.
+  \item How many hours will it take for this 1.0\% error rate to burn 100\% of the 30-day error budget?
+\end{enumerate}
+\end{tryityourselfbox}
+
+\section{Summary \& Key Takeaways}
+
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Hierarchy of Reliability}: SLI measures reality; SLO defines the internal target; SLA represents the legal penalty threshold ($SLI \ge SLO > SLA$).
+  \item \textbf{Standardized Math}: All modern SLIs are expressed as $\frac{\text{Good Events}}{\text{Valid Events}}$.
+  \item \textbf{Error Budget Currency}: The error budget ($1 - \text{SLO}$) is an operational currency designed to be spent on feature velocity and experimentation.
+  \item \textbf{Multi-Window Alerting}: Alerting on burn rates over dual windows (long + short) eliminates false positives from transient spikes and prevents alert fatigue.
+  \item \textbf{Feature Freezes}: When an error budget is exhausted, product feature deployments halt to prioritize reliability engineering.
+\end{itemize}
+
+\section{Exercises}
+
+\subsection*{Mechanics}
+\begin{enumerate}[leftmargin=18pt]
+  \item A notification service has an SLO of 99.9\% over a 30-day window. It processes 120,000,000 requests per month. Calculate the total number of requests that can fail before the error budget is exhausted.
+  \item Derive the formula for the time $T_{\text{exhaust}}$ (in days) required to completely exhaust an error budget given a 30-day SLO window and an observed burn rate $B$.
+\end{enumerate}
+
+\subsection*{Debugging}
+\begin{enumerate}[leftmargin=18pt]
+  \item An engineer writes the following Prometheus alert rule:
+  \begin{lstlisting}[language=bash]
+  - alert: HighErrorRate
+    expr: rate(http_requests_500_total[1m]) > 5
+    for: 30s
+  \end{lstlisting}
+  Identify two major flaws with this alert and explain why it causes alert fatigue.
+\end{enumerate}
+
+\subsection*{Architecture Design}
+\begin{enumerate}[leftmargin=18pt]
+  \item Author a complete Prometheus Alertmanager configuration snippet implementing the Google SRE Multi-Window Multi-Burn-Rate alerting rules for a 99.9\% availability SLO. Include both the 14.4x burn rate (1h/5m) page alert and the 6x burn rate (6h/30m) page alert.
+\end{enumerate}
+
+\section{Detailed Solutions}
+
+\subsection*{Mechanics Solution}
+\begin{enumerate}[leftmargin=18pt]
+  \item Total requests $N_{\text{total}} = 120,000,000$.
+  $$\text{Error Budget Fraction} = 1 - 0.999 = 0.001$$
+  $$\text{Permissible Failures } N_{\text{fail}} = 120,000,000 \times 0.001 = 120,000 \text{ requests}$$
+  
+  \item By definition, a burn rate of $B = 1$ exhausts 100\% of the budget in exactly 30 days. Because burn rate is linear with respect to consumption speed:
+  $$T_{\text{exhaust}} = \frac{30\text{ days}}{B}$$
+  For $B = 14.4$:
+  $$T_{\text{exhaust}} = \frac{30}{14.4} = 2.083\text{ days} \approx 50\text{ hours}$$
+\end{enumerate}
+
+\subsection*{Debugging Solution}
+\begin{enumerate}[leftmargin=18pt]
+  \item The rule exhibits two fatal flaws:
+  \begin{enumerate}
+    \item \textbf{Raw Counter Count instead of Ratio}: The rule triggers if raw errors exceed 5 requests/sec, regardless of total traffic. At peak traffic (100,000 QPS), 5 errors/sec represents a stellar 99.995\% availability ($0.005\%$ error rate). At low traffic (10 QPS), 5 errors/sec represents a catastrophic 50\% failure rate. Alerting on absolute numbers rather than an error ratio ($\frac{\text{errors}}{\text{total}}$) is invalid.
+    \item \textbf{Extremely Narrow Window (1m with 30s duration)}: A single transient network hiccup lasting 40 seconds will page an on-call engineer, creating chronic alert fatigue.
+  \end{enumerate}
+\end{enumerate}
+
+\subsection*{Architecture Design Solution}
+\begin{lstlisting}[language=bash, caption={Complete Multi-Window Multi-Burn-Rate Prometheus Alert Rules}]
+groups:
+  - name: production_api_burn_rate_alerts
+    rules:
+      # Critical Severity: 14.4x Burn Rate (1h long window, 5m short window)
+      - alert: ApiAvailabilityCriticalBurnRate
+        expr: >
+          (
+            sum(rate(http_requests_total{status=~"5.."}[1h]))
+            /
+            sum(rate(http_requests_total[1h]))
+            > (14.4 * 0.001)
+          )
+          and
+          (
+            sum(rate(http_requests_total{status=~"5.."}[5m]))
+            /
+            sum(rate(http_requests_total[5m]))
+            > (14.4 * 0.001)
+          )
+        for: 2m
+        labels:
+          severity: page
+          tier: critical
+        annotations:
+          summary: "API 14.4x Error Budget Burn Rate Detected"
+          description: "Service is burning 2% of monthly budget per hour."
+
+      # High Severity: 6x Burn Rate (6h long window, 30m short window)
+      - alert: ApiAvailabilityHighBurnRate
+        expr: >
+          (
+            sum(rate(http_requests_total{status=~"5.."}[6h]))
+            /
+            sum(rate(http_requests_total[6h]))
+            > (6.0 * 0.001)
+          )
+          and
+          (
+            sum(rate(http_requests_total{status=~"5.."}[30m]))
+            /
+            sum(rate(http_requests_total[30m]))
+            > (6.0 * 0.001)
+          )
+        for: 15m
+        labels:
+          severity: page
+          tier: high
+        annotations:
+          summary: "API 6x Error Budget Burn Rate Detected"
+          description: "Service is burning 5% of monthly budget over 6 hours."
+\end{lstlisting}
+
+\section{Further Reading \& Citations}
+\begin{itemize}[leftmargin=18pt]
+  \item Beyer, B., Murphy, N. R., Rensin, D. K., Kawahara, K. M., \& Thorne, S. (2018). \textit{The Site Reliability Workbook: Practical Ways to Implement SRE}. O'Reilly Media. (Chapter 5: Alerting on SLOs).
+  \item Google Cloud Architecture Center. (2020). \textit{SRE fundamentals: SLIs, SLOs, and Error Budgets}.
+  \item OpenTelemetry Documentation. (2023). \textit{Semantic Conventions for HTTP Metrics}.
+  \item Prometheus Authors. (2024). \textit{PromQL Metric Queries and Recording Rules}.
+\end{itemize}

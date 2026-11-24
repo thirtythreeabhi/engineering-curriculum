@@ -1,0 +1,180 @@
+\documentclass[11pt,oneside]{book}
+\input{../common/preamble.tex}
+
+\begin{document}
+\frontmatter
+
+% --- TITLE PAGE ---
+\begin{titlepage}
+  \vspace*{2.5cm}
+  {\Huge\sffamily\bfseries\color{headingblue} Modern Engineering Curriculum}\\[14pt]
+  {\LARGE\sffamily\color{gray} A Comprehensive Technical Textbook on Backend, AI, Cloud, Distributed Systems, and Architecture}\\[28pt]
+  \hrule height 1.5pt
+  \vspace*{25pt}
+  {\large\sffamily Designed for Deep Technical Understanding, Job Readiness, and Production Mastery}\\[3cm]
+  
+  \vfill
+  \begin{flushleft}
+    \sffamily\small
+    \textbf{Volumes Included:}\\
+    Volume I: Backend Engineering (Modern PHP, Python/FastAPI, HTTP, Databases, Concurrency, Security, Testing)\\
+    Volume II: AI Engineering (LangGraph, Production RAG, Embeddings, Retrieval, Agents, Evals, Observability)\\
+    Volume III: Cloud Engineering \& DevSecOps (Azure, Docker, Kubernetes, CI/CD, DevSecOps, Terraform, Security)\\
+    Volume IV: Distributed Systems (CAP, Consensus, 2PC, Outbox, Kafka, RabbitMQ, Redis, Distributed Locks, Sagas)\\
+    Volume V: Architecture \& Engineering Economics (C4, UML, TDD, ADRs, Threat Modeling, SLOs, FinOps, AI Inference)
+  \end{flushleft}
+\end{titlepage}
+
+% --- HOW TO STUDY THIS CURRICULUM ---
+\chapter*{How to Study This Curriculum Without Becoming Overwhelmed}
+\addcontentsline{toc}{chapter}{How to Study This Curriculum}
+
+This curriculum covers an immense surface area of modern software engineering. If you attempt to read all five volumes linearly from page 1 to 350 without a structured strategy, cognitive overload is inevitable. 
+
+To maximize retention and immediate career impact, follow this tailored study methodology:
+
+\section*{1. The Two Strategic Study Tracks}
+
+\begin{tcolorbox}[
+  enhanced,
+  colback=exampleBg,
+  colframe=exampleBlue,
+  arc=2pt,
+  boxrule=0.8pt,
+  left=12pt,right=12pt,top=10pt,bottom=10pt
+]
+\sffamily\small
+\textbf{Track 1: Immediate Job Readiness (Modern PHP \& Production Web Integration)}\\
+If your upcoming role demands production PHP, begin here immediately:
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Volume I, Chapter 1 (Modern PHP Engineering)}: Master the PHP-FPM process pool model, Zend OPcache memory architecture, zval refcounting, Copy-on-Write (CoW), and cyclic garbage collection.
+  \item \textbf{Volume I, Chapter 4 (Databases, SQL and ORM)}: Understand PostgreSQL MVCC, transaction isolation levels, row-level locking (\texttt{SELECT FOR UPDATE}), and resolving the N+1 query problem.
+  \item \textbf{Volume I, Chapter 1 \& Chapter 6 (Webhooks, Idempotency \& Security)}: Study HMAC-SHA256 signature verification, replay window mitigation, and Redis-backed idempotency.
+  \item \textbf{Hands-on Reference Projects}: Complete and run \texttt{projects/p01-php-db-integration} and \texttt{projects/p02-php-webhook-receiver}.
+\end{enumerate}
+\end{tcolorbox}
+
+\begin{tcolorbox}[
+  enhanced,
+  colback=hoodBg,
+  colframe=hoodSlate,
+  arc=2pt,
+  boxrule=0.8pt,
+  left=12pt,right=12pt,top=10pt,bottom=10pt
+]
+\sffamily\small
+\textbf{Track 2: Foundational Systems \& Architecture Mastery (Long-Term Growth)}\\
+Once you are confident in daily backend operations, progress through the advanced volumes:
+\begin{enumerate}[leftmargin=15pt]
+  \item \textbf{Volume IV (Distributed Systems)}: Study CAP/PACELC, Raft consensus, Transactional Outbox, and Kafka vs RabbitMQ before attempting distributed cloud topologies.
+  \item \textbf{Volume III (Cloud Engineering \& DevSecOps)}: Dive into Linux cgroups/namespaces, Kubernetes internals, and Terraform DAG execution.
+  \item \textbf{Volume II (AI Engineering)}: Master LangGraph state machines, vector spaces, HNSW graph navigation, and production RAG.
+  \item \textbf{Volume V (Architecture \& Engineering Economics)}: Synthesize everything with C4 modeling, ADRs, STRIDE threat analysis, SLO error budgets, and AI inference cost models.
+\end{enumerate}
+\end{tcolorbox}
+
+\section*{2. The Active Learning Cycle}
+For every chapter in this textbook:
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Read the Opening}: Understand the motivating practical problem before looking at code.
+  \item \textbf{Absorb the Intuition}: Visualize the physical analogy before analyzing runtime mechanics.
+  \item \textbf{Study the Under-the-Hood Mechanics}: Pay attention to memory layouts, call stacks, and network packets.
+  \item \textbf{Experiment with the Try-It-Yourself Prompts}: Open your terminal and run the provided experiments.
+  \item \textbf{Solve the Chapter Exercises}: Work through the Mechanics, Debugging, and Architecture challenges before inspecting the solutions.
+\end{enumerate}
+
+\newpage
+\tableofcontents
+
+\mainmatter
+
+% --- VOLUME I ---
+\part{Volume I: Backend Engineering}
+\input{../volume-1/ch01-modern-php}
+\input{../volume-1/ch02-python-fastapi}
+\input{../volume-1/ch03-backend-arch-http-api}
+\input{../volume-1/ch04-databases-sql-orm}
+\input{../volume-1/ch05-async-concurrency}
+\input{../volume-1/ch06-auth-security}
+\input{../volume-1/ch07-testing-reliability}
+
+% --- VOLUME II ---
+\part{Volume II: AI Engineering}
+\input{../volume-2/ch01-langgraph}
+\input{../volume-2/ch02-production-rag}
+\input{../volume-2/ch03-embeddings-vector-db}
+\input{../volume-2/ch04-retrieval-reranking}
+\input{../volume-2/ch05-agent-architectures}
+\input{../volume-2/ch06-llm-evaluations}
+\input{../volume-2/ch07-observability-tracing}
+
+% --- VOLUME III ---
+\part{Volume III: Cloud Engineering and DevSecOps}
+\input{../volume-3/ch01-azure-fundamentals}
+\input{../volume-3/ch02-azure-openai-search}
+\input{../volume-3/ch03-docker-kubernetes}
+\input{../volume-3/ch04-cicd-pipelines}
+\input{../volume-3/ch05-devsecops}
+\input{../volume-3/ch06-terraform-iac}
+\input{../volume-3/ch07-infrastructure-security}
+
+% --- VOLUME IV ---
+\part{Volume IV: Distributed Systems}
+\input{../volume-4/ch01-distributed-fundamentals}
+\input{../volume-4/ch02-cap-consistency}
+\input{../volume-4/ch03-transactions-concurrency}
+\input{../volume-4/ch04-messaging-systems}
+\input{../volume-4/ch05-kafka-rabbitmq}
+\input{../volume-4/ch06-redis-caching}
+\input{../volume-4/ch07-distributed-locking}
+\input{../volume-4/ch08-sagas-cqrs-eventsourcing}
+\input{../volume-4/ch09-reliability-fault-tolerance}
+
+% --- VOLUME V ---
+\part{Volume V: Software Architecture and Engineering Economics}
+\input{../volume-5/ch01-c4-architecture}
+\input{../volume-5/ch02-uml-sequence}
+\input{../volume-5/ch03-technical-design-docs}
+\input{../volume-5/ch04-adrs}
+\input{../volume-5/ch05-requirements-engineering}
+\input{../volume-5/ch06-threat-modeling}
+\input{../volume-5/ch07-slos-slis-slas}
+\input{../volume-5/ch08-finops}
+\input{../volume-5/ch09-ai-inference-economics}
+
+\backmatter
+
+\chapter*{Master Glossary Across All Volumes}
+\addcontentsline{toc}{chapter}{Master Glossary}
+
+\begin{description}[leftmargin=2.5cm,style=nextline]
+  \item[ACID] Atomicity, Consistency, Isolation, Durability. The four guarantees provided by relational database transaction engines.
+  \item[Active Record] Architectural pattern where an entity class wraps both database row data and database persistence logic.
+  \item[ANN] Approximate Nearest Neighbor search algorithms (e.g., HNSW, IVF) used to query high-dimensional vector spaces in sub-linear time.
+  \item[ASGI] Asynchronous Server Gateway Interface. The standard asynchronous Python specification between web servers and application frameworks like FastAPI.
+  \item[BM25] Best Matching 25. A probabilistic sparse information retrieval ranking function based on TF-IDF with term frequency saturation and document length normalization.
+  \item[C4 Model] Context, Container, Component, and Code. A hierarchical, developer-friendly software architecture modeling framework created by Simon Brown.
+  \item[CAP Theorem] Brewer's theorem stating that any distributed data store can simultaneously provide at most two of Consistency, Availability, and Partition tolerance.
+  \item[Copy-on-Write (CoW)] Memory optimization strategy where data is shared across pointers until a write occurs, triggering a lazy duplicate copy.
+  \item[CQRS] Command Query Responsibility Segregation. An architectural pattern separating data modification models (commands) from read models (queries).
+  \item[Data Mapper] Architectural pattern separating in-memory domain objects from the database persistence engine (e.g., Doctrine, SQLAlchemy).
+  \item[HNSW] Hierarchical Navigable Small World. A graph-based vector index providing logarithmic-time approximate nearest neighbor search.
+  \item[Idempotency] The property of an operation where applying it multiple times produces the identical side-effect and outcome as applying it once.
+  \item[Linearizability] Strong consistency model guaranteeing that all read and write operations appear to execute instantaneously on a single centralized copy of data.
+  \item[MVCC] Multi-Version Concurrency Control. A database concurrency engine where readers never block writers and writers never block readers by maintaining multiple snapshot versions of rows.
+  \item[PACELC] Theorem extending CAP: in a partitioned system, trade off Availability and Consistency; Else, trade off Latency and Consistency.
+  \item[Pregel] Bulk Synchronous Parallel graph computing model used by LangGraph where computation proceeds in iterative supersteps with state synchronization.
+  \item[Raft] A leader-based consensus algorithm designed for understandability, providing replicated state machine consistency equivalent to Paxos.
+  \item[SLO / SLI / SLA] Service Level Objective (target reliability), Service Level Indicator (measured metric), and Service Level Agreement (contractual commitment with penalties).
+  \item[STRIDE] Threat modeling methodology categorizing risks into Spoofing, Tampering, Repudiation, Information Disclosure, Denial of Service, and Elevation of Privilege.
+  \item[Transactional Outbox] Pattern ensuring reliable event publishing by saving outgoing messages into an atomic database outbox table within the local business transaction before publishing to a broker.
+  \item[Zend Engine] The internal execution engine of PHP, compiling PHP source code into Zend opcodes and executing them in a virtual machine runtime.
+  \item[zval] Zend Value. The fundamental C struct in PHP representing any variable, containing value data, type tags, and refcount headers.
+\end{description}
+
+\chapter*{Master Bibliography}
+\addcontentsline{toc}{chapter}{Master Bibliography}
+\bibliographystyle{plain}
+\bibliography{../common/bibliography}
+
+\end{document}

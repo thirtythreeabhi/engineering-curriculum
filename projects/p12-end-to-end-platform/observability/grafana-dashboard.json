@@ -1,0 +1,34 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": 1,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "title": "HTTP Request Throughput (req/sec)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "rate(http_requests_total[1m])",
+          "legendFormat": "{{service}} - {{handler}}"
+        }
+      ]
+    },
+    {
+      "title": "P95 Request Latency (ms)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_ms_bucket[1m])) by (le, service))",
+          "legendFormat": "{{service}} p95"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 38,
+  "title": "Platform Multi-Service Observability Dashboard",
+  "uid": "platform-e2e-dash"
+}

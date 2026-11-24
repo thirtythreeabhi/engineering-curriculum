@@ -1,0 +1,24 @@
+{
+  "spdxVersion": "SPDX-2.3",
+  "dataLicense": "CC0-1.0",
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "name": "enterprise-secure-app",
+  "documentNamespace": "https://curriculum.internal/spdxdocs/app-v1.0.0",
+  "packages": [
+    {
+      "name": "fastapi",
+      "versionInfo": "0.110.0",
+      "licenseConcluded": "MIT"
+    },
+    {
+      "name": "pydantic",
+      "versionInfo": "2.6.0",
+      "licenseConcluded": "MIT"
+    },
+    {
+      "name": "sqlalchemy",
+      "versionInfo": "2.0.28",
+      "licenseConcluded": "MIT"
+    }
+  ]
+}

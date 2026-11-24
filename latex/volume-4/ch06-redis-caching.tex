@@ -1,0 +1,317 @@
+\chapter{Redis and Caching Topologies}
+\label{ch:redis-caching}
+
+\begin{chaptergoalsbox}
+\textbf{What you will learn:}
+\begin{itemize}[leftmargin=12pt]
+  \item Redis single-threaded architecture: the non-blocking multiplexed event loop (\texttt{epoll}/\texttt{kqueue}) and internal C data structures (\texttt{sds}, \texttt{dict}, \texttt{skiplist}, \texttt{ziplist}/\texttt{listpack}).
+  \item Memory eviction algorithms: LRU, LFU, volatile vs. allkeys, and sampled approximation mechanics.
+  \item Caching topologies: Cache-Aside, Read-Through, Write-Through, and Write-Behind (Write-Back).
+  \item Caching failure pathologies: Cache Stampedes (Thundering Herd), Cache Penetration (Bloom filters), Cache Breakdown, and Cache Avalanche.
+  \item High Availability and Scaling: Redis Sentinel failover quorum vs. Redis Cluster 16,384 hash slots and Gossip protocol.
+\end{itemize}
+
+\textbf{What you should already understand:}
+\begin{itemize}[leftmargin=12pt]
+  \item Hash tables, doubly linked lists, binary search trees, and algorithm time complexity.
+  \item TCP network sockets and non-blocking I/O multiplexing from Volume I.
+\end{itemize}
+
+\textbf{Why this topic exists:}
+Main memory (DRAM) accesses occur in $\sim 100\text{ ns}$, while SSD/relational queries take milliseconds. Caching layers are essential to scale systems beyond database connection and disk I/O limits, but improper cache invalidation leads to silent data corruption and platform outages.
+
+\textbf{Motivating practical problem:}
+A national airline ticketing portal clears its flight search cache at midnight. Within 500 milliseconds, 80,000 concurrent client requests miss the cache and hit the underlying PostgreSQL database cluster simultaneously. The database runs out of worker connections, CPU spikes to 100\%, disk queue length reaches 4,000, and the entire reservation portal crashes for 45 minutes.
+\end{chaptergoalsbox}
+
+\section{Redis Architecture and Data Structures}
+
+Redis (Remote Dictionary Server), created by Salvatore Sanfilippo (antirez) in 2009, is an in-memory key-value data structure store.
+
+\subsection{The Single-Threaded Event Loop}
+
+A core design decision of Redis is its \textbf{single-threaded execution model} for command processing. While auxiliary threads handle asynchronous file deletion (\texttt{UNLINK}) and disk fsyncs, all client read and write commands execute on a single core.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.85,
+  sock/.style={rectangle, draw=headingblue, fill=codebg, thick, rounded corners=2pt, minimum width=2.4cm, minimum height=0.7cm, align=center, font=\sffamily\tiny},
+  loop/.style={circle, draw=exampleBlue, fill=exampleBg, thick, minimum size=3.0cm, align=center, font=\sffamily\footnotesize}
+]
+  \node[sock] (s1) at (-4, 1.2) {Client Socket 1};
+  \node[sock] (s2) at (-4, 0.0) {Client Socket 2};
+  \node[sock] (s3) at (-4, -1.2) {Client Socket 3};
+
+  \node[rectangle, draw=hoodSlate, fill=hoodBg, thick, rounded corners=2pt, minimum width=2.2cm, minimum height=3.2cm, align=center, font=\sffamily\footnotesize] (mux) at (-0.5, 0) {I/O Multiplexer\\(\texttt{epoll} / \texttt{kqueue})};
+
+  \node[loop] (el) at (4.5, 0) {\textbf{Event Loop}\\File Event Handler\\Sequential Exec\\In-Memory Dict};
+
+  \draw[-{Stealth[scale=1.0]}, thick] (s1) -- (mux);
+  \draw[-{Stealth[scale=1.0]}, thick] (s2) -- (mux);
+  \draw[-{Stealth[scale=1.0]}, thick] (s3) -- (mux);
+
+  \draw[-{Stealth[scale=1.0]}, thick, color=exampleBlue] (mux) -- node[above, font=\sffamily\tiny] {Event Queue} (el);
+\end{tikzpicture}
+\caption{Redis Non-Blocking Multiplexed Event Loop Architecture}
+\label{fig:redis-event-loop}
+\end{figure}
+
+\textbf{Why Single-Threaded is Fast:}
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Zero Context Switching Overhead}: No OS thread switching or CPU cache line invalidation.
+  \item \textbf{Zero Locking Contention}: In-memory operations require no mutexes, spinlocks, or read-write locks. Race conditions inside data structures are eliminated.
+  \item \textbf{Memory-Bound Execution}: Redis execution is bounded by DRAM memory bandwidth ($\sim 50\text{ GB/s}$), not CPU cycles. With \texttt{epoll}, a single core easily handles over $100{,}000$ operations per second.
+\end{enumerate}
+
+\subsection{Internal C Data Structures}
+
+Redis does not use raw C pointers or primitive types. It encapsulates values within optimized structures:
+
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{SDS (Simple Dynamic String)}:
+  Standard C strings are null-terminated (\texttt{\textbackslash 0}), requiring $O(N)$ scans to determine length and risking buffer overflows. Redis wraps strings in \texttt{sdshdr}, which stores length, remaining capacity, and flags. SDS allows $O(1)$ length lookups, binary-safe arbitrary byte storage, and pre-allocation buffering.
+  \item \textbf{Dict (Hash Table)}:
+  Redis dictionaries use two hash tables ($ht[0]$ and $ht[1]$) with separate chaining for collisions. To prevent latency spikes during resizing, Redis performs \textbf{incremental rehashing}: every client lookup or write moves a fixed number of buckets from $ht[0]$ to $ht[1]$ until migration is complete.
+  \item \textbf{SkipList}:
+  Used alongside hash tables to back Sorted Sets (\texttt{ZSET}). A SkipList is a probabilistic multi-level linked list that achieves $O(\log N)$ search, insertion, and range queries without the complex rebalancing algorithms of red-black trees.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.85,
+  node distance=1.4cm,
+  node/.style={rectangle, draw=headingblue, fill=codebg, thick, rounded corners=2pt, minimum width=0.9cm, minimum height=0.6cm, align=center, font=\sffamily\tiny}
+]
+  % Level 3
+  \node[node, fill=warningBg] (l3_0) at (0, 2) {Head};
+  \node[node, fill=warningBg] (l3_4) at (6, 2) {40};
+  \node[node, fill=warningBg] (l3_8) at (10, 2) {NIL};
+  \draw[-{Stealth[scale=1.0]}, thick] (l3_0) -- (l3_4);
+  \draw[-{Stealth[scale=1.0]}, thick] (l3_4) -- (l3_8);
+
+  % Level 2
+  \node[node, fill=intuitionBg] (l2_0) at (0, 1) {Head};
+  \node[node, fill=intuitionBg] (l2_2) at (3, 1) {20};
+  \node[node, fill=intuitionBg] (l2_4) at (6, 1) {40};
+  \node[node, fill=intuitionBg] (l2_7) at (8.5, 1) {70};
+  \node[node, fill=intuitionBg] (l2_8) at (10, 1) {NIL};
+  \draw[-{Stealth[scale=1.0]}, thick] (l2_0) -- (l2_2);
+  \draw[-{Stealth[scale=1.0]}, thick] (l2_2) -- (l2_4);
+  \draw[-{Stealth[scale=1.0]}, thick] (l2_4) -- (l2_7);
+  \draw[-{Stealth[scale=1.0]}, thick] (l2_7) -- (l2_8);
+
+  % Level 1
+  \node[node] (l1_0) at (0, 0) {Head};
+  \node[node] (l1_1) at (1.5, 0) {10};
+  \node[node] (l1_2) at (3, 0) {20};
+  \node[node] (l1_3) at (4.5, 0) {30};
+  \node[node] (l1_4) at (6, 0) {40};
+  \node[node] (l1_5) at (7.2, 0) {50};
+  \node[node] (l1_7) at (8.5, 0) {70};
+  \node[node] (l1_8) at (10, 0) {NIL};
+  \draw[-{Stealth[scale=1.0]}, thick] (l1_0) -- (l1_1);
+  \draw[-{Stealth[scale=1.0]}, thick] (l1_1) -- (l1_2);
+  \draw[-{Stealth[scale=1.0]}, thick] (l1_2) -- (l1_3);
+  \draw[-{Stealth[scale=1.0]}, thick] (l1_3) -- (l1_4);
+  \draw[-{Stealth[scale=1.0]}, thick] (l1_4) -- (l1_5);
+  \draw[-{Stealth[scale=1.0]}, thick] (l1_5) -- (l1_7);
+  \draw[-{Stealth[scale=1.0]}, thick] (l1_7) -- (l1_8);
+\end{tikzpicture}
+\caption{Multi-Level SkipList Structure Supporting $O(\log N)$ ZSET Lookups}
+\label{fig:skiplist}
+\end{figure}
+
+\section{Memory Eviction Policies}
+
+When memory usage hits \texttt{maxmemory}, Redis evicts keys according to the configured policy:
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{noeviction}: Rejects writes with an out-of-memory error. Protects critical data stores.
+  \item \textbf{allkeys-lru / volatile-lru}: Evicts the Least Recently Used keys across all keys or only keys with an expiration TTL.
+  \item \textbf{allkeys-lfu / volatile-lfu}: Evicts the Least Frequently Used keys using Morris counter probabilistic frequency tracking.
+\end{itemize}
+
+\begin{underthehoodbox}[Sampled Approximation of LRU in Redis]
+A strict LRU implementation requires maintaining a doubly linked list of all keys and moving a key to the head on every read/write. In a store with 50 million keys, this pointer manipulation consumes massive memory and destroys cache locality.
+Redis implements \textbf{Approximated LRU}: every object stores a 24-bit timestamp. When memory must be freed, Redis randomly samples $N$ keys (default $N=5$), selects the oldest key in that sample, and evicts it. With $N=10$, Approximated LRU matches theoretical true LRU within 1\% accuracy at zero pointer overhead.
+\end{underthehoodbox}
+
+\section{Caching Topologies and Strategies}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  scale=0.85,
+  box/.style={rectangle, draw=headingblue, fill=codebg, thick, rounded corners=2pt, minimum width=2.2cm, minimum height=0.9cm, align=center, font=\sffamily\footnotesize},
+  db/.style={cylinder, draw=exampleBlue, fill=exampleBg, thick, shape border rotate=90, minimum width=1.8cm, minimum height=1.3cm, align=center, font=\sffamily\footnotesize}
+]
+  \node[box] (app) at (0, 0) {Application};
+  \node[box, fill=intuitionBg] (cache) at (4.5, 1.2) {Redis Cache};
+  \node[db] (db) at (4.5, -1.2) {Database};
+
+  \draw[-{Stealth[scale=1.0]}, thick] (app) -- node[above, sloped, font=\sffamily\tiny] {1. Query Cache} (cache);
+  \draw[-{Stealth[scale=1.0]}, thick, color=warningRed] (app) -- node[below, sloped, font=\sffamily\tiny] {2. Cache Miss $\to$ Query DB} (db);
+  \draw[-{Stealth[scale=1.0]}, thick, dashed, color=intuitionTeal] (app) to [bend left=40] node[above, font=\sffamily\tiny] {3. Populate Cache} (cache);
+\end{tikzpicture}
+\caption{Cache-Aside (Lazy Loading) Topology Pattern}
+\label{fig:cache-aside}
+\end{figure}
+
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Cache-Aside (Lazy Loading)}: Application code coordinates both cache and DB. On read: check cache; if missed, read DB, write to cache, return. On write: write DB, then invalidate (delete) the cache entry.
+  \item \textbf{Write-Through}: Application treats cache as the primary store. The cache synchronously updates the database before returning success.
+  \item \textbf{Write-Behind (Write-Back)}: Application writes to cache instantly; the cache asynchronously batches and flushes mutations to the database. Provides extreme write throughput, but risks data loss if the cache node crashes before flushing.
+\end{enumerate}
+
+\section{Cache Pathologies and Defenses}
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lp{5.0cm}p{6.0cm}}
+\toprule
+\textbf{Pathology} & \textbf{Mechanism} & \textbf{Production Defense} \\
+\midrule
+\textbf{Cache Stampede (Thundering Herd)} & High-traffic hot key expires; thousands of concurrent threads miss simultaneously and query DB. & \textbf{Probabilistic Early Expiration (XFetch)} or distributed mutex locks around cache loading. \\
+\textbf{Cache Penetration} & Attackers query keys that do not exist in either cache or DB (e.g., negative IDs). & \textbf{Bloom Filters} at the ingress boundary or caching empty null values with short TTLs. \\
+\textbf{Cache Avalanche} & Large batches of keys expire at the exact same second (e.g., 24-hour midnight TTLs). & \textbf{TTL Jitter}: add random noise ($\text{TTL} = \text{base} + \text{rand}(0, 300\text{s})$) to distribute expiration across time. \\
+\textbf{Cache Breakdown} & A single extreme hot key (e.g., celebrity post) expires under million-QPS traffic. & Never expire hot keys; refresh them asynchronously in the background via a cron or worker. \\
+\bottomrule
+\end{tabular}
+\caption{Taxonomy of Distributed Caching Pathologies and Mitigations}
+\label{tab:cache-pathologies}
+\end{table}
+
+\begin{underthehoodbox}[Probabilistic Early Expiration: The XFetch Algorithm]
+Proposed by Vattani et al. in 2015, the XFetch algorithm computes whether a read should trigger an early background cache refresh before the key officially expires:
+\begin{equation}
+-\beta \times \delta \times \ln(\text{rand}()) > \text{TTL}_{\text{remaining}}
+\end{equation}
+where $\delta$ is the compute time taken to fetch from the database, $\beta > 0$ is an aggressiveness factor, and $\text{rand}() \in (0, 1]$. As $\text{TTL}_{\text{remaining}}$ approaches zero, the probability of early background refresh approaches 1.0, guaranteeing that hot keys are renewed before expiration and preventing thundering herds without locking!
+\end{underthehoodbox}
+
+\section{Redis Clustering: Sentinel vs. Cluster}
+
+\subsection{Redis Sentinel (High Availability for Single Master)}
+Sentinel manages a primary-replica pair. Sentinel nodes monitor the master using heartbeats (\texttt{PING}). If a quorum of Sentinels agree the master is unresponsive (\texttt{ODOWN}), they execute an automated failover, promote a replica, and reconfigure client connections via Pub/Sub notifications.
+\textbf{Limitation}: Cannot scale writes beyond a single physical server's CPU and RAM.
+
+\subsection{Redis Cluster (Horizontal Sharding)}
+Redis Cluster partitions data across up to 1,000 nodes without a centralized proxy:
+\begin{itemize}[leftmargin=18pt]
+  \item The keyspace is divided into \textbf{16,384 hash slots}.
+  \item Slot allocation for key $k$ is calculated as:
+  \begin{equation}
+  \text{slot} = \text{CRC16}(k) \pmod{16384}
+  \end{equation}
+  \item Using \textbf{Hash Tags} (\texttt{\{user:123\}:profile}), Redis hashes only the string inside curly braces, ensuring related multi-key operations land on the same node.
+  \item Nodes maintain cluster state and topology via a continuous binary \textbf{Gossip protocol}.
+  \item If a client sends a query for slot $S$ to node $A$, and $A$ does not own $S$, node $A$ replies with a redirect: \texttt{-MOVED 3999 10.0.0.2:6379}. The client updates its local slot cache and retries.
+\end{itemize}
+
+\section{Summary \& Key Takeaways}
+\begin{itemize}[leftmargin=18pt]
+  \item Redis achieves extreme throughput via a single-threaded non-blocking multiplexed event loop (\texttt{epoll}) and specialized in-memory C data structures (SDS, Dict, SkipList).
+  \item Memory eviction relies on Approximated LRU/LFU sampling, achieving true LRU accuracy without list pointer overhead.
+  \item Cache-Aside is the standard application pattern: write to DB, then delete the cache entry.
+  \item Cache stampedes, penetration, and avalanches can be defended using early probabilistic refresh (XFetch), Bloom filters, and TTL jitter.
+  \item Redis Sentinel provides automated failover for single-master topologies, while Redis Cluster provides horizontal sharding across 16,384 hash slots via CRC16 and Gossip protocols.
+\end{itemize}
+
+\section{Exercises}
+
+\subsection{Mechanics}
+Given key \texttt{user:orders:8492}:
+\begin{enumerate}[leftmargin=18pt]
+  \item How does Redis Cluster determine which node owns this key?
+  \item If a script executes an atomic transaction updating \texttt{user:orders:8492} and \texttt{user:profile:8492}, why will Redis Cluster reject it with a \texttt{CROSSSLOT} error?
+  \item Rewrite the keys using hash tags to guarantee they land on the same slot.
+\end{enumerate}
+
+\subsection{Debugging}
+An engineer updates user email addresses using the following cache update code:
+\begin{lstlisting}[language=Python]
+def update_user_email(user_id, new_email):
+    db.execute("UPDATE users SET email = %s WHERE id = %s", (new_email, user_id))
+    redis.set(f"user:{user_id}", new_email)
+\end{lstlisting}
+Under high concurrency, users report their emails revert to old values. Identify the race condition and provide the production-grade fix.
+
+\subsection{Architecture}
+Architect a global rate-limiting engine using Redis capable of enforcing a 1,000 requests-per-minute rolling window per API key across 200 frontend servers. Analyze the trade-offs between a sliding window log (using \texttt{ZSET}) and a token bucket algorithm implemented in Lua.
+
+\section{Detailed Solutions}
+
+\subsection{Solution to Mechanics Exercise}
+\begin{enumerate}[leftmargin=18pt]
+  \item Redis Cluster computes $\text{CRC16}(\texttt{"user:orders:8492"}) \pmod{16384}$. The resulting integer (between 0 and 16,383) maps to the specific cluster master holding that slot range.
+  \item In Redis Cluster, multi-key commands and Lua transactions can only execute if all keys map to the exact same hash slot. Because \texttt{"user:orders:8492"} and \texttt{"user:profile:8492"} produce different CRC16 checksums, they map to different hash slots (and likely different physical servers), triggering a \texttt{CROSSSLOT Keys in request don't hash to the same slot} error.
+  \item Use hash tags to force Redis to hash only the tenant/user identifier:
+  \begin{itemize}[leftmargin=12pt]
+    \item \texttt{\{user:8492\}:orders}
+    \item \texttt{\{user:8492\}:profile}
+  \end{itemize}
+  Both keys hash strictly on \texttt{"user:8492"}, ensuring they land on the identical hash slot.
+\end{enumerate}
+
+\subsection{Solution to Debugging Exercise}
+\textbf{The Race Condition:}
+When two concurrent updates (Write A and Write B) or a concurrent Read and Write interleave:
+\begin{enumerate}[leftmargin=18pt]
+  \item Thread 1 updates DB with Email 1.
+  \item Thread 2 updates DB with Email 2.
+  \item Thread 2 executes \texttt{redis.set()} and writes Email 2 to cache.
+  \item Thread 1 experiences a slow network context switch, finally executes its delayed \texttt{redis.set()}, and overwrites the cache with stale Email 1!
+\end{enumerate}
+\textbf{The Fix (Delete Cache on Write):}
+Never \texttt{SET} cache directly on update; always \textbf{delete} the cache key after writing to the database:
+\begin{lstlisting}[language=Python]
+def update_user_email(user_id, new_email):
+    db.execute("UPDATE users SET email = %s WHERE id = %s", (new_email, user_id))
+    redis.delete(f"user:{user_id}")
+\end{lstlisting}
+The next read will suffer a clean cache miss and read the latest committed state from PostgreSQL.
+
+\subsection{Solution to Architecture Exercise}
+\textbf{Token Bucket via Lua Script:}
+While a sliding window log in \texttt{ZSET} stores every request timestamp and prunes with \texttt{ZREMRANGEBYSCORE}, it consumes excessive memory ($O(N)$ elements per user).
+A Token Bucket in Lua consumes $O(1)$ memory, updating only two hash fields: \texttt{tokens} and \texttt{last\_updated}.
+
+\begin{lstlisting}[language=Python]
+LUA_RATE_LIMITER = """
+local key = KEYS[1]
+local capacity = tonumber(ARGV[1])
+local refill_rate = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+local requested = tonumber(ARGV[4])
+
+local data = redis.call('HMGET', key, 'tokens', 'last_updated')
+local tokens = tonumber(data[1])
+local last_updated = tonumber(data[2])
+
+if not tokens then
+    tokens = capacity
+    last_updated = now
+else
+    local delta = math.max(0, now - last_updated)
+    tokens = math.min(capacity, tokens + delta * refill_rate)
+end
+
+if tokens >= requested then
+    tokens = tokens - requested
+    redis.call('HMSET', key, 'tokens', tokens, 'last_updated', now)
+    redis.call('EXPIRE', key, math.ceil(capacity / refill_rate))
+    return 1 -- Allowed
+else
+    return 0 -- Rejected
+end
+"""
+\end{lstlisting}
+Executing this script inside Redis guarantees atomic execution without client-side race conditions.
+
+\section{Further Reading \& Citations}
+\begin{itemize}[leftmargin=18pt]
+  \item Sanfilippo, S. (2020). \emph{Redis Documentation and Source Code}. Available at \url{https://redis.io}.
+  \item Vattani, A., Chierichetti, F., \& Lowenstein, K. (2015). \emph{Optimal probabilistic cache stampede prevention}. Proceedings of the VLDB Endowment, 8(8), 886--897.
+  \item Pugh, W. (1990). \emph{Skip lists: a probabilistic alternative to balanced trees}. Communications of the ACM, 33(6), 668--676.
+\end{itemize}

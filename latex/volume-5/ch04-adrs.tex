@@ -1,0 +1,272 @@
+\chapter{Architecture Decision Records}
+\label{ch:adrs}
+
+\begin{chaptergoalsbox}
+\textbf{What You Will Learn:}
+\begin{itemize}[leftmargin=12pt]
+  \item Understand the phenomenon of architectural erosion and overcome the organizational ``forgetting curve'' using Architecture Decision Records (ADRs).
+  \item Master the canonical Michael Nygard ADR format and the Markdown Architectural Decision Record (MADR) standard.
+  \item Structure ADR sections with precision: establishing deep technical Context, formulating the Decision, and enumerating all Consequences (positive, negative, and neutral).
+  \item Manage the complete ADR lifecycle across version control: \textit{Proposed, Accepted, Rejected, Superseded, Deprecated}, with bi-directional superseding links.
+  \item Integrate ADR governance into the automated pull request workflow using tools like \texttt{adr-tools}, Log4brains, and architectural fitness functions.
+\end{itemize}
+
+\textbf{What You Should Already Understand:}
+\begin{itemize}[leftmargin=12pt]
+  \item Git-based version control workflows (branches, commits, pull requests, code reviews).
+  \item Fundamental architectural trade-offs: consistency vs availability, synchronous vs asynchronous communication, monoliths vs microservices.
+  \item Reading and evaluating Technical Design Documents (TDDs) and RFCs.
+\end{itemize}
+
+\textbf{Why This Topic Exists:}
+In software engineering, why a decision was made is often far more important than how it was implemented. When teams turn over and institutional memory fades, engineers face code they do not understand and either blindly follow outdated patterns or impulsively replace stable systems. ADRs capture the point-in-time context, forces, and trade-offs of significant decisions, preserving architectural intent directly alongside the codebase.
+
+\textbf{Motivating Practical Problem:}
+A newly hired senior staff engineer at an enterprise logistics firm observes that all microservices publish tracking updates using Apache Kafka, but batch delivery confirmations use RabbitMQ. Dismissing this as ``pointless operational fragmentation,'' the engineer spends three sprints migrating tracking updates to RabbitMQ. The first Black Friday under the new system triggers message queue memory exhaustion and total system stall. The engineer was unaware that three years prior, RabbitMQ had collapsed under 250,000 continuous append-only tracking events/sec—a constraint documented nowhere in the wiki.
+\end{chaptergoalsbox}
+
+\section{Architectural Erosion and the Forgetting Problem}
+
+Every software codebase is subject to entropy. As systems evolve, the delta between the original architectural vision and the actual implementation widens—a phenomenon known as \textbf{architectural erosion}.
+
+When engineers leave an organization, the rationale behind critical decisions evaporates. A newcomer encountering a peculiar design pattern (such as dual-writing to two databases or avoiding an ORM) faces the classic dilemma of **Chesterton's Fence**:
+\begin{quote}
+\textit{``Do not remove a fence until you know why it was put up in the first place.''}
+\end{quote}
+
+Without written records, engineers either:
+\begin{enumerate}[leftmargin=18pt]
+  \item \textbf{Tear down the fence blindly}: Refactoring code to follow modern trends, inadvertently re-introducing the exact race conditions, latency spikes, or memory leaks that prompted the original design.
+  \item \textbf{Treat the fence as sacred dogma}: Preserving obsolete workarounds long after the original constraints (e.g., legacy database limitations or network bottlenecks) have ceased to exist.
+\end{enumerate}
+
+To solve this, software architect Michael Nygard proposed capturing decisions in lightweight, version-controlled text documents called **Architecture Decision Records (ADRs)**.
+
+\begin{intuitionbox}[Case Law and Judicial Precedents]
+In common-law legal systems, judges write detailed legal opinions explaining their rulings. They document the facts of the case, the statutes examined, competing legal arguments, and the final rationale. Future judges refer to these written precedents to understand the law's intent. ADRs are the judicial opinions of software architecture. They form the living legal code of your software repository.
+\end{intuitionbox}
+
+\section{The Michael Nygard ADR Format}
+
+Michael Nygard formulated a remarkably compact, high-impact structure for ADRs. Each record is a short Markdown file (typically 1--2 pages) focusing on a single architectural decision.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lp{10.5cm}}
+\toprule
+\textbf{Section} & \textbf{Mandatory Semantic Content} \\
+\midrule
+\textbf{Title} & Monotonically increasing number + short active title (e.g., \texttt{0004-use-postgresql-for-ledger.md}). \\
+\textbf{Status} & Exactly one lifecycle state: \textit{Proposed, Accepted, Rejected, Superseded, Deprecated}. \\
+\textbf{Context} & The technological, business, and political forces that compel the decision. Neutral statement of facts. \\
+\textbf{Decision} & An affirmative, active-voice statement of what we are doing and how (e.g., ``We will use...''). \\
+\textbf{Consequences} & The inevitable trade-offs: what becomes easier, what becomes harder, and what operational risks are accepted. \\
+\bottomrule
+\end{tabular}
+\caption{The Canonical Michael Nygard ADR Structure}
+\label{tab:nygard-adr}
+\end{table}
+
+\begin{underthehoodbox}[Git Blame vs ADR Lookup]
+Engineers often argue: \textit{``Can't we just look at the Git commit message?''} In reality, Git commit messages describe the \textbf{diff} of a specific pull request (e.g., ``Implement Kafka producer connection pool''). They almost never explain the high-level macro trade-offs (e.g., why Kafka was chosen over RabbitMQ or AWS SQS, or what regulatory data-retention laws forced that choice). ADRs provide the macroeconomic view; Git commits provide the microeconomic execution.
+\end{underthehoodbox}
+
+\section{Production ADR Walkthrough: Event Sourcing Broker}
+
+The following is an authentic, production-grade ADR demonstrating proper tone, technical depth, and rigorous consequence analysis:
+
+\begin{lstlisting}[language=bash, caption={Production ADR 0007: Adopting Apache Kafka for Financial Ledger Events}]
+# 0007. Adopting Apache Kafka for Financial Ledger Event Sourcing
+
+* Status: Accepted
+* Deciders: Platform Architecture Guild, Billing Team Leads, SRE Lead
+* Date: 2026-03-15
+
+## Context and Problem Statement
+
+Our primary transaction processing engine currently uses PostgreSQL transactional outbox tables to publish financial mutation events. At our current scale (8,500 financial transactions/sec at peak), database write IOPS have reached 82% of provisioned capacity on our AWS Aurora r6g.16xlarge cluster. 
+
+Downstream microservices (Fraud Detection, Merchant Reporting, Invoicing, and Partner Webhooks) require real-time access to transaction event streams with sub-second latency. Each downstream consumer currently queries the relational database directly, exacerbating read replica lag (often exceeding 45 seconds during market open).
+
+We need an event streaming backbone capable of sustaining 50,000 events/second with immutable append-only persistence, strict per-account partition ordering, and independent consumer replay capability for historical audit compliance.
+
+## Decision Drivers
+
+* High-throughput, low-latency write ingestion (>50,000 events/sec, p99 < 15ms).
+* Strict total ordering per `account_id` partition.
+* Long-term replayability (re-running events from 90 days ago to rebuild read models).
+* Multi-region active-passive replication for SOC2 disaster recovery.
+
+## Considered Options
+
+* Option 1: Apache Kafka (Managed AWS MSK with KRaft)
+* Option 2: RabbitMQ (Cluster with Quorum Queues)
+* Option 3: AWS Kinesis Data Streams
+
+## Decision Outcome
+
+Chosen Option: **Option 1: Apache Kafka (AWS MSK)**.
+
+Kafka's distributed commit log architecture natively supports partitioned ordering by hash keys (`account_id`), enabling multiple consumer groups to read at independent offsets without incurring database read load or degrading broker performance.
+
+### Positive Consequences
+
+* **Throughput Headroom**: Kafka easily scales to 100k+ writes/sec via horizontal broker and partition scaling.
+* **Audit Replay**: Consumers can reset their offsets to arbitrary timestamps to recover from consumer logic bugs or recalculate ledger balances.
+* **Database Offload**: Decouples all analytical and reporting read queries from our transactional PostgreSQL Aurora primary.
+
+### Negative Consequences
+
+* **Operational Overhead**: Managing Kafka partition sizing, consumer rebalances, and MSK cluster patching requires dedicated SRE training and custom Terraform modules.
+* **Client Complexity**: Application teams must implement consumer group offset commit strategies and handle Poison-Pill message routing via custom Dead-Letter Topics (DLT).
+* **Cost**: Minimum monthly AWS MSK footprint ($1,450/month across 3 AZs) exceeds current PostgreSQL outbox polling cost ($320/month).
+\end{lstlisting}
+
+\begin{commonmistakebox}[Hiding Negative Consequences]
+An ADR that lists only positive consequences is marketing propaganda, not engineering analysis. Every architectural choice is a trade-off. Choosing microservices introduces distributed tracing overhead and network latency; choosing a NoSQL database sacrifices ACID cross-entity transactions; choosing Rust increases developer compile-time latency. If an ADR fails to document negative consequences, future engineers will feel betrayed when those exact operational costs manifest in production.
+\end{commonmistakebox}
+
+\section{The ADR Lifecycle and Governance}
+
+An ADR is not a static monolith; it transitions through explicit lifecycle states over time:
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1.5cm and 2.0cm,
+  state/.style={rectangle, draw=headingblue, fill=headingblue!10, rounded corners=3pt, minimum width=2.4cm, minimum height=0.9cm, font=\sffamily\small\bfseries, align=center},
+  arrow/.style={-{Stealth[scale=1.0]}, thick, color=textdark}
+]
+
+\node[state] (prop) {Proposed};
+\node[state, right=2.0cm of prop] (acc) {Accepted};
+\node[state, below=1.2cm of prop] (rej) {Rejected};
+\node[state, right=2.0cm of acc] (sup) {Superseded};
+\node[state, below=1.2cm of acc] (dep) {Deprecated};
+
+\draw[arrow] (prop) -- node[above, font=\tiny\sffamily]{PR Approved} (acc);
+\draw[arrow] (prop) -- node[left, font=\tiny\sffamily]{PR Closed/Vetoed} (rej);
+\draw[arrow] (acc) -- node[above, font=\tiny\sffamily]{New Decision Made} (sup);
+\draw[arrow] (acc) -- node[left, font=\tiny\sffamily]{Feature Retired} (dep);
+
+\end{tikzpicture}
+\caption{The State Machine of Architecture Decision Records}
+\label{fig:adr-lifecycle}
+\end{figure}
+
+\subsection{The Superseded Discipline}
+
+When a past architectural decision is replaced, **never overwrite or edit the original ADR text**. The original ADR is an immutable historical record of what was decided at that point in time under those specific constraints.
+
+Instead:
+\begin{enumerate}[leftmargin=18pt]
+  \item Author a new ADR (e.g., \texttt{0024-replace-kafka-with-redpanda.md}) with status \textbf{Accepted}.
+  \item Inside the new ADR, add: \texttt{Supersedes: [0007-adopting-apache-kafka.md]}.
+  \item In a single pull request, update the header of ADR 0007 from \textbf{Accepted} to \textbf{Superseded by [0024-replace-kafka-with-redpanda.md]}.
+\end{enumerate}
+
+This forms an unbroken, navigable bidirectional graph of architectural evolution throughout the repository's history.
+
+\begin{productionwarningbox}[Zombie ADRs Diverged from Code]
+A ``Zombie ADR'' is an ADR marked \textit{Accepted} whose architectural guidance is violated by the actual codebase. This occurs when teams bypass the ADR process to deploy hotfixes or stealth refactorings. To prevent zombie ADRs, organizations implement **Architectural Fitness Functions** (using ArchUnit, Semgrep, or custom AST linters) in their CI pipeline. If an ADR mandates that domain services must not import HTTP controllers, an automated test asserts this rule on every PR commit.
+\end{productionwarningbox}
+
+\begin{realworldbox}[Managing 350+ ADRs at a Global Clearinghouse]
+A multinational financial clearinghouse processing \$2 trillion in annual settlements maintains over 350 ADRs in their monorepo. Because the organization is subject to rigorous regulatory audits (SEC, FINRA, Basel III), bank examiners regularly demand proof of why specific cryptographic algorithms, key rotation intervals, and database partition keys were chosen. The engineering team simply hands over their \texttt{/docs/decisions} directory. The ADRs serve as indisputable, timestamped compliance evidence of architectural due diligence.
+\end{realworldbox}
+
+\begin{tryityourselfbox}[Exercise: Author an ADR for GraphQL vs REST]
+Assume your mobile engineering team wants to replace 35 disparate REST endpoints with a unified GraphQL API Gateway (Apollo Server). 
+\begin{enumerate}
+  \item Write an ADR following the Nygard format.
+  \item Formulate the Context: over-fetching of data on cellular networks, high battery drain, slow mobile rendering.
+  \item Articulate the Decision.
+  \item Explicitly detail at least two positive consequences and at least two negative consequences (e.g., complexity of HTTP caching at the edge, potential for runaway nested queries).
+\end{enumerate}
+\end{tryityourselfbox}
+
+\section{Summary \& Key Takeaways}
+
+\begin{itemize}[leftmargin=18pt]
+  \item \textbf{Context Preservation}: ADRs record the \textit{why} behind architectural choices, eliminating Chesterton's Fence dilemmas when engineering teams rotate.
+  \item \textbf{Nygard Format}: Keep records concise and standardized: Title, Status, Context, Decision, and Consequences.
+  \item \textbf{Radical Honesty}: An authentic ADR always documents negative consequences, operational risks, and complexity increases alongside benefits.
+  \item \textbf{Immutability \& Superseding}: Never rewrite past ADRs; mark them \textit{Superseded} and link forward to the new decision.
+  \item \textbf{Continuous Governance}: Store ADRs in the same Git repo as the code (\texttt{docs/decisions}), review them via PRs, and enforce them via architectural fitness tests in CI.
+\end{itemize}
+
+\section{Exercises}
+
+\subsection*{Mechanics}
+\begin{enumerate}[leftmargin=18pt]
+  \item What are the five valid lifecycle states of an ADR? Under what exact circumstance does an ADR transition from \textit{Accepted} to \textit{Superseded}?
+  \item Why must ADRs be co-located inside the application's source code Git repository rather than maintained in a separate corporate intranet or Confluence space?
+\end{enumerate}
+
+\subsection*{Debugging}
+\begin{enumerate}[leftmargin=18pt]
+  \item Review the following ADR draft: \textit{``Decision: We will migrate our entire backend from Ruby on Rails to Rust because Rust is faster and more modern. Consequences: Our backend will be 100\% bug-free and have zero latency.''} Identify three critical errors in this ADR.
+\end{enumerate}
+
+\subsection*{Architecture Design}
+\begin{enumerate}[leftmargin=18pt]
+  \item Author a complete, publication-grade ADR (including Title, Status, Date, Deciders, Context, Decision Drivers, Decision Outcome, and Positive/Negative Consequences) for choosing between **PostgreSQL Row-Level Security (RLS)** versus **Application-Layer Tenant Scoping** for a multi-tenant B2B SaaS application.
+\end{enumerate}
+
+\section{Detailed Solutions}
+
+\subsection*{Mechanics Solution}
+\begin{enumerate}[leftmargin=18pt]
+  \item The five states are: \textbf{Proposed}, \textbf{Accepted}, \textbf{Rejected}, \textbf{Superseded}, and \textbf{Deprecated}. 
+  An ADR transitions from \textit{Accepted} to \textit{Superseded} when a new architectural decision replaces or invalidates the earlier decision. A new ADR must be drafted and accepted, and both records must be cross-linked.
+  
+  \item Co-locating ADRs in Git provides four essential advantages:
+  \begin{enumerate}
+    \item \textbf{Version Parity}: When checking out a Git branch from 18 months ago, the ADRs match the architecture of that specific commit.
+    \item \textbf{Peer Review Workflow}: ADRs undergo the identical code review, pull request, and approval gates as production source code.
+    \item \textbf{Developer Proximity}: Engineers search the codebase locally using IDE tools (\texttt{git grep}); they rarely browse external wikis while actively coding.
+    \item \textbf{Resilience to Link Rot}: Corporate wikis frequently migrate, suffer permission fragmentation, or are decommissioned, losing years of architectural history.
+  \end{enumerate}
+\end{enumerate}
+
+\subsection*{Debugging Solution}
+\begin{enumerate}[leftmargin=18pt]
+  \item Critical errors in the draft:
+  \begin{enumerate}
+    \item \textbf{No Quantitative Context}: Fails to cite measurable performance bottlenecks, CPU utilization, or memory bounds forcing the rewrite.
+    \item \textbf{Emotional Bias (Hype-Driven)}: Cites ``Rust is more modern'' rather than technical necessity.
+    \item \textbf{Absurd/Dishonest Consequences}: Claiming a system will be ``100\% bug-free'' and have ``zero latency'' violates computer science realities. It completely ignores devastating negative consequences: massive productivity drop during language ramp-up, longer compile times, scarcity of Rust engineers, and rewriting thousands of lines of battle-tested domain logic.
+  \end{enumerate}
+\end{enumerate}
+
+\subsection*{Architecture Design Solution}
+\begin{lstlisting}[language=bash, caption={Complete Architectural Decision Record for Multi-Tenant Isolation}]
+# 0012. Adopting PostgreSQL Row-Level Security (RLS) for Multi-Tenant Isolation
+
+* Status: Accepted
+* Date: 2026-04-02
+* Deciders: Security Guild, Database Architect, Core API Team
+
+## Context and Problem Statement
+Our B2B SaaS platform shares a single multi-tenant PostgreSQL database across 1,200 enterprise customers. Currently, multi-tenant isolation relies exclusively on developers manually remembering to append `WHERE tenant_id = ?` to every SQL query and ORM invocation. During a recent penetration test, a missing tenant check on the `/api/v1/invoices/export` endpoint allowed an authenticated user to view another tenant's billing records (IDOR vulnerability).
+
+## Decision Outcome
+Chosen Option: **PostgreSQL Row-Level Security (RLS)**.
+We will enforce data isolation at the database layer using Postgres RLS policies bound to application session variables (`SET LOCAL app.current_tenant_id = ?`).
+
+### Positive Consequences
+* **Defense in Depth**: Even if application code contains a SQL injection or missing `tenant_id` filter, the database engine physically rejects queries spanning across unauthorized tenant rows.
+* **Centralized Auditability**: Security and compliance teams audit one SQL policy definition rather than inspecting 400+ application endpoints.
+
+### Negative Consequences
+* **Performance Overhead**: RLS forces the PostgreSQL query planner to inject filter expressions into every table scan, introducing a 3% to 7% latency overhead on complex multi-join queries.
+* **Connection Pooling Complexity**: With tools like PgBouncer in transaction-pooling mode, connection state must be explicitly cleared using `DISCARD ALL` or scoped strictly via `SET LOCAL` within an explicit `BEGIN...COMMIT` block to prevent tenant cross-contamination across pooled connections.
+\end{lstlisting}
+
+\section{Further Reading \& Citations}
+\begin{itemize}[leftmargin=18pt]
+  \item Nygard, M. (2011). \textit{Documenting Architecture Decisions}. Cognitect Blog.
+  \item Kopp, O., et al. (2018). Markdown Architectural Decision Records (MADR). \url{https://adr.github.io/madr/}.
+  \item Ford, N., Parsons, R., \& Kua, P. (2017). \textit{Building Evolutionary Architectures: Support Constant Change}. O'Reilly Media. (Chapter 6: Architectural Fitness Functions).
+  \item ThoughtWorks. (2020). \textit{Technology Radar: Lightweight Architecture Decision Records}.
+\end{itemize}
