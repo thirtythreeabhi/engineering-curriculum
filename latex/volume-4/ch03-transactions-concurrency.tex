@@ -368,7 +368,7 @@ To prevent cycles without building a global graph, each transaction gets a uniqu
 \end{itemize}
 In both protocols, every allowed wait edge goes strictly in one direction of age (older $\to$ younger in Wait-Die; younger $\to$ older in Wound-Wait), making cycles mathematically impossible. Because retried transactions keep their original timestamp, nobody starves, and \textbf{Wound-Wait} triggers far fewer wasted aborts.
 
-\begin{tryityourselfbox}[Trace 2PC Failure & Deadlock Prevention]
+\begin{tryityourselfbox}[Trace 2PC Failure \& Deadlock Prevention]
 \begin{enumerate}[leftmargin=18pt]
   \item Using \texttt{Participant2PC} above, trace what happens if \texttt{on\_receive\_prepare("tx\_202", "alice", -50)} runs while \texttt{"tx\_101"} is still in \texttt{PREPARED} holding the lock on \texttt{"alice"}.
   \item Three transactions have timestamps $TS(T_A)=5$, $TS(T_B)=12$, $TS(T_C)=19$. Under \textbf{Wound-Wait}, $T_B$ holds Row~X and $T_C$ holds Row~Y. What happens if $T_A$ requests Row~Y, and then $T_C$ (after restarting) requests Row~X?
@@ -395,7 +395,7 @@ An application using JTA/XA over two PostgreSQL databases suffers 200 blocked HT
 \subsection*{Exercise~\thechapter.3 (Architecture): Raft-Backed 2PC in Distributed SQL}
 Explain how CockroachDB achieves non-blocking distributed ACID transactions across Raft ranges using a \textbf{Transaction Record}, \textbf{Write Intents}, and \textbf{Wound-Wait} without a separate single-point 2PC coordinator.
 
-\subsection*{Exercise~\thechapter.4 (Try-It-Yourself Lab): Lock Contention & Wound-Wait Trace}
+\subsection*{Exercise~\thechapter.4 (Try-It-Yourself Lab): Lock Contention \& Wound-Wait Trace}
 Solve both parts of the \emph{Try It Yourself} box.
 
 \section{Detailed Solutions}

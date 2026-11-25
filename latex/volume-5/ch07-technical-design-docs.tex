@@ -60,7 +60,7 @@ Calculating sustained write IOPS in Section~10 of a TDD prevents last-minute sto
 
 \section{End-to-End Mini-TDD Walkthrough: \texttt{checkout-ledger-v2}}
 
-Rather than reading disconnected fragments, let us walk through **one unified mini-TDD** for replacing a legacy synchronous billing database with an **Idempotent Multi-Currency Checkout & Ledger Service (\texttt{checkout-ledger-v2})**, connecting Chapters~1 through~6 end-to-end.
+Rather than reading disconnected fragments, let us walk through **one unified mini-TDD** for replacing a legacy synchronous billing database with an **Idempotent Multi-Currency Checkout \& Ledger Service (\texttt{checkout-ledger-v2})**, connecting Chapters~1 through~6 end-to-end.
 
 \subsection{Goals, Non-Goals, and Capacity Math (Ch~\ref{chap:requirements})}
 
@@ -82,9 +82,9 @@ Non-Goals:
 
 \begin{itemize}[leftmargin=18pt]
   \item \textbf{C4 Scope (Ch~\ref{chap:c4})}: \texttt{API Gateway [Envoy]} routes \texttt{Charge} RPCs to \texttt{checkout-ledger-v2 [Go]}, which writes atomically to \texttt{Ledger DB [PostgreSQL 16 on io2]} and a transactional outbox table, publishing \texttt{PaymentCaptured} events to \texttt{Kafka}.
-  \item \textbf{Sequence & Concurrency (Ch~\ref{chap:uml})}: Requests enforce \texttt{grpc-timeout: 100ms} deadlines and execute \texttt{INSERT ... ON CONFLICT (idempotency\_key) DO NOTHING} inside the same ACID transaction as the balance update, eliminating TOCTOU double-spends.
+  \item \textbf{Sequence \& Concurrency (Ch~\ref{chap:uml})}: Requests enforce \texttt{grpc-timeout: 100ms} deadlines and execute \texttt{INSERT ... ON CONFLICT (idempotency\_key) DO NOTHING} inside the same ACID transaction as the balance update, eliminating TOCTOU double-spends.
   \item \textbf{Threat Model (Ch~\ref{chap:threat-modeling})}: Internal hops between \texttt{API Gateway} and \texttt{checkout-ledger-v2} cross into the Secure Ledger Enclave over **mTLS**; card tokens are never logged.
-  \item \textbf{SLO & ADRs (Ch~\ref{chap:slos}--\ref{chap:adrs})}: Protected by $14.4\times$ (\texttt{1h}/\texttt{5m}) burn-rate alerts; linked to \texttt{ADR-0014} documenting why virtual-bucket sharding on PostgreSQL beat DynamoDB for ACID double-entry invariants.
+  \item \textbf{SLO \& ADRs (Ch~\ref{chap:slos}--\ref{chap:adrs})}: Protected by $14.4\times$ (\texttt{1h}/\texttt{5m}) burn-rate alerts; linked to \texttt{ADR-0014} documenting why virtual-bucket sharding on PostgreSQL beat DynamoDB for ACID double-entry invariants.
 \end{itemize}
 
 Listing~\ref{lst:v5-ch07-protobuf} gives the formal machine-readable contract for Section~6 of the mini-TDD.
@@ -209,7 +209,7 @@ Writing a TDD after 85\% of the code is already merged turns design review into 
 
 \begin{realworldbox}[Diagnostic Walkthrough: Sharding a Billing Ledger Without Dropping a Cent]
 \textbf{Symptoms:} At hundreds of millions of daily transactions, Stripe's primary billing database hit severe row-lock wait spikes (\texttt{LWLock: buffer\_content} and \texttt{LockManager} stalls in PostgreSQL metrics) during hourly invoice batch runs.\\
-\textbf{Design & Verification:} Engineers authored an RFC evaluating range sharding, consistent hashing on \texttt{merchant\_id}, and **virtual buckets** (1,024 logical buckets mapped to 32 physical clusters). During Phase~2 (Dark Read Verification), the shadow comparator logged subtle 1-cent mismatch alerts: \texttt{diff\_cents=1 invoice=in\_8821 reason=rounding\_order}. Catching that edge case in shadow traffic let the team align rounding order before moving a single live merchant across shards.
+\textbf{Design \& Verification:} Engineers authored an RFC evaluating range sharding, consistent hashing on \texttt{merchant\_id}, and **virtual buckets** (1,024 logical buckets mapped to 32 physical clusters). During Phase~2 (Dark Read Verification), the shadow comparator logged subtle 1-cent mismatch alerts: \texttt{diff\_cents=1 invoice=in\_8821 reason=rounding\_order}. Catching that edge case in shadow traffic let the team align rounding order before moving a single live merchant across shards.
 \end{realworldbox}
 
 \begin{tryityourselfbox}[Draft Goals and Non-Goals for a Media Processing Service]
@@ -264,7 +264,7 @@ Non-Goals:
 3. Client-side cropping UI widgets or AI background-removal filters.
 \end{lstlisting}
 
-\subsection*{Mechanics, Debugging & Architecture Solutions}
+\subsection*{Mechanics, Debugging \& Architecture Solutions}
 \begin{enumerate}[label=\textbf{Solution~\thechapter.\arabic*}, leftmargin=*]
   \item The 10 sections are Metadata, Executive Summary, Context \& Motivation, Goals \& Non-Goals, Proposed Architecture, Detailed Design, Alternatives Considered, Security \& Privacy, Migration \& Rollout, and Operational Readiness. Documenting 2--3 rejected alternatives proves the author evaluated concrete trade-offs (cost, latency, operational complexity) rather than rationalizing a favorite tool.
   \item Two hazards: (1) Older app pods still running mid-rollout will fail with \texttt{UndefinedColumn} SQL errors; (2) \texttt{ALTER TABLE} requests an \texttt{ACCESS EXCLUSIVE} lock that blocks behind any long-running query and forces all incoming \texttt{SELECT}/\texttt{INSERT} requests to pile up behind it, exhausting connection pools. Use Expand and Contract with \texttt{lock\_timeout}.

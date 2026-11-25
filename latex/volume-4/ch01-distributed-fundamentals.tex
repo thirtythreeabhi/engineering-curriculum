@@ -479,7 +479,7 @@ During a hypervisor NTP step-adjustment, two debits of \$5,000 occur. The databa
 \subsection*{Exercise~\thechapter.3 (Architecture): Thread-Safe Snowflake ID Generator}
 Design a distributed sequence ID generator capable of generating 100,000 globally unique, time-ordered 64-bit integers per second across 1,024 independent worker nodes without inter-node coordination during ID generation. Address thread safety and clock backward skew explicitly, and trace two consecutive calls.
 
-\subsection*{Exercise~\thechapter.4 (Try-It-Yourself Lab): NTP Error & Vector Conflict Verification}
+\subsection*{Exercise~\thechapter.4 (Try-It-Yourself Lab): NTP Error \& Vector Conflict Verification}
 Verify both parts of the \emph{Try It Yourself} prompt mathematically and in Python.
 
 \section{Detailed Solutions}
@@ -575,7 +575,7 @@ class SnowflakeGenerator:
   \item Tracing \texttt{VectorClock}: \texttt{c1} increments twice to \texttt{\{"A": 2\}}. \texttt{c2.update(\{"A": 2\})} produces \texttt{\{"B": 1, "A": 2\}}. Then \texttt{c1.increment()} yields \texttt{\{"A": 3\}} and \texttt{c2.increment()} yields \texttt{\{"A": 2, "B": 2\}}. Comparing them sees \texttt{A: 3 > 2} and \texttt{B: 0 < 2}, returning \texttt{"CONCURRENT"}.
 \end{enumerate}
 
-\begin{labbridgebox}[Vector Clocks & Outbox Foundations]
+\begin{labbridgebox}[Vector Clocks \& Outbox Foundations]
 Run the standalone causality lab in \texttt{exercises/volume4/ex01\_vector\_clocks.py} to test \texttt{VectorClock.tick()}, \texttt{send\_event()}, \texttt{receive\_event()}, and \texttt{compare()} directly. When you finish Chapter~8, apply event-ordering concepts in \texttt{projects/p11-event-driven-microservices}.
 \end{labbridgebox}
 

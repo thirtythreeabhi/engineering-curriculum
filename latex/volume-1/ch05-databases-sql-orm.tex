@@ -13,19 +13,19 @@ Imagine a hospital scheduling table with two rows:
 \end{tabular}
 \end{center}
 
-Hospital policy says at least one doctor must stay on call at all times. Both Alice and Bob try to go off-duty at the exact same millisecond: each browser runs 	exttt{SELECT count(*) FROM doctors WHERE on\_call = true;}, sees 	exttt{2}, decides ``it is safe for me to step off'', and runs 	exttt{UPDATE doctors SET on\_call = false WHERE doctor\_id = ...;}. When both queries commit, \textbf{zero doctors are on call}---even though neither transaction saw uncommitted data and both queries looked completely valid!
+Hospital policy says at least one doctor must stay on call at all times. Both Alice and Bob try to go off-duty at the exact same millisecond: each browser runs \texttt{SELECT count(*) FROM doctors WHERE on\_call = true;}, sees \texttt{2}, decides ``it is safe for me to step off'', and runs \texttt{UPDATE doctors SET on\_call = false WHERE doctor\_id = ...;}. When both queries commit, \textbf{zero doctors are on call}---even though neither transaction saw uncommitted data and both queries looked completely valid!
 
 To understand why concurrency bugs like that happen---and how databases keep data consistent without grinding to a halt---we work from the logical table level down into PostgreSQL's B-Trees, 8\,KB heap pages, Write-Ahead Log, and ORM boundaries.
 
 % ==========================================
 \section{ACID, Concurrency Anomalies, and Isolation Levels}
 
-A database \textbf{transaction} groups SQL statements into one logical unit governed by 	extbf{ACID}:
+A database \textbf{transaction} groups SQL statements into one logical unit governed by \textbf{ACID}:
 \begin{itemize}[leftmargin=15pt]
-  \item \textbf{Atomicity:} Either every write in the transaction succeeds (	exttt{COMMIT}), or every write is undone (	exttt{ROLLBACK}).
-  \item \textbf{Consistency:} Constraints (	exttt{CHECK}, foreign keys, unique indexes) hold before and after every transaction.
+  \item \textbf{Atomicity:} Either every write in the transaction succeeds (\texttt{COMMIT}), or every write is undone (\texttt{ROLLBACK}).
+  \item \textbf{Consistency:} Constraints (\texttt{CHECK}, foreign keys, unique indexes) hold before and after every transaction.
   \item \textbf{Isolation:} Concurrent transactions do not corrupt each other's view of data.
-  \item \textbf{Durability:} Once 	exttt{COMMIT} returns success, the change survives a power failure.
+  \item \textbf{Durability:} Once \texttt{COMMIT} returns success, the change survives a power failure.
 \end{itemize}
 
 \subsection{Four Concurrency Anomalies Defined by Timelines}
@@ -33,10 +33,10 @@ A database \textbf{transaction} groups SQL statements into one logical unit gove
 Stronger isolation prevents more anomalies at higher coordination cost. Let's define all four anomalies with concrete two-transaction ($T_1, T_2$) interleavings:
 
 \begin{enumerate}[leftmargin=15pt]
-  \item \textbf{Dirty Read:} $T_1$ writes 	exttt{balance = 500} (uncommitted) $\rightarrow$ $T_2$ reads 	exttt{500} $\rightarrow$ $T_1$ executes 	exttt{ROLLBACK} back to 	exttt{1000}. $T_2$ acted on money that never existed.
-  \item \textbf{Non-Repeatable Read:} $T_1$ reads 	exttt{balance = 1000} $\rightarrow$ $T_2$ updates 	exttt{balance = 500} and 	exttt{COMMIT}s $\rightarrow$ $T_1$ reads the same row again and sees 	exttt{500} inside the same transaction.
-  \item \textbf{Phantom Read:} $T_1$ runs 	exttt{SELECT count(*) FROM orders WHERE status = 'NEW'} (sees 3) $\rightarrow$ $T_2$ 	exttt{INSERT}s a 4th 	exttt{'NEW'} order and 	exttt{COMMIT}s $\rightarrow$ $T_1$ re-runs the range query and sees 4 rows.
-  \item \textbf{Write Skew:} Our hospital on-call bug above! $T_1$ reads Alice + Bob both 	exttt{on\_call=true}, $T_2$ reads Alice + Bob both 	exttt{on\_call=true}; $T_1$ updates row 1 while $T_2$ updates row 2. Because they modify \emph{disjoint rows} based on a shared premise, both commit and break the invariant!
+  \item \textbf{Dirty Read:} $T_1$ writes \texttt{balance = 500} (uncommitted) $\rightarrow$ $T_2$ reads \texttt{500} $\rightarrow$ $T_1$ executes \texttt{ROLLBACK} back to \texttt{1000}. $T_2$ acted on money that never existed.
+  \item \textbf{Non-Repeatable Read:} $T_1$ reads \texttt{balance = 1000} $\rightarrow$ $T_2$ updates \texttt{balance = 500} and \texttt{COMMIT}s $\rightarrow$ $T_1$ reads the same row again and sees \texttt{500} inside the same transaction.
+  \item \textbf{Phantom Read:} $T_1$ runs \texttt{SELECT count(*) FROM orders WHERE status = 'NEW'} (sees 3) $\rightarrow$ $T_2$ \texttt{INSERT}s a 4th \texttt{'NEW'} order and \texttt{COMMIT}s $\rightarrow$ $T_1$ re-runs the range query and sees 4 rows.
+  \item \textbf{Write Skew:} Our hospital on-call bug above! $T_1$ reads Alice + Bob both \texttt{on\_call=true}, $T_2$ reads Alice + Bob both \texttt{on\_call=true}; $T_1$ updates row 1 while $T_2$ updates row 2. Because they modify \emph{disjoint rows} based on a shared premise, both commit and break the invariant!
 \end{enumerate}
 
 \begin{table}[htbp]
@@ -53,12 +53,12 @@ Stronger isolation prevents more anomalies at higher coordination cost. Let's de
 \label{tab:v1-ch05-isolation}
 \end{table}
 
-\subsection{2PL vs.\ MVCC, and 	exttt{SELECT FOR UPDATE SKIP LOCKED}}
+\subsection{2PL vs.\ MVCC, and \texttt{SELECT FOR UPDATE SKIP LOCKED}}
 
 Databases enforce isolation using two contrasting philosophies:
 \begin{itemize}[leftmargin=15pt]
-  \item \textbf{Two-Phase Locking (2PL):} Transactions acquire shared locks to read and exclusive locks to write, holding all locks until 	exttt{COMMIT}/	exttt{ROLLBACK}. Readers block writers and writers block readers---simple to reason about, but slow under read-heavy traffic (studied further in distributed transactions in Volume~IV).
-  \item \textbf{Multi-Version Concurrency Control (MVCC):} Used by PostgreSQL. Instead of overwriting rows in place, an 	exttt{UPDATE} writes a \emph{new version} of the row stamped with transaction IDs, so \textbf{readers never block writers, and writers never block readers} \cite{kleppmann2017designing}.
+  \item \textbf{Two-Phase Locking (2PL):} Transactions acquire shared locks to read and exclusive locks to write, holding all locks until \texttt{COMMIT}/\texttt{ROLLBACK}. Readers block writers and writers block readers---simple to reason about, but slow under read-heavy traffic (studied further in distributed transactions in Volume~IV).
+  \item \textbf{Multi-Version Concurrency Control (MVCC):} Used by PostgreSQL. Instead of overwriting rows in place, an \texttt{UPDATE} writes a \emph{new version} of the row stamped with transaction IDs, so \textbf{readers never block writers, and writers never block readers} \cite{kleppmann2017designing}.
 \end{itemize}
 
 \begin{intuitionbox}[Library Ledger (2PL) vs.\ Timestamped Photocopies (MVCC)]
@@ -67,7 +67,7 @@ Under 2PL, if someone is editing a page in the master ledger, nobody else can ev
 
 When building job queues or flash-sale reservations where workers \emph{must} claim disjoint rows exclusively, explicit row locks combine MVCC speed with safe exclusion:
 
-\begin{lstlisting}[language=SQL,caption={Lock-Contention-Free Queue Worker Pattern with 	exttt{SKIP LOCKED}}]
+\begin{lstlisting}[language=SQL,caption={Lock-Contention-Free Queue Worker Pattern with \texttt{SKIP LOCKED}}]
 BEGIN;
 SELECT id, payload
 FROM job_queue
@@ -80,12 +80,12 @@ UPDATE job_queue SET status = 'IN_PROGRESS' WHERE id = :claimed_id;
 COMMIT;
 \end{lstlisting}
 
-\textbf{Concrete 2-worker trace:} Suppose rows 101 and 102 are 	exttt{'PENDING'}. Worker 1 runs the 	exttt{SELECT ... FOR UPDATE SKIP LOCKED}, locks row 101, and starts processing. Milliseconds later Worker 2 runs the same query: instead of blocking behind Worker 1's lock on row 101 (as plain 	exttt{FOR UPDATE} would), 	exttt{SKIP LOCKED} skips row 101 immediately, locks row 102, and returns it to Worker 2 with zero lock waiting!
+\textbf{Concrete 2-worker trace:} Suppose rows 101 and 102 are \texttt{'PENDING'}. Worker 1 runs the \texttt{SELECT ... FOR UPDATE SKIP LOCKED}, locks row 101, and starts processing. Milliseconds later Worker 2 runs the same query: instead of blocking behind Worker 1's lock on row 101 (as plain \texttt{FOR UPDATE} would), \texttt{SKIP LOCKED} skips row 101 immediately, locks row 102, and returns it to Worker 2 with zero lock waiting!
 
 % ==========================================
-\section{B-Tree Indexes and Query Plan Profiling (	exttt{EXPLAIN})}
+\section{B-Tree Indexes and Query Plan Profiling (\texttt{EXPLAIN})}
 
-Scanning millions of rows sequentially from disk for one user ID wastes I/O. PostgreSQL accelerates lookups with 	extbf{Lehman and Yao B-Tree} indexes: balanced trees of 8\,KB index pages consisting of a 	extbf{Metapage} (block 0 pointing to the root), 	extbf{Internal Branch Pages} (routing keys + 	extbf{High Key} upper bounds), and doubly-linked 	extbf{Leaf Pages} holding indexed values paired with physical heap row pointers (\textbf{TIDs}).
+Scanning millions of rows sequentially from disk for one user ID wastes I/O. PostgreSQL accelerates lookups with \textbf{Lehman and Yao B-Tree} indexes: balanced trees of 8\,KB index pages consisting of a \textbf{Metapage} (block 0 pointing to the root), \textbf{Internal Branch Pages} (routing keys + \textbf{High Key} upper bounds), and doubly-linked \textbf{Leaf Pages} holding indexed values paired with physical heap row pointers (\textbf{TIDs}).
 
 \begin{figure}[htbp]
 \centering
@@ -126,7 +126,7 @@ Scanning millions of rows sequentially from disk for one user ID wastes I/O. Pos
 \toprule
 \textbf{Access Method} & \textbf{Mechanics} & \textbf{Best When} \\ \midrule
 \textbf{Sequential Scan} & Reads every 8\,KB heap page linearly. & Query matches $>15\%$ of rows or tiny table. \\
-\textbf{Index Scan} & Walks B-Tree $\to$ fetches each TID from heap. & Selective lookups (	exttt{id = 42}). \\
+\textbf{Index Scan} & Walks B-Tree $\to$ fetches each TID from heap. & Selective lookups (\texttt{id = 42}). \\
 \textbf{Bitmap Index Scan} & Collects matching TIDs, sorts by block, reads heap sequentially. & Moderate ranges ($2\%\text{--}10\%$) avoiding random disk seeks. \\
 \textbf{Index-Only Scan} & Answers purely from index if Visibility Map bit $= 1$. & Covering indexes where all needed columns are indexed. \\ \bottomrule
 \end{tabular}
@@ -134,9 +134,9 @@ Scanning millions of rows sequentially from disk for one user ID wastes I/O. Pos
 \label{tab:v1-ch05-scans}
 \end{table}
 
-\subsection{Reading 	exttt{EXPLAIN (ANALYZE, BUFFERS)} Bottom-Up}
+\subsection{Reading \texttt{EXPLAIN (ANALYZE, BUFFERS)} Bottom-Up}
 
-Always read PostgreSQL execution plans 	extbf{from the innermost indented child nodes upward} toward the root, because child operators feed rows up to parent operators and buffer counts are cumulative:
+Always read PostgreSQL execution plans \textbf{from the innermost indented child nodes upward} toward the root, because child operators feed rows up to parent operators and buffer counts are cumulative:
 
 \begin{lstlisting}[language=SQL,caption={Query Under Analysis}]
 EXPLAIN (ANALYZE, BUFFERS)
@@ -168,18 +168,18 @@ Execution Time: 15.200 ms
 
 \textbf{Bottom-up trace:}
 \begin{enumerate}[leftmargin=15pt]
-  \item Innermost child 	exttt{Seq Scan on users u} reads $90\text{ (hit)} + 2\text{ (read)} = 92$ 8\,KB pages and emits 7,200 rows into 	exttt{Hash} ($480\text{\,kB}$ in memory, still 	exttt{hit=90 read=2}).
-  \item Sibling 	exttt{Seq Scan on orders o} reads $290 + 10 = 300$ pages and emits 14,200 matching rows.
-  \item 	exttt{Hash Join} combines both inputs, so its cumulative buffer counts equal $(90+290)=380$ hits and $(2+10)=12$ reads.
-  \item Finally, 	exttt{HashAggregate} groups the 14,200 joined rows in memory into 6,850 users without reading extra table pages (	exttt{shared hit=380 read=12}). Notice planner estimates (	exttt{rows=14040}) closely match 	exttt{actual rows=14200}; huge mismatches signal stale statistics needing 	exttt{ANALYZE}.
+  \item Innermost child \texttt{Seq Scan on users u} reads $90\text{ (hit)} + 2\text{ (read)} = 92$ 8\,KB pages and emits 7,200 rows into \texttt{Hash} ($480\text{\,kB}$ in memory, still \texttt{hit=90 read=2}).
+  \item Sibling \texttt{Seq Scan on orders o} reads $290 + 10 = 300$ pages and emits 14,200 matching rows.
+  \item \texttt{Hash Join} combines both inputs, so its cumulative buffer counts equal $(90+290)=380$ hits and $(2+10)=12$ reads.
+  \item Finally, \texttt{HashAggregate} groups the 14,200 joined rows in memory into 6,850 users without reading extra table pages (\texttt{shared hit=380 read=12}). Notice planner estimates (\texttt{rows=14040}) closely match \texttt{actual rows=14200}; huge mismatches signal stale statistics needing \texttt{ANALYZE}.
 \end{enumerate}
 
 % ==========================================
 \section{PostgreSQL Physical Storage: 8\,KB Pages, Bloat, and Redo WAL}
 
-\subsection{Inside an 8\,KB Heap Page and 	exttt{HeapTupleHeaderData}}
+\subsection{Inside an 8\,KB Heap Page and \texttt{HeapTupleHeaderData}}
 
-PostgreSQL splits each table file into fixed 	extbf{8,192-byte (8\,KB) pages}:
+PostgreSQL splits each table file into fixed \textbf{8,192-byte (8\,KB) pages}:
 
 \begin{figure}[htbp]
 \centering
@@ -202,20 +202,20 @@ PostgreSQL splits each table file into fixed 	extbf{8,192-byte (8\,KB) pages}:
 \label{fig:v1-ch05-postgres-page}
 \end{figure}
 
-Every row is addressed physically by a 	extbf{Tuple Identifier (TID)} $= (\text{block\_number}, \text{line\_pointer\_index})$ and carries a 	extbf{23-byte 	exttt{HeapTupleHeaderData}} (plus a 1+-byte NULL bitmap padded to 8-byte alignment, making the header 24 bytes for up to 8 columns). Inside that header sit 	extbf{	exttt{t\\_xmin}} (the XID that inserted this row version) and 	extbf{	exttt{t\\_xmax}} (the XID that deleted or updated it, or $0$ if live).
+Every row is addressed physically by a \textbf{Tuple Identifier (TID)} $= (\text{block\_number}, \text{line\_pointer\_index})$ and carries a \textbf{23-byte \texttt{HeapTupleHeaderData}} (plus a 1+-byte NULL bitmap padded to 8-byte alignment, making the header 24 bytes for up to 8 columns). Inside that header sit \textbf{\texttt{t\_xmin}} (the XID that inserted this row version) and \textbf{\texttt{t\_xmax}} (the XID that deleted or updated it, or $0$ if live).
 
 \subsection{Dead Tuples, Autovacuum, and XID Wraparound}
 
-Because an 	exttt{UPDATE} leaves the old version on disk with 	exttt{t\_xmax} set and appends a brand-new tuple, frequent updates create 	extbf{dead tuples} (	extbf{table bloat}). The 	extbf{Autovacuum} worker reclaims dead space, updates the 	extbf{Free Space Map (FSM)} and 	extbf{Visibility Map (VM)}, and 	extbf{freezes} ancient tuples (	exttt{HEAP\_XMIN\_FROZEN}) before PostgreSQL's 32-bit unsigned transaction counter ($\approx 4.29$ billion) wraps around modulo $2^{32}$---which would otherwise force PostgreSQL into an emergency read-only shutdown!
+Because an \texttt{UPDATE} leaves the old version on disk with \texttt{t\_xmax} set and appends a brand-new tuple, frequent updates create \textbf{dead tuples} (\textbf{table bloat}). The \textbf{Autovacuum} worker reclaims dead space, updates the \textbf{Free Space Map (FSM)} and \textbf{Visibility Map (VM)}, and \textbf{freezes} ancient tuples (\texttt{HEAP\_XMIN\_FROZEN}) before PostgreSQL's 32-bit unsigned transaction counter ($\approx 4.29$ billion) wraps around modulo $2^{32}$---which would otherwise force PostgreSQL into an emergency read-only shutdown!
 
 \subsection{Shared Buffers, Clock Sweep, and Redo-Only WAL Recovery}
 
-PostgreSQL caches 8\,KB pages in 	extbf{Shared Buffers} (evicted via a ring-hand 	extbf{Clock Sweep} usage counter $0\dots 5$). Before modifying any page in memory, PostgreSQL writes a sequential record to the 	extbf{Write-Ahead Log (WAL)} and calls 	exttt{fsync()} on 	exttt{COMMIT} \cite{petrov2019database}.
+PostgreSQL caches 8\,KB pages in \textbf{Shared Buffers} (evicted via a ring-hand \textbf{Clock Sweep} usage counter $0\dots 5$). Before modifying any page in memory, PostgreSQL writes a sequential record to the \textbf{Write-Ahead Log (WAL)} and calls \texttt{fsync()} on \texttt{COMMIT} \cite{petrov2019database}.
 
 \begin{productionwarningbox}[Why PostgreSQL Crash Recovery Performs Redo Only (Unlike ARIES Undo)]
-Traditional database engines that overwrite rows in place (such as MySQL InnoDB or IBM DB2) use the three-phase 	extbf{ARIES} recovery algorithm: *Analysis* $\to$ *Redo* $\to$ *Undo* (to roll back uncommitted in-place edits).
+Traditional database engines that overwrite rows in place (such as MySQL InnoDB or IBM DB2) use the three-phase \textbf{ARIES} recovery algorithm: *Analysis* $\to$ *Redo* $\to$ *Undo* (to roll back uncommitted in-place edits).
 
-\textbf{PostgreSQL does NOT run an Undo pass during crash recovery.} Because MVCC never overwrites old tuples in place, an uncommitted transaction's half-written tuples simply have an 	exttt{xmin} not marked committed in the commit log (	exttt{pg\_xact}). After a power failure, PostgreSQL replays WAL records forward from the last checkpoint's REDO point (	extbf{Redo pass only}); uncommitted tuples are automatically invisible to every future query and are reclaimed later by 	exttt{VACUUM}.
+\textbf{PostgreSQL does NOT run an Undo pass during crash recovery.} Because MVCC never overwrites old tuples in place, an uncommitted transaction's half-written tuples simply have an \texttt{xmin} not marked committed in the commit log (\texttt{pg\_xact}). After a power failure, PostgreSQL replays WAL records forward from the last checkpoint's REDO point (\textbf{Redo pass only}); uncommitted tuples are automatically invisible to every future query and are reclaimed later by \texttt{VACUUM}.
 \end{productionwarningbox}
 
 \begin{realworldbox}[Diagnosing Flash-Sale Bloat, Missing Index, and Lock Contention]
@@ -223,9 +223,9 @@ Traditional database engines that overwrite rows in place (such as MySQL InnoDB 
 
 \textbf{Diagnostic Steps:}
 \begin{enumerate}[leftmargin=15pt,itemsep=2pt]
-  \item Query 	exttt{pg\_stat\_user\_tables}: see 	exttt{n\_dead\_tup = 48{,}000{,}000} and 	exttt{last\_autovacuum = NULL} because a long-running analytics query holds an old snapshot open, blocking autovacuum from reclaiming dead rows.
-  \item Query 	exttt{pg\_stat\_activity} for 	exttt{wait\_event\_type = 'Lock'}: dozens of checkout connections pile up waiting on the same SKU row lock, or run full sequential scans on a JSONB filter lacking an expression/GIN index.
-  \item Fix: Terminate stale reporting snapshots, tune 	exttt{autovacuum\_vacuum\_scale\_factor = 0.05}, add targeted indexes, and use atomic conditional updates or 	exttt{SKIP LOCKED}.
+  \item Query \texttt{pg\_stat\_user\_tables}: see \texttt{n\_dead\_tup = 48{,}000{,}000} and \texttt{last\_autovacuum = NULL} because a long-running analytics query holds an old snapshot open, blocking autovacuum from reclaiming dead rows.
+  \item Query \texttt{pg\_stat\_activity} for \texttt{wait\_event\_type = 'Lock'}: dozens of checkout connections pile up waiting on the same SKU row lock, or run full sequential scans on a JSONB filter lacking an expression/GIN index.
+  \item Fix: Terminate stale reporting snapshots, tune \texttt{autovacuum\_vacuum\_scale\_factor = 0.05}, add targeted indexes, and use atomic conditional updates or \texttt{SKIP LOCKED}.
 \end{enumerate}
 \end{realworldbox}
 
@@ -244,12 +244,12 @@ Traditional database engines that overwrite rows in place (such as MySQL InnoDB 
   line/.style={draw=headingblue, -{Stealth[length=2.3mm]}, thick}
 ]
   \node[accent, minimum width=5cm] (ar) {\textbf{Active Record (Eloquent, Django)}\\Model holds data + SQL save/query};
-  \node[box, below=0.45cm of ar, minimum width=5cm] (ardb) {Table 	exttt{orders}};
-  \draw[line, <->] (ar) -- node[right, font=\tiny\sffamily] {	exttt{\$order->save()}} (ardb);
+  \node[box, below=0.45cm of ar, minimum width=5cm] (ardb) {Table \texttt{orders}};
+  \draw[line, <->] (ar) -- node[right, font=\tiny\sffamily] {\texttt{\$order->save()}} (ardb);
 
   \node[accent, right=1.6cm of ar, minimum width=5.4cm] (dm_ent) {\textbf{Data Mapper Entity (Doctrine, SQLAlchemy)}\\Pure domain object (no DB methods)};
   \node[box, below=0.45cm of dm_ent, minimum width=5.4cm] (dm_map) {\textbf{Unit of Work / Session}\\Tracks dirty objects, batches SQL};
-  \node[box, below=0.45cm of dm_map, minimum width=5.4cm] (dm_db) {Table 	exttt{orders}};
+  \node[box, below=0.45cm of dm_map, minimum width=5.4cm] (dm_db) {Table \texttt{orders}};
   \draw[line] (dm_ent) -- (dm_map);
   \draw[line, <->] (dm_map) -- (dm_db);
 \end{tikzpicture}
@@ -257,13 +257,13 @@ Traditional database engines that overwrite rows in place (such as MySQL InnoDB 
 \label{fig:v1-ch05-orm-patterns}
 \end{figure}
 
-Both ORM families easily trigger the 	extbf{N+1 query problem}: fetching 100 orders (1 query) and reading 	exttt{\$order->customer->name} inside a loop fires 100 extra 	exttt{SELECT} round trips. Fix it with 	extbf{eager loading} (	exttt{WHERE id IN (...)}, turning 101 queries into 2) or batching across async requests via the 	extbf{DataLoader} pattern.
+Both ORM families easily trigger the \textbf{N+1 query problem}: fetching 100 orders (1 query) and reading \texttt{\$order->customer->name} inside a loop fires 100 extra \texttt{SELECT} round trips. Fix it with \textbf{eager loading} (\texttt{WHERE id IN (...)}, turning 101 queries into 2) or batching across async requests via the \textbf{DataLoader} pattern.
 
-\subsection{Row-Level Security (RLS) and 	exttt{SET LOCAL} with PgBouncer}
+\subsection{Row-Level Security (RLS) and \texttt{SET LOCAL} with PgBouncer}
 
-In multi-tenant backends, PostgreSQL 	extbf{Row-Level Security (RLS)} acts as a database-enforced safety net: even if an ORM query forgets 	exttt{WHERE tenant\_id = ...}, PostgreSQL automatically filters every row:
+In multi-tenant backends, PostgreSQL \textbf{Row-Level Security (RLS)} acts as a database-enforced safety net: even if an ORM query forgets \texttt{WHERE tenant\_id = ...}, PostgreSQL automatically filters every row:
 
-\begin{lstlisting}[language=SQL,caption={Enforcing Tenant Isolation Safely with RLS and 	exttt{SET LOCAL}}]
+\begin{lstlisting}[language=SQL,caption={Enforcing Tenant Isolation Safely with RLS and \texttt{SET LOCAL}}]
 ALTER TABLE invoices ENABLE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON invoices
     USING (tenant_id = current_setting('app.current_tenant', true)::uuid);
@@ -275,22 +275,22 @@ SELECT * FROM invoices;  -- Automatically filtered to that tenant only
 COMMIT;                  -- SET LOCAL resets automatically when the transaction ends!
 \end{lstlisting}
 
-\begin{productionwarningbox}[Why 	exttt{SET} Leaks Tenants Behind PgBouncer Transaction Pooling]
-Connection poolers like 	extbf{PgBouncer} in 	exttt{transaction} pooling mode hand the exact same PostgreSQL backend socket to Tenant A for Transaction 1 and Tenant B for Transaction 2. Using session-scoped 	exttt{SET app.current\_tenant = ...} leaves Tenant A's ID sticky on the socket for Tenant B! Always use 	extbf{	exttt{SET LOCAL}} inside an explicit 	exttt{BEGIN ... COMMIT} block so PostgreSQL wipes the setting automatically at transaction end (explored further in Volume~V).
+\begin{productionwarningbox}[Why \texttt{SET} Leaks Tenants Behind PgBouncer Transaction Pooling]
+Connection poolers like \textbf{PgBouncer} in \texttt{transaction} pooling mode hand the exact same PostgreSQL backend socket to Tenant A for Transaction 1 and Tenant B for Transaction 2. Using session-scoped \texttt{SET app.current\_tenant = ...} leaves Tenant A's ID sticky on the socket for Tenant B! Always use \textbf{\texttt{SET LOCAL}} inside an explicit \texttt{BEGIN ... COMMIT} block so PostgreSQL wipes the setting automatically at transaction end (explored further in Volume~V).
 \end{productionwarningbox}
 
 \begin{tryityourselfbox}[Trace MVCC Visibility Across Two Transactions]
-Row 	exttt{id=1} has 	exttt{(xmin=100, xmax=0, balance=500)}. Transaction 	exttt{XID=105} begins at 	exttt{REPEATABLE READ} and runs 	exttt{SELECT balance FROM accounts WHERE id=1}. Meanwhile, Transaction 	exttt{XID=106} updates 	exttt{balance = 300} (creating version 	exttt{xmin=106, xmax=0} and setting 	exttt{xmax=106} on the old version) and commits. Now 	exttt{XID=105} runs 	exttt{SELECT balance} a second time. Which tuple version does 	exttt{XID=105} see, and what changes if 	exttt{XID=105} was 	exttt{READ COMMITTED}?
+Row \texttt{id=1} has \texttt{(xmin=100, xmax=0, balance=500)}. Transaction \texttt{XID=105} begins at \texttt{REPEATABLE READ} and runs \texttt{SELECT balance FROM accounts WHERE id=1}. Meanwhile, Transaction \texttt{XID=106} updates \texttt{balance = 300} (creating version \texttt{xmin=106, xmax=0} and setting \texttt{xmax=106} on the old version) and commits. Now \texttt{XID=105} runs \texttt{SELECT balance} a second time. Which tuple version does \texttt{XID=105} see, and what changes if \texttt{XID=105} was \texttt{READ COMMITTED}?
 \end{tryityourselfbox}
 
 % ==========================================
 \section{Chapter Summary \protect\& Key Takeaways}
 
 \begin{itemize}[leftmargin=15pt]
-  \item \textbf{Anomalies \& Isolation:} Dirty Reads, Non-Repeatable Reads, Phantoms, and Write Skew define isolation guarantees. PostgreSQL MVCC prevents dirty/non-repeatable/phantom reads at 	exttt{Repeatable Read} and requires 	exttt{Serializable} (SSI) for Write Skew.
-  \item \textbf{Locking \& Plans:} 	exttt{SELECT ... FOR UPDATE SKIP LOCKED} lets concurrent queue workers claim disjoint jobs without waiting; 	exttt{EXPLAIN (ANALYZE, BUFFERS)} must be read bottom-up with cumulative buffer hits/reads.
-  \item \textbf{Storage \& Recovery:} 8\,KB pages pack 24-byte headers, 4-byte line pointers, and 8-byte-aligned tuples with 	exttt{xmin}/	exttt{xmax}. Autovacuum clears dead tuples and prevents 32-bit XID wraparound. PostgreSQL WAL crash recovery runs a 	extbf{Redo pass only} (no ARIES Undo pass).
-  \item \textbf{ORMs \& Multi-Tenancy:} Prevent N+1 loops with eager 	exttt{WHERE IN} queries, and pair PostgreSQL RLS policies with transaction-scoped 	exttt{SET LOCAL} behind connection poolers.
+  \item \textbf{Anomalies \& Isolation:} Dirty Reads, Non-Repeatable Reads, Phantoms, and Write Skew define isolation guarantees. PostgreSQL MVCC prevents dirty/non-repeatable/phantom reads at \texttt{Repeatable Read} and requires \texttt{Serializable} (SSI) for Write Skew.
+  \item \textbf{Locking \& Plans:} \texttt{SELECT ... FOR UPDATE SKIP LOCKED} lets concurrent queue workers claim disjoint jobs without waiting; \texttt{EXPLAIN (ANALYZE, BUFFERS)} must be read bottom-up with cumulative buffer hits/reads.
+  \item \textbf{Storage \& Recovery:} 8\,KB pages pack 24-byte headers, 4-byte line pointers, and 8-byte-aligned tuples with \texttt{xmin}/\texttt{xmax}. Autovacuum clears dead tuples and prevents 32-bit XID wraparound. PostgreSQL WAL crash recovery runs a \textbf{Redo pass only} (no ARIES Undo pass).
+  \item \textbf{ORMs \& Multi-Tenancy:} Prevent N+1 loops with eager \texttt{WHERE IN} queries, and pair PostgreSQL RLS policies with transaction-scoped \texttt{SET LOCAL} behind connection poolers.
 \end{itemize}
 
 % ==========================================
@@ -298,7 +298,7 @@ Row 	exttt{id=1} has 	exttt{(xmin=100, xmax=0, balance=500)}. Transaction 	exttt
 
 \subsection{Mechanics Exercises}
 \begin{enumerate}[leftmargin=15pt]
-  \item \textbf{Exercise~\thechapter.1:} Calculate the exact physical heap storage required by 1,000,000 uncompressed rows in a table defined as 	exttt{(id INT, created\_at TIMESTAMP, label VARCHAR(32), active BOOLEAN)}, assuming every 	exttt{label} is 32 ASCII characters (1-byte short varlena header + 32 bytes = 33 bytes), taking into account PostgreSQL's 24-byte page header, 4-byte line pointers, 24-byte tuple header (23B + 1B NULL bitmap), and 8-byte 	exttt{MAXALIGN} alignment padding.
+  \item \textbf{Exercise~\thechapter.1:} Calculate the exact physical heap storage required by 1,000,000 uncompressed rows in a table defined as \texttt{(id INT, created\_at TIMESTAMP, label VARCHAR(32), active BOOLEAN)}, assuming every \texttt{label} is 32 ASCII characters (1-byte short varlena header + 32 bytes = 33 bytes), taking into account PostgreSQL's 24-byte page header, 4-byte line pointers, 24-byte tuple header (23B + 1B NULL bitmap), and 8-byte \texttt{MAXALIGN} alignment padding.
   \item \textbf{Exercise~\thechapter.2:} Explain the exact difference between an Index Scan and an Index-Only Scan, and name the exact data structure bit that forces an Index-Only Scan to fall back to reading the heap page.
 \end{enumerate}
 
@@ -309,7 +309,7 @@ Row 	exttt{id=1} has 	exttt{(xmin=100, xmax=0, balance=500)}. Transaction 	exttt
 CREATE INDEX idx_audit_logs_metadata ON audit_logs (metadata);
 SELECT * FROM audit_logs WHERE metadata->>'tenant_id' = 'acme_corp';
 \end{lstlisting}
-  Explain why PostgreSQL ignores 	exttt{idx\_audit\_logs\_metadata} and provide two valid indexing fixes.
+  Explain why PostgreSQL ignores \texttt{idx\_audit\_logs\_metadata} and provide two valid indexing fixes.
 \end{enumerate}
 
 \subsection{Architecture Design Problem}
@@ -320,23 +320,23 @@ SELECT * FROM audit_logs WHERE metadata->>'tenant_id' = 'acme_corp';
 % ==========================================
 \section{Detailed Solutions}
 
-\subsection{Solution to Try It Yourself: MVCC 	exttt{xmin}/	exttt{xmax} Trace}
+\subsection{Solution to Try It Yourself: MVCC \texttt{xmin}/\texttt{xmax} Trace}
 \begin{itemize}[leftmargin=15pt]
-  \item Under \textbf{	exttt{REPEATABLE READ}}, 	exttt{XID=105} takes one transaction-level snapshot at its first query (when 	exttt{XID=106} had not committed yet). On its second 	exttt{SELECT}, it sees the old tuple (	exttt{xmin=100, xmax=106}) as still live because 	exttt{106} is not in its snapshot, and ignores the new tuple (	exttt{xmin=106}). Result: \textbf{500}.
-  \item Under \textbf{	exttt{READ COMMITTED}}, 	exttt{XID=105} takes a fresh snapshot at the start of \emph{each statement}. Since 	exttt{106} is committed before the second 	exttt{SELECT}, it sees the old tuple as deleted and returns the new tuple: \textbf{300}.
+  \item Under \textbf{\texttt{REPEATABLE READ}}, \texttt{XID=105} takes one transaction-level snapshot at its first query (when \texttt{XID=106} had not committed yet). On its second \texttt{SELECT}, it sees the old tuple (\texttt{xmin=100, xmax=106}) as still live because \texttt{106} is not in its snapshot, and ignores the new tuple (\texttt{xmin=106}). Result: \textbf{500}.
+  \item Under \textbf{\texttt{READ COMMITTED}}, \texttt{XID=105} takes a fresh snapshot at the start of \emph{each statement}. Since \texttt{106} is committed before the second \texttt{SELECT}, it sees the old tuple as deleted and returns the new tuple: \textbf{300}.
 \end{itemize}
 
 \subsection{Solution~\thechapter.1: Exact 8-Byte Aligned PostgreSQL Heap Storage Math}
 \begin{enumerate}[leftmargin=15pt]
-  \item \textbf{Tuple Header + NULL Bitmap:} 	exttt{HeapTupleHeaderData} is 23 bytes + 1 byte NULL bitmap (for 4 columns) $= \mathbf{24\text{ bytes}}$ (already a multiple of 8).
-  \item \textbf{Column Layout \& Alignment Padding (column order: 	exttt{id, created\_at, label, active}):}
+  \item \textbf{Tuple Header + NULL Bitmap:} \texttt{HeapTupleHeaderData} is 23 bytes + 1 byte NULL bitmap (for 4 columns) $= \mathbf{24\text{ bytes}}$ (already a multiple of 8).
+  \item \textbf{Column Layout \& Alignment Padding (column order: \texttt{id, created\_at, label, active}):}
   \begin{itemize}
-    \item 	exttt{id} (	exttt{INT}, 4 bytes, 4-byte aligned): offsets $24\dots 27$ (4 bytes).
-    \item 	exttt{created\_at} (	exttt{TIMESTAMP}, 8 bytes, 8-byte aligned): inserts \textbf{4 bytes alignment padding} at $28\dots 31$, then occupies $32\dots 39$ (8 bytes).
-    \item 	exttt{label} (	exttt{VARCHAR(32)}, 1-byte header + 32 bytes = 33 bytes, 1-byte aligned): offsets $40\dots 72$ (33 bytes).
-    \item 	exttt{active} (	exttt{BOOLEAN}, 1 byte, 1-byte aligned): offset $73$ (1 byte).
+    \item \texttt{id} (\texttt{INT}, 4 bytes, 4-byte aligned): offsets $24\dots 27$ (4 bytes).
+    \item \texttt{created\_at} (\texttt{TIMESTAMP}, 8 bytes, 8-byte aligned): inserts \textbf{4 bytes alignment padding} at $28\dots 31$, then occupies $32\dots 39$ (8 bytes).
+    \item \texttt{label} (\texttt{VARCHAR(32)}, 1-byte header + 32 bytes = 33 bytes, 1-byte aligned): offsets $40\dots 72$ (33 bytes).
+    \item \texttt{active} (\texttt{BOOLEAN}, 1 byte, 1-byte aligned): offset $73$ (1 byte).
   \end{itemize}
-  \item \textbf{Total Tuple \& Page Slot Size:} Unaligned tuple end $= 74$ bytes. PostgreSQL pads every tuple length to 8-byte 	exttt{MAXALIGN}: $\lceil 74 / 8 \rceil \times 8 = \mathbf{80\text{ bytes}}$. Adding the 4-byte 	exttt{ItemIdData} line pointer gives $\mathbf{84\text{ bytes per row}}$ on the page. (Reordering columns largest-fixed-first---putting 	exttt{created\_at} before 	exttt{id}---eliminates the 4-byte padding gap, shrinking each tuple to 72 bytes + 4-byte pointer = 76 bytes!)
+  \item \textbf{Total Tuple \& Page Slot Size:} Unaligned tuple end $= 74$ bytes. PostgreSQL pads every tuple length to 8-byte \texttt{MAXALIGN}: $\lceil 74 / 8 \rceil \times 8 = \mathbf{80\text{ bytes}}$. Adding the 4-byte \texttt{ItemIdData} line pointer gives $\mathbf{84\text{ bytes per row}}$ on the page. (Reordering columns largest-fixed-first---putting \texttt{created\_at} before \texttt{id}---eliminates the 4-byte padding gap, shrinking each tuple to 72 bytes + 4-byte pointer = 76 bytes!)
   \item \textbf{Page Capacity \& Total Heap Size:}
   \begin{itemize}
     \item Usable space per page: $8192 - 24 = 8168\text{ bytes}$.
@@ -347,10 +347,10 @@ SELECT * FROM audit_logs WHERE metadata->>'tenant_id' = 'acme_corp';
 \end{enumerate}
 
 \subsection{Solution~\thechapter.2: Index Scan vs.\ Index-Only Scan}
-An Index Scan walks the B-Tree and visits the heap page for every matching TID to read missing columns and check 	exttt{xmin}/	exttt{xmax} visibility. An Index-Only Scan returns columns straight from the B-Tree leaf pages, checking the 	extbf{Visibility Map (VM)} bit for each heap page: if the VM all-visible bit is 	exttt{1}, the heap read is skipped; if 	exttt{0} (recent uncommitted or unvacuumed changes on that page), PostgreSQL falls back to reading the heap page to verify MVCC visibility.
+An Index Scan walks the B-Tree and visits the heap page for every matching TID to read missing columns and check \texttt{xmin}/\texttt{xmax} visibility. An Index-Only Scan returns columns straight from the B-Tree leaf pages, checking the \textbf{Visibility Map (VM)} bit for each heap page: if the VM all-visible bit is \texttt{1}, the heap read is skipped; if \texttt{0} (recent uncommitted or unvacuumed changes on that page), PostgreSQL falls back to reading the heap page to verify MVCC visibility.
 
 \subsection{Solution~\thechapter.3: Fixing JSONB Expression Indexing}
-A standard B-Tree on 	exttt{(metadata)} orders whole JSONB objects, not the extracted key 	exttt{metadata->>'tenant\_id'}.
+A standard B-Tree on \texttt{(metadata)} orders whole JSONB objects, not the extracted key \texttt{metadata->>'tenant\_id'}.
 \begin{lstlisting}[language=SQL]
 -- Fix A: B-Tree expression index matching the exact query predicate
 CREATE INDEX idx_audit_logs_tenant ON audit_logs ((metadata->>'tenant_id'));
@@ -388,13 +388,13 @@ SELECT sku, :user_id FROM claimed
 RETURNING id;
 COMMIT;
 \end{lstlisting}
-\textbf{Why this prevents overselling and deadlocks:} PostgreSQL takes a row-level lock on the single 	exttt{CONSOLE-X} row during the atomic 	exttt{UPDATE ... WHERE (total\_stock - reserved\_stock) >= 1}. Under 	exttt{READ COMMITTED}, waiting transactions automatically re-evaluate the 	exttt{WHERE} predicate against the latest committed 	exttt{reserved\_stock} once the lock releases. Once 	exttt{reserved\_stock == 500}, the 	exttt{UPDATE} matches 0 rows, 	exttt{claimed} is empty, no reservation row is inserted, and the API returns 	exttt{409 Conflict} with zero multi-row deadlock cycles.
+\textbf{Why this prevents overselling and deadlocks:} PostgreSQL takes a row-level lock on the single \texttt{CONSOLE-X} row during the atomic \texttt{UPDATE ... WHERE (total\_stock - reserved\_stock) >= 1}. Under \texttt{READ COMMITTED}, waiting transactions automatically re-evaluate the \texttt{WHERE} predicate against the latest committed \texttt{reserved\_stock} once the lock releases. Once \texttt{reserved\_stock == 500}, the \texttt{UPDATE} matches 0 rows, \texttt{claimed} is empty, no reservation row is inserted, and the API returns \texttt{409 Conflict} with zero multi-row deadlock cycles.
 
 \begin{labbridgebox}[Practice Real SQL Transactions \& Async ORMs]
 \begin{itemize}[leftmargin=15pt,itemsep=2pt]
-  \item 	exttt{exercises/volume1/ex02\_php\_pdo\_prepared\_transactions.php} \& 	exttt{ex04\_sql\_mvcc\_isolation.sql}: Practice PDO prepared statements, transaction rollbacks, and MVCC row locking.
-  \item 	exttt{projects/p01-php-db-integration/}: Full PHP 8.3 order placement service with isolation levels and row locking.
-  \item 	exttt{projects/p04-async-db-sqlalchemy/}: Async SQLAlchemy 2.0 + 	exttt{asyncpg} connection pooling and batched upserts (	exttt{ON CONFLICT DO UPDATE}).
+  \item \texttt{exercises/volume1/ex02\_php\_pdo\_prepared\_transactions.php} \& \texttt{ex04\_sql\_mvcc\_isolation.sql}: Practice PDO prepared statements, transaction rollbacks, and MVCC row locking.
+  \item \texttt{projects/p01-php-db-integration/}: Full PHP 8.3 order placement service with isolation levels and row locking.
+  \item \texttt{projects/p04-async-db-sqlalchemy/}: Async SQLAlchemy 2.0 + \texttt{asyncpg} connection pooling and batched upserts (\texttt{ON CONFLICT DO UPDATE}).
 \end{itemize}
 \end{labbridgebox}
 

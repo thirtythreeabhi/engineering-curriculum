@@ -357,7 +357,7 @@ Justify choosing Kafka or RabbitMQ for:
   \item A multi-step PDF/video rendering dispatcher needing VIP priority queues, wildcard routing to GPU/CPU pools, and immediate deletion upon task completion.
 \end{enumerate}
 
-\subsection*{Exercise~\thechapter.4 (Try-It-Yourself Lab): Assignor Trace & AMQP Topic Matching}
+\subsection*{Exercise~\thechapter.4 (Try-It-Yourself Lab): Assignor Trace \& AMQP Topic Matching}
 Solve both parts of the \emph{Try It Yourself} box above.
 
 \section{Detailed Solutions}
@@ -384,7 +384,7 @@ Uncompressed JSON telemetry fills \texttt{buffer.memory} faster than the sender 
   \item Since \texttt{\#} matches zero or more words: (a) \texttt{payments.failed} matches (0 words between), (b) \texttt{payments.eu.card.failed} matches (2 words between), (c) \texttt{payments.card.succeeded} does \emph{not} match.
 \end{enumerate}
 
-\begin{labbridgebox}[Event-Driven Outbox & Full Stack Broker Integration]
+\begin{labbridgebox}[Event-Driven Outbox \& Full Stack Broker Integration]
 Explore Kafka-style partitioned log delivery in \texttt{projects/p11-event-driven-microservices}, and inspect live RabbitMQ exchanges, queues, and worker consumption in \texttt{projects/p12-end-to-end-platform} (ports 5672/15672).
 \end{labbridgebox}
 

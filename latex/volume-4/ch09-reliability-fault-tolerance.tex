@@ -354,7 +354,7 @@ An API gateway has 200 worker threads and a $2{,}000\text{ ms}$ upstream timeout
 \subsection*{Exercise~\thechapter.3 (Architecture): End-to-End High-Load Resilience Topology}
 Design an end-to-end resilience architecture for an e-commerce checkout platform handling 10$\times$ traffic spikes. Specify where Priority Load Shedding, Bulkheads, Circuit Breakers, Adaptive Concurrency Limits, and Chaos Game Days sit.
 
-\subsection*{Exercise~\thechapter.4 (Try-It-Yourself Lab): Variance Floor & Failure Counter Reset}
+\subsection*{Exercise~\thechapter.4 (Try-It-Yourself Lab): Variance Floor \& Failure Counter Reset}
 Solve both parts of the \emph{Try It Yourself} box above.
 
 \section{Detailed Solutions}
@@ -395,7 +395,7 @@ All routes share one 200-thread pool. Because Profile requests wait the full $2{
   \item If \texttt{failure\_count} only resets in \texttt{HALF\_OPEN}, a breaker in \texttt{CLOSED} state with \texttt{failure\_threshold = 3} would trip to \texttt{OPEN} after 3 unrelated single-packet blips spaced hours apart, instead of requiring 3 \emph{consecutive} failures.
 \end{enumerate}
 
-\begin{labbridgebox}[Circuit Breaker Lab & End-to-End Platform]
+\begin{labbridgebox}[Circuit Breaker Lab \& End-to-End Platform]
 Run \texttt{exercises/volume4/ex05\_circuit\_breaker.py} to step through \texttt{CLOSED $\to$ OPEN $\to$ HALF\_OPEN $\to$ CLOSED} transitions, and inspect full multi-service resilience, observability, and Prometheus metrics in \texttt{projects/p12-end-to-end-platform}.
 \end{labbridgebox}
 

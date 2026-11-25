@@ -265,10 +265,10 @@ Given events \texttt{CartCreated}, \texttt{ItemAdded(SKU123, 2)}, \texttt{ItemAd
 \subsection*{Exercise~\thechapter.2 (Debugging): Choreographed Saga Infinite Loop}
 In a ride-sharing choreographed saga: Service~A emits \texttt{RideRequested} $\to$ Service~B emits \texttt{DriverReserved} $\to$ Service~C fails payment and emits \texttt{PaymentFailed} $\to$ Service~B releases driver and emits \texttt{DriverReleased} $\to$ Service~A treats \texttt{DriverReleased} as a new retry trigger and re-emits \texttt{RideRequested} forever. Explain how to break this cycle.
 
-\subsection*{Exercise~\thechapter.3 (Architecture): Event-Sourced Exchange Ledger & Version-Guarded Redis CQRS}
+\subsection*{Exercise~\thechapter.3 (Architecture): Event-Sourced Exchange Ledger \& Version-Guarded Redis CQRS}
 Design an event-sourced ledger schema in PostgreSQL enforcing optimistic concurrency and an atomic version-guarded Redis CQRS projector (\texttt{version > current\_version}) that blocks out-of-order replay regressions.
 
-\subsection*{Exercise~\thechapter.4 (Try-It-Yourself Lab): Double-Spend Prevention & Projection Lua Guard}
+\subsection*{Exercise~\thechapter.4 (Try-It-Yourself Lab): Double-Spend Prevention \& Projection Lua Guard}
 Solve both parts of the \emph{Try It Yourself} box above.
 
 \section{Detailed Solutions}
@@ -304,7 +304,7 @@ final_state = functools.reduce(reduce_cart, events, {})
 
 \subsection*{Solution to Exercise~\thechapter.2}
 \begin{enumerate}[leftmargin=18pt]
-  \item \textbf{Saga State & Correlation IDs}: Tag every event with \texttt{saga\_id}; Service~A checks \texttt{saga.status} and ignores compensation events once \texttt{CANCELED}.
+  \item \textbf{Saga State \& Correlation IDs}: Tag every event with \texttt{saga\_id}; Service~A checks \texttt{saga.status} and ignores compensation events once \texttt{CANCELED}.
   \item \textbf{Distinct Event Semantics}: Distinguish \texttt{DriverReleasedForRetry} from \texttt{DriverReleasedOnAbort}.
   \item \textbf{Switch to Orchestration}: Let Temporal/Step Functions drive explicit commands (\texttt{ReleaseDriver}) and transition cleanly to \texttt{FAILED}.
 \end{enumerate}
@@ -340,7 +340,7 @@ return 0 -- Ignore stale or duplicate out-of-order replay
   \item The Lua snippet in Solution~\thechapter.3 solves this directly: comparing \texttt{2 > 3} evaluates to \texttt{false} and returns \texttt{0} without modifying \texttt{balance=120.0}.
 \end{enumerate}
 
-\begin{labbridgebox}[Outbox Relay & Microservices Integration]
+\begin{labbridgebox}[Outbox Relay \& Microservices Integration]
 Run \texttt{exercises/volume4/ex03\_outbox\_pattern\_relay.py} for SQLite atomic outbox relay verification, and inspect \texttt{projects/p11-event-driven-microservices} (\texttt{src/cdc\_relay.py}, \texttt{src/order\_service.py}, \texttt{src/inventory\_consumer.py}) plus \texttt{projects/p12-end-to-end-platform}.
 \end{labbridgebox}
 

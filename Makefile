@@ -34,8 +34,8 @@ volume-5:
 
 master:
 	@echo "==> Compiling master-textbook.pdf..."
-	cd latex/master && pdflatex -interaction=nonstopmode master-textbook.tex && pdflatex -interaction=nonstopmode master-textbook.tex
+	cd latex/master && pdflatex -interaction=nonstopmode master-textbook.tex && bibtex master-textbook && pdflatex -interaction=nonstopmode master-textbook.tex && pdflatex -interaction=nonstopmode master-textbook.tex
 	cp latex/master/master-textbook.pdf ./master-textbook.pdf
 
 clean:
-	rm -f latex/*/*.aux latex/*/*.log latex/*/*.out latex/*/*.toc
+	rm -f latex/*/*.aux latex/*/*.log latex/*/*.out latex/*/*.toc latex/*/*.bbl latex/*/*.blg

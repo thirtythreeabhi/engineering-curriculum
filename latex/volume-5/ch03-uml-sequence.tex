@@ -167,7 +167,7 @@ As covered in Volume~II, Chapter~7, distributed tracing tools (OpenTelemetry, Ja
 
 \section{Modeling Concurrency Bugs---and Their Fixes}
 
-Suppose an account holds $\$100$, and two concurrent withdrawal requests ($R_1$ and $R_2$, each for $\$100$) arrive 2 milliseconds apart. Without locking, both requests read `balance = $100` before either writes back `balance = $0`. Figure~\ref{fig:v5-ch03-double-spend} exposes this **Time-of-Check to Time-of-Use (TOCTOU)** race window.
+Suppose an account holds $\$100$, and two concurrent withdrawal requests ($R_1$ and $R_2$, each for $\$100$) arrive 2 milliseconds apart. Without locking, both requests read a balance of $\$100$ before either writes back the literal balance \texttt{0}. Figure~\ref{fig:v5-ch03-double-spend} exposes this **Time-of-Check to Time-of-Use (TOCTOU)** race window.
 
 \begin{figure}[htbp]
 \centering
@@ -212,7 +212,7 @@ Suppose an account holds $\$100$, and two concurrent withdrawal requests ($R_1$ 
 \label{fig:v5-ch03-double-spend}
 \end{figure}
 
-To close that race window, we wrap each transaction in a PostgreSQL row-level exclusive lock (\texttt{SELECT ... FOR UPDATE}, detailed in Volume~I, Chapter~4). Modeling that inside a UML \texttt{critical} fragment (Figure~\ref{fig:v5-ch03-double-spend-fixed}) proves visually why $R_2$ blocks on the database lock until $R_1$ commits, forcing $R_2$ to see `balance = $0` and reject cleanly.
+To close that race window, we wrap each transaction in a PostgreSQL row-level exclusive lock (\texttt{SELECT ... FOR UPDATE}, detailed in Volume~I, Chapter~4). Modeling that inside a UML \texttt{critical} fragment (Figure~\ref{fig:v5-ch03-double-spend-fixed}) proves visually why $R_2$ blocks on the database lock until $R_1$ commits, forcing $R_2$ to see \texttt{balance = 0} and reject cleanly.
 
 \begin{figure}[htbp]
 \centering
@@ -266,7 +266,7 @@ Suppose Service~A calls Service~B with a 5-second timeout and 2 retries, while S
 
 \begin{realworldbox}[Diagnostic Walkthrough: Eliminating Duplicate Charges via Idempotency Keys]
 \textbf{Symptoms:} Mobile users on spotty cellular networks tap ``Pay \$49'' once, see a spinner stall, and tap ``Pay'' a second time. Support receives tickets for duplicate card charges.\\
-\textbf{Logs & Metrics:} Gateway logs show two requests from the same cart arriving 1.4 seconds apart, both returning \texttt{201 Created} with different \texttt{charge\_id}s:
+\textbf{Logs \& Metrics:} Gateway logs show two requests from the same cart arriving 1.4 seconds apart, both returning \texttt{201 Created} with different \texttt{charge\_id}s:
 \texttt{POST /v1/charges cart=c\_91 status=201 charge=ch\_01} followed by
 \texttt{POST /v1/charges cart=c\_91 status=201 charge=ch\_02}.\\
 \textbf{Root Cause:} Because the mobile client lost its TCP connection before receiving \texttt{ch\_01}'s reply, the retry looked like a brand-new payment request to the server.\\
@@ -288,7 +288,7 @@ Draft a sequence diagram across three lifelines---\texttt{:Coordinator}, \texttt
   \item \textbf{Temporal Clarity}: Sequence diagrams expose message ordering, execution intervals, and race windows that static C4 views cannot show.
   \item \textbf{Exact Arrow Notation}: Filled triangle ($\blacktriangleright$) for synchronous calls, solid open stick ($\rightarrow$) for asynchronous fire-and-forget signals, and dashed open stick ($\dashrightarrow$) for replies.
   \item \textbf{Combined Fragments}: Model branching (\texttt{alt}/\texttt{opt}), retries and early exits (\texttt{loop}/\texttt{break}), concurrency (\texttt{par}), and row locks (\texttt{critical}).
-  \item \textbf{Concurrency & Timeout Safety}: Use \texttt{SELECT ... FOR UPDATE}, idempotency keys, and \texttt{grpc-timeout} deadline propagation to prevent double-spends and retry storms.
+  \item \textbf{Concurrency \& Timeout Safety}: Use \texttt{SELECT ... FOR UPDATE}, idempotency keys, and \texttt{grpc-timeout} deadline propagation to prevent double-spends and retry storms.
 \end{itemize}
 
 \section{Exercises}
@@ -349,7 +349,7 @@ Figure~\ref{fig:v5-ch03-2pc-solution} models the Two-Phase Commit coordinator cr
 \label{fig:v5-ch03-2pc-solution}
 \end{figure}
 
-\subsection*{Mechanics, Debugging & Architecture Solutions}
+\subsection*{Mechanics, Debugging \& Architecture Solutions}
 \begin{enumerate}[label=\textbf{Solution~\thechapter.\arabic*}, leftmargin=*]
   \item An \texttt{alt} block guarantees mutual exclusion: at most one branch runs. Two consecutive \texttt{opt} blocks are evaluated independently; if the first \texttt{opt} changes a flag or balance, the second \texttt{opt}'s guard may also become true, executing both paths illegally.
   \item When \texttt{break}'s guard evaluates true, its body runs and execution jumps immediately out of the enclosing \texttt{loop(1, 5)} frame, skipping all remaining loop iterations.

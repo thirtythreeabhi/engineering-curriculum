@@ -261,7 +261,7 @@ An operations team sees \emph{RabbitMQ Memory High Watermark Exceeded} while 10 
 \subsection*{Exercise~\thechapter.3 (Architecture): Multi-Tenant Webhook Dispatcher}
 Design a distributed webhook delivery pipeline dispatching 50 million webhooks/day to arbitrary third-party URLs. Address customer endpoint timeouts, 72-hour exponential retry scheduling, and noisy-neighbor isolation so one slow customer cannot starve healthy ones.
 
-\subsection*{Exercise~\thechapter.4 (Try-It-Yourself Lab): Exception Rollback & Tombstone Handler}
+\subsection*{Exercise~\thechapter.4 (Try-It-Yourself Lab): Exception Rollback \& Tombstone Handler}
 Solve both parts of the \emph{Try It Yourself} box above.
 
 \section{Detailed Solutions}
@@ -307,7 +307,7 @@ def apply_user_event(cache: dict, key: str, value: dict | None) -> None:
   \end{lstlisting}
 \end{enumerate}
 
-\begin{labbridgebox}[Outbox Relay & End-to-End Microservice Messaging]
+\begin{labbridgebox}[Outbox Relay \& End-to-End Microservice Messaging]
 Practice atomic local writes and at-least-once relay mechanics in \texttt{exercises/volume4/ex03\_outbox\_pattern\_relay.py}, and explore full queue + DLQ + idempotent inventory consumption in \texttt{projects/p11-event-driven-microservices}.
 \end{labbridgebox}
 

@@ -18,7 +18,7 @@ No prior GPU hardware, Transformer math, or floating-point bit-layout background
 A team deploys an open-weight LLaMA-3-70B customer support assistant using standard Hugging Face Transformers on an 8$\times$80~GB A100 node (\$24/hour). The GPU runs Out Of Memory (OOM) at just 12 concurrent user chats. Reaching their peak load of 600 chats naively would demand 50 GPU nodes costing \$864,000/month. By switching to vLLM, FP8 quantization, and continuous batching, they handle all 600 chats on two nodes (\$34,560/month)---a $25\times$ cost drop. To engineer that win yourself, you first need to see what happens inside GPU silicon and attention layers.
 \end{chaptergoalsbox}
 
-\section{Bridge 1: GPU Memory Hierarchy & Floating-Point Precision}
+\section{Bridge 1: GPU Memory Hierarchy \& Floating-Point Precision}
 
 Before examining inference engines, look at how a modern GPU moves bytes and stores numbers.
 
@@ -27,7 +27,7 @@ Before examining inference engines, look at how a modern GPU moves bytes and sto
 Inside an NVIDIA H100 SXM5 GPU sit two very different memories:
 \begin{itemize}[leftmargin=18pt]
   \item \textbf{HBM3 (High Bandwidth Memory)}: A large 80~GB warehouse holding model weights and conversation caches. Its bus transfers up to **$3.35\text{ TB/s}$** ($3,350\text{ GB/s}$)---fast compared to CPU RAM, yet slow relative to the math cores.
-  \item \textbf{On-Chip SRAM & Tensor Cores}: Tiny, ultra-fast scratchpad buffers (tens of megabytes) sitting inches from the **Tensor Cores** (specialized matrix-multiply circuits). Tensor Cores on an H100 SXM5 deliver up to **$989.4\text{ TFLOPS}$** of **dense FP16/BF16** compute ($1,979\text{ TFLOPS}$ with 2:4 structured sparsity), and **$1,979\text{ TFLOPS}$** of **dense FP8** compute ($3,958\text{ TFLOPS}$ sparse).
+  \item \textbf{On-Chip SRAM \& Tensor Cores}: Tiny, ultra-fast scratchpad buffers (tens of megabytes) sitting inches from the **Tensor Cores** (specialized matrix-multiply circuits). Tensor Cores on an H100 SXM5 deliver up to **$989.4\text{ TFLOPS}$** of **dense FP16/BF16** compute ($1,979\text{ TFLOPS}$ with 2:4 structured sparsity), and **$1,979\text{ TFLOPS}$** of **dense FP8** compute ($3,958\text{ TFLOPS}$ sparse).
 \end{itemize}
 Every number must be hauled from the HBM3 warehouse onto the SRAM workbench before Tensor Cores can multiply it.
 
@@ -188,7 +188,7 @@ Pairing PagedAttention with **Continuous Batching** swaps finished requests out 
 
 \begin{itemize}[leftmargin=18pt]
   \item \textbf{Speculative Decoding (Exact Distribution Preservation)}: A tiny fast draft model proposes $K=5$ candidate tokens in sequence; the large target model verifies all $K$ tokens in *one parallel compute-bound pass*. Each draft token is accepted with probability $\alpha = \min(1, P_{\text{target}}(x)/P_{\text{draft}}(x))$. Whenever a token is rejected, the engine resamples from the normalized residual $\max(0, P_{\text{target}}(x) - P_{\text{draft}}(x))$---mathematically guaranteeing the **exact same output probability distribution** as running the target model alone, with $2\times$--$3\times$ lower latency when acceptance is high.
-  \item \textbf{Quantization (FP8 E4M3 & AWQ INT4)}: Compressing 70B weights from FP16 ($140\text{ GB}$) to FP8 ($70\text{ GB}$) or AWQ INT4 ($35\text{ GB}$, which protects the top $1\%$ most active weight channels) halves HBM3 bandwidth trips per token with $<0.5\%$ perplexity impact.
+  \item \textbf{Quantization (FP8 E4M3 \& AWQ INT4)}: Compressing 70B weights from FP16 ($140\text{ GB}$) to FP8 ($70\text{ GB}$) or AWQ INT4 ($35\text{ GB}$, which protects the top $1\%$ most active weight channels) halves HBM3 bandwidth trips per token with $<0.5\%$ perplexity impact.
   \item \textbf{RadixAttention (Prefix Caching)}: In RAG or chat, prompts often share a 2,500-token system prompt or policy header. SGLang/vLLM stores past KV pages in a **radix tree** (prefix tree): when a new request starts with the same 2,500 tokens, the engine reuses the cached KV pages immediately and runs prefill only on the remaining unique user suffix, cutting TTFT by up to $90\%$.
 \end{itemize}
 
@@ -249,7 +249,7 @@ An 8$\times$H100 node provides $640\text{ GiB}$ usable VRAM budget: $70\text{ Gi
 \section{Summary \protect\& Key Takeaways}
 
 \begin{itemize}[leftmargin=18pt]
-  \item \textbf{Hardware & Precision}: HBM3 bandwidth ($3.35\text{ TB/s}$) limits decode; SRAM and Tensor Cores ($989.4\text{ TFLOPS}$ dense FP16 / $1,979\text{ TFLOPS}$ dense FP8) govern prefill.
+  \item \textbf{Hardware \& Precision}: HBM3 bandwidth ($3.35\text{ TB/s}$) limits decode; SRAM and Tensor Cores ($989.4\text{ TFLOPS}$ dense FP16 / $1,979\text{ TFLOPS}$ dense FP8) govern prefill.
   \item \textbf{KV Cache Scaling}: Memory grows linearly with context and layers; GQA and FP8 shrink footprints by $8\times$--$16\times$.
   \item \textbf{Serving Engine Stack}: Combine PagedAttention (zero fragmentation), Continuous Batching (no padding bubbles), Quantization, and RadixAttention prefix caching.
   \item \textbf{Honest Break-Even}: Always divide 24/7 cluster spend by *real* daily token volume, not peak theoretical tokens/second.
@@ -285,7 +285,7 @@ An 8$\times$H100 node provides $640\text{ GiB}$ usable VRAM budget: $70\text{ Gi
   $$\left\lfloor \frac{540\text{ GiB}}{1.25\text{ GiB/stream}} \right\rfloor = \mathbf{432\text{ concurrent user streams}}$$
 \end{enumerate}
 
-\subsection*{Mechanics, Debugging & Architecture Solutions}
+\subsection*{Mechanics, Debugging \& Architecture Solutions}
 \begin{enumerate}[label=\textbf{Solution~\thechapter.\arabic*}, leftmargin=*]
   \item MHA formula: $2 \times 64 \times 6,144 \times 4,096 \times 2 = 6,442,450,944\text{ bytes}$. Dividing by $1024^2 = 1,048,576$ gives $\mathbf{6,144\text{ MiB}} = \mathbf{6.00\text{ GiB}}$.
   \item Minimum memory-transfer time per decode step:

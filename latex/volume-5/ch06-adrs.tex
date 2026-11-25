@@ -261,7 +261,7 @@ gRPC/REST services so mobile clients fetch exact required fields in one round-tr
   requiring query-depth and complexity limits in the gateway.
 \end{lstlisting}
 
-\subsection*{Mechanics, Debugging & Architecture Solutions}
+\subsection*{Mechanics, Debugging \& Architecture Solutions}
 \begin{enumerate}[label=\textbf{Solution~\thechapter.\arabic*}, leftmargin=*]
   \item The five states are **Proposed, Accepted, Rejected, Superseded, Deprecated**. To replace an Accepted ADR, commit a new numbered ADR with \texttt{Status: Accepted} and \texttt{Supersedes: [old-adr]}, and in the same PR change only the header of the old ADR to \texttt{Superseded by [new-adr]}.
   \item (1) **Version parity** across branches and historical tags, (2) **Pull-request peer review** alongside code changes, (3) **Local searchability** (\texttt{git grep}) and immunity to corporate wiki migrations/link rot.

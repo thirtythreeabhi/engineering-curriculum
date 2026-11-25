@@ -409,7 +409,7 @@ etcdserver: failed to send out heartbeat on time (took 240ms, exceeded 100ms)
 
 \section{Exercises}
 
-\subsection*{Exercise~\thechapter.1 (Mechanics): Raft Partition & Split Quorum}
+\subsection*{Exercise~\thechapter.1 (Mechanics): Raft Partition \& Split Quorum}
 Consider a Raft cluster of 5 nodes ($N_1, N_2, N_3, N_4, N_5$). The cluster is partitioned into two subnets: $\{N_1, N_2\}$ and $\{N_3, N_4, N_5\}$.
 \begin{enumerate}[leftmargin=18pt]
   \item Can $\{N_1, N_2\}$ elect a new leader? Show the quorum calculation.
@@ -423,7 +423,7 @@ An engineer configures a legacy 3-node cluster with a split-brain guard paramete
 \subsection*{Exercise~\thechapter.3 (Architecture): Real-Time Collaborative Editor}
 You are designing a globally distributed collaborative text editor where users in Tokyo and New York edit the same paragraph simultaneously with $0\text{ ms}$ local keystroke lag. Explain why Raft/Spanner is unsuitable for keystroke replication and architect a solution using CRDTs.
 
-\subsection*{Exercise~\thechapter.4 (Try-It-Yourself Lab): Quorum Math & Log Truncation}
+\subsection*{Exercise~\thechapter.4 (Try-It-Yourself Lab): Quorum Math \& Log Truncation}
 Solve both parts of the \emph{Try It Yourself} box above.
 
 \section{Detailed Solutions}

@@ -165,7 +165,7 @@ An alert fires only when \emph{both} the long window (e.g., 1h) and the short wi
 
 \section{Prometheus Counters, \texttt{rate()}, and Counter Resets}
 
-Before writing PromQL alert rules, we must understand what a Prometheus **Counter** actually stores. A Counter is a cumulative number that starts at `0` when an application pod boots and only ever goes up (e.g., `http_requests_total`).
+Before writing PromQL alert rules, we must understand what a Prometheus **Counter** actually stores. A Counter is a cumulative number that starts at `0` when an application pod boots and only ever goes up (e.g., \texttt{http\_requests\_total}).
 
 Suppose one pod records these cumulative counts every 15 seconds, and crashes/restarts at $t = 20\text{ s}$:
 $$t=0\text{ s}: 100 \quad\longrightarrow\quad t=15\text{ s}: 160 \quad\longrightarrow\quad \text{[pod restarts at 20s!]} \quad\longrightarrow\quad t=30\text{ s}: 20 \quad\longrightarrow\quad t=45\text{ s}: 80$$
@@ -173,7 +173,7 @@ If you naively subtracted end minus start ($80 - 100 = -20$), you would report n
 \begin{enumerate}[leftmargin=18pt]
   \item \textbf{Counter Reset Detection}: Whenever a sample is smaller than the previous sample ($20 < 160$), \texttt{rate()} assumes the process restarted and adds back the pre-crash counter value ($160$):
   $$\Delta = (160 - 100) + 20 + (80 - 20) = 60 + 20 + 60 = 140\text{ requests}$$
-  \item \textbf{Per-Second Rate & Extrapolation}: \texttt{rate()} divides $\Delta$ by the time span between samples (45 s $\rightarrow$ $140 / 45 \approx 3.11\text{ req/s}$, and extrapolates slightly to the window edges if needed).
+  \item \textbf{Per-Second Rate \& Extrapolation}: \texttt{rate()} divides $\Delta$ by the time span between samples (45 s $\rightarrow$ $140 / 45 \approx 3.11\text{ req/s}$, and extrapolates slightly to the window edges if needed).
   \item \textbf{Aggregation Across Pods}: Wrapping \texttt{sum(rate(...))} adds the per-second rates across all running replicas without mixing individual pod restarts.
 \end{enumerate}
 
@@ -240,7 +240,7 @@ An error budget without consequences is trivia. Table~\ref{tab:v5-ch05-budget-po
 
 \begin{realworldbox}[Diagnostic Walkthrough: Catching a Silent 1.8\% Error Bleed]
 \textbf{Symptoms:} Customers report intermittent checkout failures on Tuesday afternoon, while the legacy static CPU and $5\%$ error-rate alerts remain silent.\\
-\textbf{Metrics & Logs:} Running the new PromQL burn-rate expression returns \texttt{error\_ratio\_1h = 0.018} ($1.8\%$) and \texttt{error\_ratio\_5m = 0.019} against a $99.9\%$ SLO ($0.001$ budget). The burn rate is $B = 0.018 / 0.001 = 18.0\times$, exceeding the $14.4\times$ page threshold. Pod logs show \texttt{OOMError / ConnectionReset} in build \texttt{v2.14.0} deployed at 13:10 UTC.\\
+\textbf{Metrics \& Logs:} Running the new PromQL burn-rate expression returns \texttt{error\_ratio\_1h = 0.018} ($1.8\%$) and \texttt{error\_ratio\_5m = 0.019} against a $99.9\%$ SLO ($0.001$ budget). The burn rate is $B = 0.018 / 0.001 = 18.0\times$, exceeding the $14.4\times$ page threshold. Pod logs show \texttt{OOMError / ConnectionReset} in build \texttt{v2.14.0} deployed at 13:10 UTC.\\
 \textbf{Remediation:} Multi-window alerting pages within 8 minutes of deployment instead of 5 days later. The team rolls back to \texttt{v2.13.9}, spending only $3\%$ of the monthly error budget instead of $100\%$, and invokes the Error Budget Policy to add automated canary rollback checks before re-enabling feature deploys.
 \end{realworldbox}
 
@@ -298,7 +298,7 @@ An online banking API maintains a $99.95\%$ monthly availability SLO ($1 - \text
   $$T_{\text{exhaust}} = \frac{720\text{ hours}}{20.0} = 36\text{ hours} \quad (1.5\text{ days})$$
 \end{enumerate}
 
-\subsection*{Mechanics, Debugging & Architecture Solutions}
+\subsection*{Mechanics, Debugging \& Architecture Solutions}
 \begin{enumerate}[label=\textbf{Solution~\thechapter.\arabic*}, leftmargin=*]
   \item Permissible failures: $120,000,000 \times (1 - 0.999) = 120,000,000 \times 0.001 = 120,000\text{ failed requests}$.
   \item For $B = 6.0$, $W = 6\text{ h}$, $T_{\text{SLO}} = 720\text{ h}$:

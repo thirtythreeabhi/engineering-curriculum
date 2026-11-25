@@ -230,7 +230,7 @@ An engineer who averages the two server averages computes:
 $$\text{Naive Mean-of-Means} = \frac{10 + 110}{2} = 60\text{ ms}$$
 That number is mathematically wrong because Server B carried $9\times$ more traffic than Server A. The true fleet average weights each server by its request count:
 $$\text{True Weighted Mean} = \frac{(100 \times 10) + (900 \times 110)}{100 + 900} = \frac{1,000 + 99,000}{1,000} = \frac{100,000}{1,000} = 100\text{ ms}$$
-The exact same warning applies to percentiles: you can \textbf{never} average \texttt{p99} across two servers (`(p99_A + p99_B)/2` is invalid). Always merge the raw histogram buckets across servers first, then read the percentile from the combined counts.
+The exact same warning applies to percentiles: you can \textbf{never} average \texttt{p99} across two servers (\texttt{(p99\_A + p99\_B)/2} is invalid). Always merge the raw histogram buckets across servers first, then read the percentile from the combined counts.
 
 \begin{commonmistakebox}[Coordinated Omission in Load Testing]
 Coordinated Omission (coined by Gil Tene) happens when a naive load generator waits for the previous request to finish before sending the next one. If the server freezes for 5 seconds during a garbage-collection pause, the benchmark script pauses too, recording only one 5-second request and omitting the thousands of requests that real users would have sent during that freeze. Use open-loop generators such as \texttt{wrk2} or \texttt{k6} constant-arrival-rate executors that fire requests on an independent clock regardless of server stalls.
@@ -365,8 +365,8 @@ When an entire availability zone or database disk is lost, recovery requirements
 
 \begin{realworldbox}[Diagnostic Walkthrough: E-Commerce Fan-Out Tail Cascade]
 \textbf{Symptoms:} During a seasonal sale, checkout conversion drops 18\% while the primary dashboard shows \texttt{HTTP 200} availability at $99.98\%$ and median latency flat at \texttt{p50 = 22 ms}.\\
-\textbf{Metrics & Logs:} Inspecting the latency histogram shows \texttt{p99} jumped from $140\text{ ms}$ to $2,400\text{ ms}$. Distributed trace logs show the product page synchronously fans out to $n = 35$ microservices, and \texttt{recommendation-svc} logs:
-\texttt{level=warn svc=recommendation-svc msg="redis_cache_miss_storm" p99_ms=850}.\\
+\textbf{Metrics \& Logs:} Inspecting the latency histogram shows \texttt{p99} jumped from $140\text{ ms}$ to $2,400\text{ ms}$. Distributed trace logs show the product page synchronously fans out to $n = 35$ microservices, and \texttt{recommendation-svc} logs:
+\texttt{level=warn svc=recommendation-svc msg="redis\_cache\_miss\_storm" p99\_ms=850}.\\
 \textbf{Root Cause:} Even though only $1\%$ of \texttt{recommendation-svc} calls took $850\text{ ms}$, across $n = 35$ parallel fan-out calls per page load, $P(\text{slow}) = 1 - 0.99^{35} = 29.7\%$ of shoppers waited on the slow tail, triggering frontend timeouts.\\
 \textbf{Remediation:} Engineers flipped a load-shedding feature flag skipping optional recommendations whenever \texttt{recommendation-svc} exceeded a $150\text{ ms}$ deadline, dropping checkout \texttt{p99} back to $130\text{ ms}$ within two minutes.
 \end{realworldbox}
@@ -421,7 +421,7 @@ A webhook dispatcher delivers $\lambda = 1,200\text{ webhooks/second}$ to mercha
   Because $1,200\text{ webhooks/s}$ arrive while only $111.1\text{/s}$ finish, $1,088.9\text{ webhooks/s}$ accumulate in the queue every second until memory/queue caps trip and deliveries fail or time out. (Remediation: enforce strict per-merchant HTTP timeouts and isolate slow merchants into separate dead-letter/low-priority queues.)
 \end{enumerate}
 
-\subsection*{Mechanics & Debugging Solutions}
+\subsection*{Mechanics \& Debugging Solutions}
 \begin{enumerate}[label=\textbf{Solution~\thechapter.\arabic*}, leftmargin=*]
   \item Total minutes in a 365-day year: $365 \times 24 \times 60 = 525,600\text{ minutes}$. Permissible downtime fraction is $1 - 0.9995 = 0.0005$:
   $$\text{Downtime} = 525,600 \times 0.0005 = 262.8\text{ minutes } (4\text{ h } 22\text{ m } 48\text{ s})$$

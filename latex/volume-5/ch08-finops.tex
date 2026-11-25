@@ -222,7 +222,7 @@ spec:
 
 \begin{realworldbox}[Diagnostic Walkthrough: Fixing 18\% Cluster Utilization with Karpenter]
 \textbf{Symptoms:} Monthly EKS infrastructure spend grows 45\% in a quarter while average cluster CPU utilization sits at just $18\%$, yet new deploys stick in \texttt{Pending} state.\\
-\textbf{Metrics & Logs:} \texttt{kube-state-metrics} reveals \texttt{sum(kube\_pod\_container\_resource\_requests\{resource="cpu"\}) / sum(kube\_node\_status\_allocatable\{resource="cpu"\}) = 0.89} ($89\%$ requested, $18\%$ used), and \texttt{kubectl describe pod} prints \texttt{0/12 nodes available: 12 Insufficient memory} due to rigid homogeneous \texttt{m5.2xlarge} node groups.\\
+\textbf{Metrics \& Logs:} \texttt{kube-state-metrics} reveals \texttt{sum(kube\_pod\_container\_resource\_requests\{resource="cpu"\}) / sum(kube\_node\_status\_allocatable\{resource="cpu"\}) = 0.89} ($89\%$ requested, $18\%$ used), and \texttt{kubectl describe pod} prints \texttt{0/12 nodes available: 12 Insufficient memory} due to rigid homogeneous \texttt{m5.2xlarge} node groups.\\
 \textbf{Remediation:} Engineers rightsized pod \texttt{requests} to actual \texttt{p95} metrics and replaced fixed Auto Scaling Groups with **Karpenter** (dynamic node provisioner choosing exact mixed x86/Graviton instance sizes per pending pod batch). Karpenter consolidated 12 half-empty nodes into 5 tightly packed Graviton nodes, cutting monthly compute spend by over $30\%$.
 \end{realworldbox}
 
@@ -281,7 +281,7 @@ An application writes $50\text{ TB}$ ($50,000\text{ GB}$) of raw logs every mont
   \end{itemize}
 \end{enumerate}
 
-\subsection*{Mechanics, Debugging & Architecture Solutions}
+\subsection*{Mechanics, Debugging \& Architecture Solutions}
 \begin{enumerate}[label=\textbf{Solution~\thechapter.\arabic*}, leftmargin=*]
   \item $U_{\text{break}} = \$0.218 / \$0.384 \approx 0.5677$ ($56.77\%$), or $0.5677 \times 24 \approx 13.62\text{ hours/day}$.
   \item $2,048\text{ GiB} \times \$0.08/\text{GiB-mo} = \$163.84/\text{mo}$; over 6 months, waste is $\$163.84 \times 6 = \mathbf{\$983.04}$.

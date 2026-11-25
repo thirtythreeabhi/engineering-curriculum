@@ -252,7 +252,7 @@ Consensus stores like ZooKeeper and \texttt{etcd} provide native monotonic count
 \textbf{Takeaway:} Even though Redis expired the lock and Worker~A woke up mid-job, storage-side fencing (\texttt{412 <= 413}) caught and blocked the stale write before any duplicate charge reached Stripe.
 \end{realworldbox}
 
-\begin{tryityourselfbox}[Trace Watchdog Renewal & Storage Fencing Failure]
+\begin{tryityourselfbox}[Trace Watchdog Renewal \& Storage Fencing Failure]
 \begin{enumerate}[leftmargin=18pt]
   \item In \texttt{LockWatchdog} above, suppose \texttt{ttl\_ms = 9000}. At $t=0$, Worker~A acquires the lock. At $t=3\text{ s}$ and $t=6\text{ s}$, renewals succeed. At $t=7\text{ s}$, Worker~A receives \texttt{SIGSTOP} for $12\text{ s}$ (until $t=19\text{ s}$). At exactly what timestamp $t$ does Redis expire the lock?
   \item Suppose a storage service forgets to check \texttt{fencing\_token} on \texttt{DELETE} operations, checking it only on \texttt{UPDATE}. Describe how Client~1 waking up with token~33 can still corrupt Client~2's work.
@@ -288,7 +288,7 @@ class BadLock:
 \subsection*{Exercise~\thechapter.3 (Architecture): Exactly-Once Nightly Billing Across 50 Pods}
 Design a nightly 02:00 AM billing system across 50 Kubernetes pods using PostgreSQL advisory locks, optimistic row-version fencing, and payment gateway idempotency keys to guarantee zero duplicate charges during rolling deploys.
 
-\subsection*{Exercise~\thechapter.4 (Try-It-Yourself Lab): Lease Expiry Timing & Fencing Gaps}
+\subsection*{Exercise~\thechapter.4 (Try-It-Yourself Lab): Lease Expiry Timing \& Fencing Gaps}
 Solve both parts of the \emph{Try It Yourself} box above.
 
 \section{Detailed Solutions}
@@ -308,7 +308,7 @@ end
 
 \subsection*{Solution to Exercise~\thechapter.2}
 \textbf{Bug 1 (No TTL):} \texttt{redis.set(key, "1", nx=True)} sets no expiration. If the lock holder crashes or is OOM-killed, \texttt{key} stays in Redis forever and all other pods spin permanently in \texttt{while not ...}.\\
-\textbf{Bug 2 (Blind Delete & Static Token):} Storing static \texttt{"1"} and calling \texttt{redis.delete(key)} lets a stalled worker delete a newer worker's active lock.
+\textbf{Bug 2 (Blind Delete \& Static Token):} Storing static \texttt{"1"} and calling \texttt{redis.delete(key)} lets a stalled worker delete a newer worker's active lock.
 
 \subsection*{Solution to Exercise~\thechapter.3}
 \begin{enumerate}[leftmargin=18pt]
@@ -323,7 +323,7 @@ end
   \item Client~2 writes a valid record with token~34; Client~1 wakes up with stale token~33 and executes an unguarded \texttt{DELETE} that erases Client~2's newly written record. Fencing must protect *every* mutating operation (\texttt{INSERT}, \texttt{UPDATE}, and \texttt{DELETE}).
 \end{enumerate}
 
-\begin{labbridgebox}[Fencing Token Lab & Production Locking]
+\begin{labbridgebox}[Fencing Token Lab \& Production Locking]
 Run \texttt{exercises/volume4/ex04\_distributed\_lock\_fencing.py} to verify how \texttt{FencedStorageService.write()} rejects stale token~1 after Client~2 acquires token~2, and inspect Redis-backed idempotency locking inside \texttt{projects/p12-end-to-end-platform}.
 \end{labbridgebox}
 

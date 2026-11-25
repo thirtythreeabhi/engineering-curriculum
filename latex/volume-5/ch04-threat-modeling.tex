@@ -289,7 +289,7 @@ Identify at least one applicable threat and concrete countermeasure for each.
   \emph{Threat (Elevation of Privilege / DoS):} A crafted malicious PDF exploits a vulnerability in the OCR C-library (e.g., Ghostscript/Poppler RCE or decompression zip-bomb), giving the attacker access to Lambda's IAM role. \emph{Mitigation:} Scope Lambda's IAM role strictly to \texttt{s3:GetObject} on the single bucket, enforce short execution timeouts and memory limits, and sanitize/sandbox PDF rendering in an isolated runtime.
 \end{enumerate}
 
-\subsection*{Mechanics, Debugging & Architecture Solutions}
+\subsection*{Mechanics, Debugging \& Architecture Solutions}
 \begin{enumerate}[label=\textbf{Solution~\thechapter.\arabic*}, leftmargin=*]
   \item An External Entity (a customer's laptop or third-party vendor) sits outside our administrative and network control. We cannot patch their OS or encrypt their local RAM; therefore, we only model how they interact across our boundary (Spoofing identity at our perimeter, or Repudiating actions sent to us).
   \item \textbf{Kerckhoffs's principle} states that a security system should remain secure even if an adversary possesses full knowledge of its design and source code, needing only the secret cryptographic keys to remain hidden. Microsoft deprecated **DREAD** around 2008 because its subjective 1--10 scores (especially Discoverability and Damage) produced inconsistent ratings across reviewers; **CVSS** replaces guesswork with standardized, verifiable vector metrics.

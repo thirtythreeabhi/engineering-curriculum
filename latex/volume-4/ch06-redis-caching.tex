@@ -401,7 +401,7 @@ def update_user_email(user_id, new_email):
 \subsection*{Exercise~\thechapter.3 (Architecture): Global Distributed Rate Limiter}
 Design a Redis rate limiter enforcing 1,000 requests/minute per API key across 200 frontend servers. Compare a \texttt{ZSET} sliding-window log vs. a Lua Token Bucket using \texttt{HSET}, and write the Lua script.
 
-\subsection*{Exercise~\thechapter.4 (Try-It-Yourself Lab): XFetch Probability & \texttt{listpack}}
+\subsection*{Exercise~\thechapter.4 (Try-It-Yourself Lab): XFetch Probability \& \texttt{listpack}}
 Solve both parts of the \emph{Try It Yourself} box above.
 
 \section{Detailed Solutions}
@@ -454,7 +454,7 @@ end
   \item In \texttt{ziplist}, each entry's \texttt{prevlen} field grew from 1 to 5 bytes whenever the preceding entry crossed 254 bytes, forcing $O(N^2)$ cascading reallocations across all following entries. In \texttt{listpack}, each entry stores only its own length at its tail, decoupling neighbors so updates never cascade.
 \end{enumerate}
 
-\begin{labbridgebox}[Redis Caching & Idempotency in Production]
+\begin{labbridgebox}[Redis Caching \& Idempotency in Production]
 Inspect live Redis~7 caching and Lua/key invalidation alongside PostgreSQL and RabbitMQ inside \texttt{projects/p12-end-to-end-platform} (port 6379).
 \end{labbridgebox}
 

@@ -97,7 +97,7 @@ Figure~\ref{fig:v5-ch02-l1-context} shows the resulting System Context view: not
 \node[person] (merchant) {\textbf{Merchant}\\ \scriptsize[Person]\\ \raggedright Lists goods online and tracks daily payouts.};
 \node[system, right=2.0cm of merchant] (paycore) {\textbf{Global Payments Platform}\\ \scriptsize[Software System]\\ \raggedright Authorizes cards, holds escrow, and settles merchant payouts.};
 \node[extsystem, right=2.0cm of paycore] (bank) {\textbf{Banking Rails / ACH}\\ \scriptsize[External System]\\ \raggedright Inter-bank clearinghouse executing bulk transfers.};
-\node[extsystem, above=1.4cm of paycore] (fraud) {\textbf{Third-Party Fraud API}\\ \scriptsize[External System]\\ \raggedright Real-time anti-money-laundering & risk scoring.};
+\node[extsystem, above=1.4cm of paycore] (fraud) {\textbf{Third-Party Fraud API}\\ \scriptsize[External System]\\ \raggedright Real-time anti-money-laundering \& risk scoring.};
 \node[person, below=1.4cm of merchant] (buyer) {\textbf{Shopper}\\ \scriptsize[Person]\\ \raggedright Pays for orders at checkout.};
 
 \draw[arrow] (merchant) -- node[above, font=\tiny\sffamily, align=center]{Views reports\\{[HTTPS]}} (paycore);
@@ -130,7 +130,7 @@ Figure~\ref{fig:v5-ch02-l2-container} zooms inside our \texttt{Global Payments P
 
 \node[cnt] (web) at (1.6, 0.4) {\textbf{Merchant Web App}\\ \textit{[Container: React / TypeScript]}\\ Serves dashboard UI in browser.};
 \node[cnt] (api) at (6.5, 0.4) {\textbf{API Gateway}\\ \textit{[Container: Go / Envoy]}\\ Routing, JWT check, rate limits.};
-\node[cnt] (order) at (6.5, -2.1) {\textbf{Settlement Service}\\ \textit{[Container: Java / Spring Boot]}\\ Orchestrates ledger & payouts.};
+\node[cnt] (order) at (6.5, -2.1) {\textbf{Settlement Service}\\ \textit{[Container: Java / Spring Boot]}\\ Orchestrates ledger \& payouts.};
 \node[db] (sqldb) at (11.0, -2.1) {\textbf{Ledger DB}\\ \textit{[Container: PostgreSQL]}\\ Double-entry ledger tables.};
 \node[cnt] (kafka) at (1.6, -4.0) {\textbf{Event Broker}\\ \textit{[Container: Apache Kafka]}\\ Durable settlement event log.};
 \node[cnt] (worker) at (6.5, -4.0) {\textbf{Payout Worker}\\ \textit{[Container: Python AsyncIO]}\\ Dispatches batch ACH files.};
@@ -175,7 +175,7 @@ Level 3 zooms inside \emph{one} container from Level 2---here, the \texttt{Settl
 
 % Components inside Settlement Service
 \node[comp] (ctrl) at (4.9, 0.8) {\textbf{SettlementController}\\ \textit{[Component: gRPC]}\\ Validates payloads \& auth claims.};
-\node[comp] (svc) at (9.1, -1.2) {\textbf{LedgerDomainService}\\ \textit{[Component: Spring Bean]}\\ Enforces balance invariants & payout state.};
+\node[comp] (svc) at (9.1, -1.2) {\textbf{LedgerDomainService}\\ \textit{[Component: Spring Bean]}\\ Enforces balance invariants \& payout state.};
 \node[comp] (repo) at (9.1, 0.8) {\textbf{LedgerRepository}\\ \textit{[Component: JDBC DAO]}\\ Executes SQL journal inserts.};
 \node[comp] (fclient) at (4.9, -3.4) {\textbf{FraudClientAdapter}\\ \textit{[Component: Resilience4j]}\\ Circuit-broken gRPC risk client.};
 \node[comp] (pub) at (9.1, -3.4) {\textbf{OutboxPublisher}\\ \textit{[Component: Kafka Client]}\\ Emits captured events.};
@@ -309,7 +309,7 @@ workspace "Global Payments Gateway" "Production C4 Model" {
 
 \begin{realworldbox}[Diagnostic Walkthrough: Tracing a Latency Spike Across 200+ Services]
 \textbf{Symptoms:} During peak morning payouts, PagerDuty triggers a high-latency alert on \texttt{ledger-posting-svc} (\texttt{p99 = 1,800 ms}, normally $35\text{ ms}$).\\
-\textbf{Metrics & Logs:} Service metrics show database CPU at $94\%$ and active connections pinned at $200/200$, while \texttt{ledger-posting-svc} logs show thousands of \texttt{POST /internal/entries} calls from an unrecognized user-agent \texttt{payout-reconciler/1.4}.\\
+\textbf{Metrics \& Logs:} Service metrics show database CPU at $94\%$ and active connections pinned at $200/200$, while \texttt{ledger-posting-svc} logs show thousands of \texttt{POST /internal/entries} calls from an unrecognized user-agent \texttt{payout-reconciler/1.4}.\\
 \textbf{Root Cause Investigation:} Rather than grepping 200 repositories, the on-call engineer opens the platform's Git-generated C4 Container catalog (built automatically like Monzo's service graph from Kubernetes manifests and RPC routing metadata) centered on \texttt{ledger-posting-svc}. One upstream edge stands out: \texttt{payout-reconciler} was added two weeks earlier calling \texttt{ledger-posting-svc} synchronously in a tight retry loop instead of reading from the Kafka event stream.\\
 \textbf{Remediation:} The team rate-limits \texttt{payout-reconciler} at the Envoy sidecar and moves it onto the Kafka consumer group documented in the C4 model, restoring \texttt{p99} to $38\text{ ms}$.
 \end{realworldbox}
@@ -387,7 +387,7 @@ workspace "Multi-Tenant Notification Platform" "Try It Yourself Solution" {
 }
 \end{lstlisting}
 
-\subsection*{Mechanics, Debugging & Architecture Solutions}
+\subsection*{Mechanics, Debugging \& Architecture Solutions}
 \begin{enumerate}[label=\textbf{Solution~\thechapter.\arabic*}, leftmargin=*]
   \item Classifications: (a) \textbf{Container} (Data Store), (b) \textbf{Container} (Web SPA), (c) \textbf{Person}, (d) \textbf{External System}, (e) \textbf{Component} (encapsulated module running inside the Auth API container).
   \item A bidirectional arrow hides which process opens the TCP socket and what protocol travels over it. Corrected unidirectional arrow:
